@@ -1,0 +1,14 @@
+[package]
+name = "sasql"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Safe SQL for Rust — if it compiles, the SQL is correct"
+
+[features]
+default = []
+
+[dependencies]
+sasql-core = { workspace = true }
+sasql-macros = { workspace = true }

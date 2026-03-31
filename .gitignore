@@ -1,0 +1,5 @@
+/target
+.sasql/
+*.swp
+*.swo
+.DS_Store

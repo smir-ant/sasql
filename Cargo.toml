@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = ["sasql", "sasql-core", "sasql-macros"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# Runtime
+tokio-postgres = { version = "0.7.17", default-features = false }
+deadpool-postgres = { version = "0.14.1", default-features = false }
+postgres-types = { version = "0.2.13", default-features = false }
+tokio = { version = "1", default-features = false }
+
+# Proc-macro
+syn = { version = "2.0.117", default-features = false, features = ["full", "parsing", "printing"] }
+quote = "1.0.45"
+proc-macro2 = "1.0.106"
+
+# Performance
+rapidhash = "4.4.1"
+
+# Serialization (compile-time offline cache)
+bitcode = { version = "0.6.9", features = ["derive"] }
+
+# Internal
+sasql-core = { path = "sasql-core", version = "0.1.0" }
+sasql-macros = { path = "sasql-macros", version = "0.1.0" }
