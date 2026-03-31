@@ -18,3 +18,4 @@ postgres-types = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 rapidhash = { workspace = true }
 bitcode = { workspace = true }
+sasql-core = { workspace = true }
