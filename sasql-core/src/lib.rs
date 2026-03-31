@@ -6,6 +6,10 @@
 //! You should not depend on this crate directly — use [`sasql`] instead.
 
 pub mod error;
+pub mod executor;
+pub mod pool;
 pub mod types;
 
 pub use error::{SasqlError, SasqlResult};
+pub use executor::Executor;
+pub use pool::{Pool, PoolBuilder, PoolConnection, PoolStatus};
