@@ -1,12 +1,12 @@
 //! Integration tests for v0.5: transactions.
 //!
 //! Requires a running PostgreSQL with the test schema.
-//! Set BSQL_DATABASE_URL=postgres://sasql:sasql@localhost/sasql_test
+//! Set BSQL_DATABASE_URL=postgres://bsql:bsql@localhost/bsql_test
 
 use bsql::{BsqlError, Pool};
 
 async fn pool() -> Pool {
-    Pool::connect("postgres://sasql:sasql@localhost/sasql_test")
+    Pool::connect("postgres://bsql:bsql@localhost/bsql_test")
         .await
         .expect("Failed to connect to test database. Is PostgreSQL running?")
 }
@@ -263,9 +263,9 @@ async fn begin_on_exhausted_pool_fails_fast() {
     // Create a pool with exactly 1 connection.
     let pool = Pool::builder()
         .host("localhost")
-        .dbname("sasql_test")
-        .user("sasql")
-        .password("sasql")
+        .dbname("bsql_test")
+        .user("bsql")
+        .password("bsql")
         .max_size(1)
         .build()
         .await

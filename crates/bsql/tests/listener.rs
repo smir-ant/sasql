@@ -1,11 +1,11 @@
 //! Integration tests: LISTEN/NOTIFY via Listener.
 //!
 //! Requires a running PostgreSQL.
-//! Set BSQL_DATABASE_URL=postgres://sasql:sasql@localhost/sasql_test
+//! Set BSQL_DATABASE_URL=postgres://bsql:bsql@localhost/bsql_test
 
 use bsql::{BsqlError, Listener};
 
-const DB_URL: &str = "postgres://sasql:sasql@localhost/sasql_test";
+const DB_URL: &str = "postgres://bsql:bsql@localhost/bsql_test";
 
 #[tokio::test]
 async fn listen_and_receive_notification() {

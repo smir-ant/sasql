@@ -143,9 +143,13 @@ impl Pool {
         cfg.port = config.get_ports().first().copied();
         cfg.dbname = config.get_dbname().map(String::from);
         cfg.user = config.get_user().map(String::from);
-        cfg.password = config
-            .get_password()
-            .map(|p| String::from_utf8_lossy(p).into_owned());
+        cfg.password =
+            match config.get_password() {
+                Some(p) => Some(String::from_utf8(p.to_vec()).map_err(|_| {
+                    ConnectError::create("database password contains invalid UTF-8")
+                })?),
+                None => None,
+            };
         cfg.connect_timeout = Some(std::time::Duration::from_secs(5));
         cfg.manager = Some(ManagerConfig {
             recycling_method: RecyclingMethod::Fast,

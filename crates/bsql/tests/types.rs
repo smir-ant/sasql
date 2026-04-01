@@ -1,13 +1,13 @@
 //! v0.2 integration tests: feature-gated types and pg_enum.
 //!
 //! These tests require specific features. Run with:
-//!   BSQL_DATABASE_URL=postgres://sasql:sasql@localhost/sasql_test \
-//!     cargo test -p bsql --test v02_types --features "time,uuid"
+//!   BSQL_DATABASE_URL=postgres://bsql:bsql@localhost/bsql_test \
+//!     cargo test -p bsql --test types --features "time,uuid"
 
 use bsql::Pool;
 
 async fn pool() -> Pool {
-    Pool::connect("postgres://sasql:sasql@localhost/sasql_test")
+    Pool::connect("postgres://bsql:bsql@localhost/bsql_test")
         .await
         .expect("Failed to connect to test database. Is PostgreSQL running?")
 }

@@ -3,15 +3,15 @@ services:
   postgres:
     image: postgres:18
     environment:
-      POSTGRES_DB: sasql_test
-      POSTGRES_USER: sasql
-      POSTGRES_PASSWORD: sasql
+      POSTGRES_DB: bsql_test
+      POSTGRES_USER: bsql
+      POSTGRES_PASSWORD: bsql
     ports:
       - "5432:5432"
     tmpfs:
       - /var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U sasql -d sasql_test"]
+      test: ["CMD-SHELL", "pg_isready -U bsql -d bsql_test"]
       interval: 1s
       timeout: 3s
       retries: 10

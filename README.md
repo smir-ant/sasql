@@ -31,7 +31,7 @@ What bsql does differently:
 - **Inline SQL** — the query is where it's used. No jumping between files. Code review sees SQL and Rust in the same diff.
 - **No unchecked path** — not "be disciplined and use the safe function". There is only one function. It is safe.
 - **Dynamic queries** — optional clauses `[AND col = $param]` expand to every combination at compile time. Each combination is validated. No string concatenation.
-- **Built for performance** — optimized connection pooling, prepared statement caching, fail-fast error handling. Architecture designed for arena allocation, binary protocol, and SIMD (planned for v1.0).
+- **Built for performance** — optimized connection pooling, prepared statement caching, fail-fast error handling. Architecture designed for arena allocation, binary protocol, and SIMD (planned).
 
 ## What Gets Checked at Compile Time
 
@@ -136,7 +136,7 @@ Type-safe PG enum mapping. Only accepts the specific PostgreSQL enum type it was
 | v0.5 | Released | Transactions: `begin()`, `commit()`, `rollback()`, auto-rollback on drop |
 | v0.6 | **Current** | Streaming results, LISTEN/NOTIFY |
 | v0.7 | Planned | Singleflight request coalescing, cross-query analysis, EXPLAIN at compile time, read/write splitting |
-| v1.0 | Planned | Arena allocation, binary protocol, SIMD, stable API |
+| v0.8+ | Planned | Arena allocation, binary protocol, SIMD, pipelining |
 
 ## About the Development Process
 

@@ -1,13 +1,13 @@
 //! Integration tests: fetch_stream — streaming query results.
 //!
 //! Requires a running PostgreSQL with the test schema.
-//! Set BSQL_DATABASE_URL=postgres://sasql:sasql@localhost/sasql_test
+//! Set BSQL_DATABASE_URL=postgres://bsql:bsql@localhost/bsql_test
 
 use bsql::Pool;
 use tokio_stream::StreamExt;
 
 async fn pool() -> Pool {
-    Pool::connect("postgres://sasql:sasql@localhost/sasql_test")
+    Pool::connect("postgres://bsql:bsql@localhost/bsql_test")
         .await
         .expect("Failed to connect to test database. Is PostgreSQL running?")
 }

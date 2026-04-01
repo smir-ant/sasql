@@ -8,7 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  BSQL_DATABASE_URL: postgres://sasql:sasql@localhost/sasql_test
+  BSQL_DATABASE_URL: postgres://bsql:bsql@localhost/bsql_test
 
 jobs:
   test:
@@ -22,13 +22,13 @@ jobs:
       postgres:
         image: postgres:${{ matrix.pg }}
         env:
-          POSTGRES_DB: sasql_test
-          POSTGRES_USER: sasql
-          POSTGRES_PASSWORD: sasql
+          POSTGRES_DB: bsql_test
+          POSTGRES_USER: bsql
+          POSTGRES_PASSWORD: bsql
         ports:
           - 5432:5432
         options: >-
-          --health-cmd="pg_isready -U sasql -d sasql_test"
+          --health-cmd="pg_isready -U bsql -d bsql_test"
           --health-interval=2s
           --health-timeout=5s
           --health-retries=10
@@ -49,7 +49,7 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Setup test schema
-        run: PGPASSWORD=sasql psql -h localhost -U sasql -d sasql_test -f tests/setup.sql
+        run: PGPASSWORD=bsql psql -h localhost -U bsql -d bsql_test -f tests/setup.sql
 
       - name: Test (no features)
         run: cargo test --workspace
@@ -70,13 +70,13 @@ jobs:
       postgres:
         image: postgres:18
         env:
-          POSTGRES_DB: sasql_test
-          POSTGRES_USER: sasql
-          POSTGRES_PASSWORD: sasql
+          POSTGRES_DB: bsql_test
+          POSTGRES_USER: bsql
+          POSTGRES_PASSWORD: bsql
         ports:
           - 5432:5432
         options: >-
-          --health-cmd="pg_isready -U sasql -d sasql_test"
+          --health-cmd="pg_isready -U bsql -d bsql_test"
           --health-interval=2s
           --health-timeout=5s
           --health-retries=10
@@ -86,10 +86,10 @@ jobs:
         with:
           components: clippy
       - name: Setup test schema
-        run: PGPASSWORD=sasql psql -h localhost -U sasql -d sasql_test -f tests/setup.sql
+        run: PGPASSWORD=bsql psql -h localhost -U bsql -d bsql_test -f tests/setup.sql
       - run: cargo clippy --workspace --all-targets --features "time,uuid,decimal,chrono" -- -D warnings
         env:
-          BSQL_DATABASE_URL: postgres://sasql:sasql@localhost/sasql_test
+          BSQL_DATABASE_URL: postgres://bsql:bsql@localhost/bsql_test
 
   fmt:
     name: Format
