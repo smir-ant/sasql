@@ -8,7 +8,6 @@
 //! The cache is per-query (one file per SQL hash), so no file locking is
 //! needed and incremental compilation works naturally.
 
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
@@ -122,9 +121,7 @@ fn cache_dir() -> Result<&'static PathBuf, String> {
 
 /// Compute the rapidhash of normalized SQL, used as the cache key.
 pub fn sql_hash(normalized_sql: &str) -> u64 {
-    let mut hasher = rapidhash::quality::RapidHasher::default();
-    normalized_sql.hash(&mut hasher);
-    hasher.finish()
+    bsql_core::rapid_hash_str(normalized_sql)
 }
 
 // ---------------------------------------------------------------------------
@@ -344,33 +341,15 @@ fn validate_cached_type(rust_type: &str) -> Result<(), String> {
         .and_then(|s| s.strip_suffix('>'))
         .unwrap_or(inner);
 
-    // Known base types (from BASE_TYPE_MAP and EnumString)
-    const KNOWN_TYPES: &[&str] = &[
-        "bool",
-        "i16",
-        "i32",
-        "i64",
-        "f32",
-        "f64",
-        "u32",
-        "()",
-        "String",
-        "Vec<u8>",
-        "Vec<bool>",
-        "Vec<i16>",
-        "Vec<i32>",
-        "Vec<i64>",
-        "Vec<f32>",
-        "Vec<f64>",
-        "Vec<String>",
-        "Vec<Vec<u8>>",
-        "::bsql_core::types::EnumString",
-    ];
+    // Derive known types from BASE_TYPE_MAP (single source of truth)
+    let known_base = bsql_core::types::BASE_TYPE_MAP
+        .iter()
+        .any(|m| m.rust_type == inner);
 
-    // Known feature-gated type prefixes
+    // Known feature-gated type prefixes (not in BASE_TYPE_MAP)
     const KNOWN_PREFIXES: &[&str] = &["::time::", "::chrono::", "::uuid::", "::rust_decimal::"];
 
-    if KNOWN_TYPES.contains(&inner)
+    if known_base
         || KNOWN_PREFIXES.iter().any(|p| inner.starts_with(p))
         || KNOWN_PREFIXES.iter().any(|p| element.starts_with(p))
     {
@@ -620,10 +599,10 @@ mod tests {
             normalized_sql: "select status from tickets where status = $1".into(),
             columns: vec![CachedColumn {
                 name: "status".into(),
-                pg_oid: 99999, // custom enum OID
-                pg_type_name: "ticket_status".into(),
+                pg_oid: 25, // text OID after cast
+                pg_type_name: "text".into(),
                 is_nullable: false,
-                rust_type: "::bsql_core::types::EnumString".into(),
+                rust_type: "String".into(),
             }],
             param_pg_oids: vec![99999],
             param_is_pg_enum: vec![true],
@@ -632,7 +611,7 @@ mod tests {
         let bytes = encode_enveloped(&cached);
         let decoded = decode_enveloped(&bytes).expect("decode");
         assert_eq!(decoded.param_is_pg_enum, vec![true]);
-        assert_eq!(decoded.columns[0].pg_type_name, "ticket_status");
+        assert_eq!(decoded.columns[0].pg_type_name, "text");
     }
 
     // --- FIX 1: format version tests ---
@@ -677,9 +656,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_enum_string() {
-        assert!(validate_cached_type("::bsql_core::types::EnumString").is_ok());
-        assert!(validate_cached_type("Option<::bsql_core::types::EnumString>").is_ok());
+    fn validate_rejects_removed_enum_string() {
+        // EnumString was removed — PG enums now require #[bsql::pg_enum] or ::text cast
+        assert!(validate_cached_type("::bsql_core::types::EnumString").is_err());
+        assert!(validate_cached_type("Option<::bsql_core::types::EnumString>").is_err());
     }
 
     #[test]

@@ -41,16 +41,13 @@ pub struct Pool {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PgBouncerInfo {
     /// True if PgBouncer was detected between the client and PostgreSQL.
-    detected: bool,
-    /// True if PgBouncer supports server-side prepared statement tracking
-    /// (PgBouncer 1.21+ with `prepared_statements=yes`).
-    supports_named_stmts: bool,
+    is_pgbouncer: bool,
 }
 
 impl PgBouncerInfo {
+    #[cfg(test)]
     const DIRECT: Self = Self {
-        detected: false,
-        supports_named_stmts: true,
+        is_pgbouncer: false,
     };
 }
 
@@ -186,11 +183,8 @@ impl PoolBuilder {
             let replica_pool =
                 create_pool_from_url(url, self.max_size, self.connect_timeout_secs).await?;
             let replica_pgb = detect_pgbouncer(&replica_pool).await?;
-            if replica_pgb.detected {
-                merged_pgbouncer.detected = true;
-                if !replica_pgb.supports_named_stmts {
-                    merged_pgbouncer.supports_named_stmts = false;
-                }
+            if replica_pgb.is_pgbouncer {
+                merged_pgbouncer.is_pgbouncer = true;
             }
             replicas.push(replica_pool);
         }
@@ -210,55 +204,7 @@ impl Pool {
     ///
     /// Format: `postgres://user:password@host:port/dbname`
     pub async fn connect(url: &str) -> BsqlResult<Self> {
-        let config: tokio_postgres::Config = url
-            .parse()
-            .map_err(|e: tokio_postgres::Error| ConnectError::create(e.to_string()))?;
-
-        let mut cfg = Config::new();
-        cfg.host = config.get_hosts().first().map(|h| match h {
-            tokio_postgres::config::Host::Tcp(s) => s.clone(),
-            #[cfg(unix)]
-            tokio_postgres::config::Host::Unix(p) => p.to_string_lossy().into_owned(),
-        });
-        cfg.port = config.get_ports().first().copied();
-        cfg.dbname = config.get_dbname().map(String::from);
-        cfg.user = config.get_user().map(String::from);
-        cfg.password =
-            match config.get_password() {
-                Some(p) => Some(String::from_utf8(p.to_vec()).map_err(|_| {
-                    ConnectError::create("database password contains invalid UTF-8")
-                })?),
-                None => None,
-            };
-        cfg.connect_timeout = Some(std::time::Duration::from_secs(5));
-        cfg.manager = Some(ManagerConfig {
-            recycling_method: RecyclingMethod::Fast,
-        });
-        // FIX 2: fail-fast -- zero wait timeout means acquire() never blocks
-        cfg.pool = Some(deadpool_postgres::PoolConfig {
-            max_size: 16,
-            timeouts: deadpool_postgres::Timeouts {
-                wait: Some(std::time::Duration::ZERO),
-                create: None,
-                recycle: None,
-            },
-            ..Default::default()
-        });
-
-        let pool = cfg
-            .create_pool(Some(Runtime::Tokio1), NoTls)
-            .map_err(|e| ConnectError::create(e.to_string()))?;
-
-        // FIX 11: detect PgBouncer -- propagate connection failure
-        let pgbouncer = detect_pgbouncer(&pool).await?;
-
-        Ok(Pool {
-            primary: pool,
-            replicas: Vec::new(),
-            replica_idx: std::sync::atomic::AtomicUsize::new(0),
-            pgbouncer,
-            singleflight: Singleflight::new(),
-        })
+        Pool::builder().url(url)?.build().await
     }
 
     /// Create a pool builder for fine-grained configuration.
@@ -290,14 +236,7 @@ impl Pool {
 
     /// Whether PgBouncer was detected between the client and PostgreSQL.
     pub fn is_pgbouncer(&self) -> bool {
-        self.pgbouncer.detected
-    }
-
-    /// Whether named prepared statements can be used.
-    ///
-    /// False when PgBouncer is detected without `prepared_statements=yes`.
-    pub fn supports_named_statements(&self) -> bool {
-        self.pgbouncer.supports_named_stmts
+        self.pgbouncer.is_pgbouncer
     }
 
     /// Whether read replicas are configured.
@@ -480,7 +419,7 @@ impl std::fmt::Debug for Pool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Pool")
             .field("status", &self.status())
-            .field("is_pgbouncer", &self.pgbouncer.detected)
+            .field("is_pgbouncer", &self.pgbouncer.is_pgbouncer)
             .field("replicas", &self.replicas.len())
             .finish()
     }
@@ -495,9 +434,9 @@ pub struct PoolConnection {
 }
 
 impl PoolConnection {
-    /// Whether named prepared statements can be used on this connection.
-    pub fn supports_named_statements(&self) -> bool {
-        self.pgbouncer.supports_named_stmts
+    /// Whether PgBouncer was detected on this connection.
+    pub fn is_pgbouncer(&self) -> bool {
+        self.pgbouncer.is_pgbouncer
     }
 }
 
@@ -567,9 +506,8 @@ async fn create_pool_from_url(
 /// Detect PgBouncer on the first connection from the pool.
 ///
 /// Strategy: try `SHOW POOLS` -- only PgBouncer responds to this.
-/// If PgBouncer is detected, check `SHOW CONFIG` for `prepared_statements`.
 ///
-/// FIX 11: returns `Err` if the initial connection fails, instead of silently
+/// Returns `Err` if the initial connection fails, instead of silently
 /// returning `DIRECT`. A pool that can't connect on creation is broken.
 async fn detect_pgbouncer(pool: &deadpool_postgres::Pool) -> BsqlResult<PgBouncerInfo> {
     let conn = pool.get().await.map_err(|e| {
@@ -579,26 +517,7 @@ async fn detect_pgbouncer(pool: &deadpool_postgres::Pool) -> BsqlResult<PgBounce
     // PgBouncer responds to `SHOW POOLS`; PostgreSQL does not.
     let is_pgbouncer = conn.simple_query("SHOW POOLS").await.is_ok();
 
-    if !is_pgbouncer {
-        return Ok(PgBouncerInfo::DIRECT);
-    }
-
-    // Check if PgBouncer supports named prepared statements (1.21+)
-    let supports_named = match conn.simple_query("SHOW CONFIG").await {
-        Ok(messages) => messages.iter().any(|msg| {
-            if let tokio_postgres::SimpleQueryMessage::Row(row) = msg {
-                row.get(0) == Some("prepared_statements") && row.get(1) == Some("yes")
-            } else {
-                false
-            }
-        }),
-        Err(_) => false,
-    };
-
-    Ok(PgBouncerInfo {
-        detected: true,
-        supports_named_stmts: supports_named,
-    })
+    Ok(PgBouncerInfo { is_pgbouncer })
 }
 
 #[cfg(test)]
@@ -644,8 +563,7 @@ mod tests {
     #[test]
     fn pgbouncer_direct_defaults() {
         let info = PgBouncerInfo::DIRECT;
-        assert!(!info.detected);
-        assert!(info.supports_named_stmts);
+        assert!(!info.is_pgbouncer);
     }
 
     #[test]

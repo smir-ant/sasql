@@ -1,4 +1,5 @@
 error: PostgreSQL error: cannot insert multiple commands into a prepared statement
+         SQL: SELECT 1; DROP TABLE users
  --> tests/compile_fail/sql_injection.rs:2:13
   |
 2 |     let _ = bsql::query!("SELECT 1; DROP TABLE users");

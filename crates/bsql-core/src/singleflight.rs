@@ -13,7 +13,6 @@
 //! independently on their next call.
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::broadcast;
@@ -88,12 +87,8 @@ impl Singleflight {
 /// Singleflight only applies to parameterless queries (params.is_empty()).
 /// Parameterized queries bypass singleflight entirely because different param
 /// values produce the same SQL text but different results.
-/// string, so singleflight key-generation is done at the codegen level where
-/// concrete param types (which implement `Hash`) are available.
 pub(crate) fn sql_key(sql: &str) -> u64 {
-    let mut hasher = rapidhash::quality::RapidHasher::default();
-    sql.hash(&mut hasher);
-    hasher.finish()
+    crate::rapid_hash_str(sql)
 }
 
 #[cfg(test)]

@@ -29,17 +29,18 @@ pub enum TicketStatus {
 }
 
 #[tokio::test]
-async fn pg_enum_select_returns_string() {
-    // Without pg_enum integration in query!, enum columns map to String.
+async fn pg_enum_select_as_text() {
+    // PG enum columns require ::text cast (EnumString was removed).
     let pool = pool().await;
     let id = 1i32;
-    let ticket = bsql::query!("SELECT id, status FROM tickets WHERE id = $id: i32")
+    let ticket = bsql::query!("SELECT id, status::text AS status FROM tickets WHERE id = $id: i32")
         .fetch_one(&pool)
         .await
         .unwrap();
 
     assert_eq!(ticket.id, 1);
-    assert_eq!(ticket.status, "new");
+    // ::text cast produces a computed column, so PG reports it as nullable
+    assert_eq!(ticket.status.as_deref(), Some("new"));
 }
 
 #[tokio::test]
@@ -284,20 +285,20 @@ mod time_tests {
 }
 
 // ---------------------------------------------------------------------------
-// Enum column as String (no feature needed)
+// Enum column as text (requires ::text cast)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn enum_column_maps_to_string() {
+async fn enum_column_cast_to_text() {
     let pool = pool().await;
     let id = 1i32;
-    let ticket = bsql::query!("SELECT id, status FROM tickets WHERE id = $id: i32")
+    let ticket = bsql::query!("SELECT id, status::text AS status FROM tickets WHERE id = $id: i32")
         .fetch_one(&pool)
         .await
         .unwrap();
 
     assert_eq!(ticket.id, 1);
-    assert_eq!(ticket.status, "new");
+    assert_eq!(ticket.status.as_deref(), Some("new"));
 }
 
 #[tokio::test]
@@ -309,13 +310,13 @@ async fn insert_with_enum_literal() {
     let ticket = bsql::query!(
         "INSERT INTO tickets (title, status, created_by_user_id)
          VALUES ($title: &str, 'resolved', $uid: i32)
-         RETURNING id, status"
+         RETURNING id, status::text AS status"
     )
     .fetch_one(&pool)
     .await
     .unwrap();
 
-    assert_eq!(ticket.status, "resolved");
+    assert_eq!(ticket.status.as_deref(), Some("resolved"));
 
     // Clean up
     let del_id = ticket.id;

@@ -1,15 +1,11 @@
 //! Prepared statement name generation via rapidhash.
 
-use std::hash::{Hash, Hasher};
-
 /// Generate a prepared statement name from normalized SQL.
 ///
 /// Format: `s_{hash:016x}` — a 64-bit rapidhash of the SQL text, hex-encoded.
 /// Deterministic: same SQL always produces the same name.
 pub fn statement_name(normalized_sql: &str) -> String {
-    let mut hasher = rapidhash::quality::RapidHasher::default();
-    normalized_sql.hash(&mut hasher);
-    let hash = hasher.finish();
+    let hash = bsql_core::rapid_hash_str(normalized_sql);
     format!("s_{hash:016x}")
 }
 

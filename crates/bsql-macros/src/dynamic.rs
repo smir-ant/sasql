@@ -5,8 +5,6 @@
 //! ready for PREPARE validation and runtime execution.
 
 use crate::parse::{Param, ParsedQuery};
-use crate::sql_norm::normalize_sql;
-use crate::stmt_name::statement_name;
 
 /// A single concrete SQL variant with a specific combination of
 /// included/excluded optional clauses.
@@ -14,18 +12,12 @@ use crate::stmt_name::statement_name;
 pub struct QueryVariant {
     /// Complete SQL string for this variant (positional params, not normalized).
     pub sql: String,
-    /// Normalized SQL for statement naming.
-    #[allow(dead_code)] // retained for diagnostics and future cache keying
-    pub normalized_sql: String,
     /// All parameters for this variant, in positional order.
     /// Base params first, then included optional clause params.
     pub params: Vec<Param>,
     /// Bitmask of which optional clauses are included.
     /// Bit 0 = clause 0, bit 1 = clause 1, etc.
     pub mask: u32,
-    /// Prepared statement name for this variant.
-    #[allow(dead_code)] // retained for diagnostics and future cache keying
-    pub statement_name: String,
 }
 
 /// Expand a parsed query with optional clauses into 2^N concrete variants.
@@ -39,10 +31,8 @@ pub fn expand_variants(parsed: &ParsedQuery) -> Result<Vec<QueryVariant>, String
     if n == 0 {
         return Ok(vec![QueryVariant {
             sql: parsed.positional_sql.clone(),
-            normalized_sql: parsed.normalized_sql.clone(),
             params: parsed.params.clone(),
             mask: 0,
-            statement_name: parsed.statement_name.clone(),
         }]);
     }
 
@@ -121,15 +111,10 @@ fn build_variant(parsed: &ParsedQuery, mask: u32) -> Result<QueryVariant, String
     // Trim leading/trailing whitespace
     let sql = sql.trim().to_owned();
 
-    let normalized = normalize_sql(&sql);
-    let stmt_name = statement_name(&normalized);
-
     Ok(QueryVariant {
         sql,
-        normalized_sql: normalized,
         params: all_params,
         mask,
-        statement_name: stmt_name,
     })
 }
 
@@ -289,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn each_variant_has_unique_statement_name() {
+    fn each_variant_has_unique_sql() {
         let parsed = parse_query(
             "SELECT id FROM tickets WHERE 1 = 1 \
              [AND a = $a: Option<i32>] \
@@ -298,12 +283,12 @@ mod tests {
         .unwrap();
 
         let variants = expand_variants(&parsed).unwrap();
-        let names: Vec<&str> = variants.iter().map(|v| v.statement_name.as_str()).collect();
-        let unique: std::collections::HashSet<&str> = names.iter().copied().collect();
+        let sqls: Vec<&str> = variants.iter().map(|v| v.sql.as_str()).collect();
+        let unique: std::collections::HashSet<&str> = sqls.iter().copied().collect();
         assert_eq!(
             unique.len(),
-            names.len(),
-            "statement names must be unique: {names:?}"
+            sqls.len(),
+            "variant SQL strings must be unique: {sqls:?}"
         );
     }
 

@@ -231,5 +231,4 @@ async fn pool_direct_is_not_pgbouncer() {
     let pool = pool().await;
     // Direct connection (not through PgBouncer) should report false
     assert!(!pool.is_pgbouncer());
-    assert!(pool.supports_named_statements());
 }

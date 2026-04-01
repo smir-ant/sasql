@@ -83,17 +83,17 @@ async fn validate_async(parsed: &ParsedQuery, client: &Client) -> Result<Validat
         let name = col.name().to_owned();
         let is_nullable = nullable_flags[i];
 
-        // Custom PG enums (Kind::Enum) map to EnumString at the type level.
-        // EnumString accepts Kind::Enum in its FromSql impl.
-        // Users who want typed enums should use #[bsql::pg_enum].
         let is_pg_enum = matches!(col.type_().kind(), postgres_types::Kind::Enum(_));
 
-        let base_rust_type = if is_pg_enum {
-            "::bsql_core::types::EnumString"
-        } else {
-            crate::types::resolve_rust_type(pg_oid)
-                .map_err(|msg| format!("column \"{name}\": {msg}"))?
-        };
+        if is_pg_enum {
+            return Err(format!(
+                "column \"{name}\" is PostgreSQL enum type `{pg_type_name}`. \
+                 Define a Rust enum with #[bsql::pg_enum] or cast to text: {name}::text"
+            ));
+        }
+
+        let base_rust_type = crate::types::resolve_rust_type(pg_oid)
+            .map_err(|msg| format!("column \"{name}\": {msg}"))?;
 
         let rust_type = if is_nullable {
             format!("Option<{base_rust_type}>")
@@ -227,57 +227,13 @@ pub fn check_param_types(
     parsed: &ParsedQuery,
     validation: &ValidationResult,
 ) -> Result<(), String> {
-    if parsed.params.len() != validation.param_pg_oids.len() {
-        return Err(format!(
-            "parameter count mismatch: query has {} parameters but PostgreSQL \
-             expects {}. Check your $name: Type declarations.",
-            parsed.params.len(),
-            validation.param_pg_oids.len()
-        ));
-    }
-
-    for (i, (param, &pg_oid)) in parsed
-        .params
-        .iter()
-        .zip(&validation.param_pg_oids)
-        .enumerate()
-    {
-        let is_pg_enum = validation.param_is_pg_enum.get(i).copied().unwrap_or(false);
-
-        // PG enum params: accept &str/String (text representation) and
-        // unknown types (likely #[bsql::pg_enum] user enums, verified at runtime
-        // by ToSql). Reject types that are provably incompatible.
-        if is_pg_enum {
-            if matches!(param.rust_type.as_str(), "&str" | "String") {
-                continue;
-            }
-            if crate::types::is_known_non_enum_type(&param.rust_type) {
-                return Err(format!(
-                    "type `{}` cannot be used for PostgreSQL enum parameter `${}`. \
-                     Use `&str`, `String`, or a `#[bsql::pg_enum]` type.",
-                    param.rust_type, param.name
-                ));
-            }
-            // Unknown type (likely a #[pg_enum] type) — accept, runtime ToSql verifies
-            continue;
-        }
-
-        if !crate::types::is_param_compatible_extended(&param.rust_type, pg_oid) {
-            let pg_name = bsql_core::types::pg_name_for_oid(pg_oid).unwrap_or("unknown");
-            // Provide a better error for feature-gated types
-            let extra_hint = match crate::types::resolve_rust_type(pg_oid) {
-                Ok(expected) => format!(" (expected `{expected}`)"),
-                Err(msg) => format!(" — {msg}"),
-            };
-            return Err(format!(
-                "type mismatch for parameter `${}`: declared `{}` but PostgreSQL \
-                 expects `{}` (OID {}){extra_hint}",
-                param.name, param.rust_type, pg_name, pg_oid
-            ));
-        }
-    }
-
-    Ok(())
+    check_params_against_pg(
+        &parsed.params,
+        &validation.param_pg_oids,
+        &validation.param_is_pg_enum,
+        false,
+        "",
+    )
 }
 
 /// Validate all dynamic query variants against PostgreSQL.
@@ -356,12 +312,15 @@ async fn validate_variant_async(
         let is_nullable = nullable_flags[i];
         let is_pg_enum = matches!(col.type_().kind(), postgres_types::Kind::Enum(_));
 
-        let base_rust_type = if is_pg_enum {
-            "::bsql_core::types::EnumString"
-        } else {
-            crate::types::resolve_rust_type(pg_oid)
-                .map_err(|msg| format!("column \"{name}\": {msg}"))?
-        };
+        if is_pg_enum {
+            return Err(format!(
+                "column \"{name}\" is PostgreSQL enum type `{pg_type_name}`. \
+                 Define a Rust enum with #[bsql::pg_enum] or cast to text: {name}::text"
+            ));
+        }
+
+        let base_rust_type = crate::types::resolve_rust_type(pg_oid)
+            .map_err(|msg| format!("column \"{name}\": {msg}"))?;
 
         let rust_type = if is_nullable {
             format!("Option<{base_rust_type}>")
@@ -391,27 +350,51 @@ pub fn check_variant_param_types(
     variant: &QueryVariant,
     validation: &ValidationResult,
 ) -> Result<(), String> {
-    if variant.params.len() != validation.param_pg_oids.len() {
+    check_params_against_pg(
+        &variant.params,
+        &validation.param_pg_oids,
+        &validation.param_is_pg_enum,
+        true,
+        &format!("variant (mask {:#06b})", variant.mask),
+    )
+}
+
+/// Unified parameter type checking against PostgreSQL OIDs.
+///
+/// `strip_option_wrapper`: when true, strips `Option<>` before comparison
+/// (used for dynamic query variants where optional clause params are `Option<T>`).
+///
+/// `context`: empty string for static queries, or a description like
+/// `"variant (mask 0b0011)"` for error messages.
+fn check_params_against_pg(
+    params: &[crate::parse::Param],
+    pg_oids: &[u32],
+    pg_enum_flags: &[bool],
+    strip_option_wrapper: bool,
+    context: &str,
+) -> Result<(), String> {
+    if params.len() != pg_oids.len() {
+        let ctx = if context.is_empty() {
+            String::new()
+        } else {
+            format!(" in {context}")
+        };
         return Err(format!(
-            "parameter count mismatch in variant (mask {:#06b}): query has {} \
-             parameters but PostgreSQL expects {}.",
-            variant.mask,
-            variant.params.len(),
-            validation.param_pg_oids.len()
+            "parameter count mismatch{ctx}: query has {} parameters but PostgreSQL \
+             expects {}. Check your $name: Type declarations.",
+            params.len(),
+            pg_oids.len()
         ));
     }
 
-    for (i, (param, &pg_oid)) in variant
-        .params
-        .iter()
-        .zip(&validation.param_pg_oids)
-        .enumerate()
-    {
-        let is_pg_enum = validation.param_is_pg_enum.get(i).copied().unwrap_or(false);
+    for (i, (param, &pg_oid)) in params.iter().zip(pg_oids).enumerate() {
+        let is_pg_enum = pg_enum_flags.get(i).copied().unwrap_or(false);
 
-        // For optional clause params, the declared type is Option<T>.
-        // PostgreSQL sees the inner type T. Strip Option<> for comparison.
-        let check_type = strip_option(&param.rust_type);
+        let check_type = if strip_option_wrapper {
+            strip_option(&param.rust_type)
+        } else {
+            &param.rust_type
+        };
 
         if is_pg_enum {
             if matches!(check_type, "&str" | "String") {
@@ -424,7 +407,7 @@ pub fn check_variant_param_types(
                     param.rust_type, param.name
                 ));
             }
-            // Unknown type (likely a #[pg_enum] type) — accept, runtime ToSql verifies
+            // Unknown type (likely a #[pg_enum] type) -- accept, runtime ToSql verifies
             continue;
         }
 
@@ -456,6 +439,24 @@ fn strip_option(ty: &str) -> &str {
     ty
 }
 
+/// Extract the common parts of a PostgreSQL error: message, detail, hint.
+fn format_db_error_base(e: &tokio_postgres::Error) -> String {
+    if let Some(db_err) = e.as_db_error() {
+        let detail = db_err.detail().unwrap_or("");
+        let hint = db_err.hint().unwrap_or("");
+        let mut out = format!("PostgreSQL error: {}", db_err.message());
+        if !detail.is_empty() {
+            out.push_str(&format!("\n  detail: {detail}"));
+        }
+        if !hint.is_empty() {
+            out.push_str(&format!("\n  hint: {hint}"));
+        }
+        out
+    } else {
+        format!("PostgreSQL error: {e}")
+    }
+}
+
 /// Format a variant-specific PostgreSQL error with context about which
 /// clause combination caused the failure.
 fn format_variant_error(
@@ -482,21 +483,7 @@ fn format_variant_error(
         format!("with {}", clause_strs.join(", "))
     };
 
-    let base_msg = if let Some(db_err) = e.as_db_error() {
-        let detail = db_err.detail().unwrap_or("");
-        let hint = db_err.hint().unwrap_or("");
-        let mut out = format!("PostgreSQL error: {}", db_err.message());
-        if !detail.is_empty() {
-            out.push_str(&format!("\n  detail: {detail}"));
-        }
-        if !hint.is_empty() {
-            out.push_str(&format!("\n  hint: {hint}"));
-        }
-        out
-    } else {
-        format!("PostgreSQL error: {e}")
-    };
-
+    let base_msg = format_db_error_base(e);
     format!(
         "optional clause variant {} ({clause_desc}) produces invalid SQL:\n  \
          {base_msg}\n  SQL: {}",
@@ -506,29 +493,14 @@ fn format_variant_error(
 
 /// Format a PostgreSQL error into a developer-friendly compile error message.
 fn format_pg_error(e: &tokio_postgres::Error, parsed: &ParsedQuery) -> String {
-    let msg = e.to_string();
+    let mut out = format_db_error_base(e);
 
-    // Extract the PostgreSQL error code if available
     if let Some(db_err) = e.as_db_error() {
-        let detail = db_err.detail().unwrap_or("");
-        let hint = db_err.hint().unwrap_or("");
-        let position = db_err.position();
-
-        let mut out = format!("PostgreSQL error: {}", db_err.message());
-
-        if !detail.is_empty() {
-            out.push_str(&format!("\n  detail: {detail}"));
-        }
-        if !hint.is_empty() {
-            out.push_str(&format!("\n  hint: {hint}"));
-        }
-        if let Some(pos) = position {
+        if let Some(pos) = db_err.position() {
             out.push_str(&format!("\n  position: {pos:?}"));
-            out.push_str(&format!("\n  SQL: {}", parsed.positional_sql));
         }
-
-        out
-    } else {
-        format!("PostgreSQL error: {msg}\n  SQL: {}", parsed.positional_sql)
     }
+    out.push_str(&format!("\n  SQL: {}", parsed.positional_sql));
+
+    out
 }

@@ -172,7 +172,6 @@ dependencies = [
  "postgres-types",
  "proc-macro2",
  "quote",
- "rapidhash",
  "syn 2.0.117",
  "tempfile",
  "tokio",

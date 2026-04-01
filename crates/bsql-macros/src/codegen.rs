@@ -113,26 +113,22 @@ fn gen_result_struct(parsed: &ParsedQuery, validation: &ValidationResult) -> Tok
 fn gen_executor_struct(parsed: &ParsedQuery) -> TokenStream {
     let struct_name = executor_struct_name(parsed);
 
-    if parsed.params.is_empty() {
-        quote! {
-            #[must_use = "query is not executed until .fetch_one(), .fetch_all(), .fetch_optional(), or .execute() is called"]
-            #[allow(non_camel_case_types)]
-            struct #struct_name;
-        }
-    } else {
-        let fields = parsed.params.iter().map(|p| {
+    let fields: Vec<TokenStream> = parsed
+        .params
+        .iter()
+        .map(|p| {
             let name = param_ident(&p.name);
             let ty = inject_lifetime(&p.rust_type);
             quote! { #name: #ty }
-        });
+        })
+        .collect();
 
-        quote! {
-            #[must_use = "query is not executed until .fetch_one(), .fetch_all(), .fetch_optional(), or .execute() is called"]
-            #[allow(non_camel_case_types)]
-            struct #struct_name<'_bsql> {
-                #(#fields,)*
-                _marker: ::std::marker::PhantomData<&'_bsql ()>,
-            }
+    quote! {
+        #[must_use = "query is not executed until .fetch_one(), .fetch_all(), .fetch_optional(), or .execute() is called"]
+        #[allow(non_camel_case_types)]
+        struct #struct_name<'_bsql> {
+            #(#fields,)*
+            _marker: ::std::marker::PhantomData<&'_bsql ()>,
         }
     }
 }
@@ -147,7 +143,6 @@ fn gen_executor_struct(parsed: &ParsedQuery) -> TokenStream {
 fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> TokenStream {
     let executor_name = executor_struct_name(parsed);
     let sql_lit = &parsed.positional_sql;
-    let has_params = !parsed.params.is_empty();
 
     // v0.7: SELECT -> query_raw_readonly (replica-aware), writes -> query_raw (primary)
     let is_select = parsed.kind == crate::parse::QueryKind::Select;
@@ -256,37 +251,7 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
         TokenStream::new()
     };
 
-    // Generate the StreamMap adapter (only when columns exist)
-    let stream_map_def = if has_columns {
-        let result_name = result_struct_name(parsed);
-        let row_decode = gen_row_decode(validation);
-
-        quote! {
-            /// Maps `QueryStream` (raw rows) to typed result structs.
-            struct StreamMap<T> {
-                inner: ::bsql_core::QueryStream,
-                _phantom: ::std::marker::PhantomData<T>,
-            }
-
-            impl ::bsql_core::Stream for StreamMap<#result_name> {
-                type Item = ::bsql_core::BsqlResult<#result_name>;
-
-                fn poll_next(
-                    mut self: ::std::pin::Pin<&mut Self>,
-                    cx: &mut ::std::task::Context<'_>,
-                ) -> ::std::task::Poll<Option<Self::Item>> {
-                    ::std::pin::Pin::new(&mut self.inner)
-                        .poll_next(cx)
-                        .map(|opt| opt.map(|res| {
-                            let row = res?;
-                            Ok(#result_name { #row_decode })
-                        }))
-                }
-            }
-        }
-    } else {
-        TokenStream::new()
-    };
+    let stream_map_def = gen_stream_map_adapter(parsed, validation);
 
     let execute_method = quote! {
         pub async fn execute<E: ::bsql_core::Executor>(
@@ -297,25 +262,13 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
         }
     };
 
-    if has_params {
-        quote! {
-            #stream_map_def
+    quote! {
+        #stream_map_def
 
-            #[allow(non_camel_case_types)]
-            impl<'_bsql> #executor_name<'_bsql> {
-                #fetch_methods
-                #execute_method
-            }
-        }
-    } else {
-        quote! {
-            #stream_map_def
-
-            #[allow(non_camel_case_types)]
-            impl #executor_name {
-                #fetch_methods
-                #execute_method
-            }
+        #[allow(non_camel_case_types)]
+        impl<'_bsql> #executor_name<'_bsql> {
+            #fetch_methods
+            #execute_method
         }
     }
 }
@@ -352,21 +305,12 @@ fn gen_dynamic_executor_struct(parsed: &ParsedQuery) -> TokenStream {
         }
     }
 
-    if fields.is_empty() {
-        // Unlikely: a dynamic query with no params at all
-        quote! {
-            #[must_use = "query is not executed until .fetch_one(), .fetch_all(), .fetch_optional(), or .execute() is called"]
-            #[allow(non_camel_case_types)]
-            struct #struct_name;
-        }
-    } else {
-        quote! {
-            #[must_use = "query is not executed until .fetch_one(), .fetch_all(), .fetch_optional(), or .execute() is called"]
-            #[allow(non_camel_case_types)]
-            struct #struct_name<'_bsql> {
-                #(#fields,)*
-                _marker: ::std::marker::PhantomData<&'_bsql ()>,
-            }
+    quote! {
+        #[must_use = "query is not executed until .fetch_one(), .fetch_all(), .fetch_optional(), or .execute() is called"]
+        #[allow(non_camel_case_types)]
+        struct #struct_name<'_bsql> {
+            #(#fields,)*
+            _marker: ::std::marker::PhantomData<&'_bsql ()>,
         }
     }
 }
@@ -383,8 +327,6 @@ fn gen_dynamic_executor_impls(
 ) -> TokenStream {
     let executor_name = executor_struct_name(parsed);
     let has_columns = !validation.columns.is_empty();
-    let has_any_params =
-        !parsed.params.is_empty() || parsed.optional_clauses.iter().any(|c| !c.params.is_empty());
 
     // Build the match dispatcher that all methods share
 
@@ -497,36 +439,7 @@ fn gen_dynamic_executor_impls(
         TokenStream::new()
     };
 
-    // Generate the StreamMap adapter (only when columns exist)
-    let stream_map_def = if has_columns {
-        let result_name = result_struct_name(parsed);
-        let row_decode = gen_row_decode(validation);
-
-        quote! {
-            struct StreamMap<T> {
-                inner: ::bsql_core::QueryStream,
-                _phantom: ::std::marker::PhantomData<T>,
-            }
-
-            impl ::bsql_core::Stream for StreamMap<#result_name> {
-                type Item = ::bsql_core::BsqlResult<#result_name>;
-
-                fn poll_next(
-                    mut self: ::std::pin::Pin<&mut Self>,
-                    cx: &mut ::std::task::Context<'_>,
-                ) -> ::std::task::Poll<Option<Self::Item>> {
-                    ::std::pin::Pin::new(&mut self.inner)
-                        .poll_next(cx)
-                        .map(|opt| opt.map(|res| {
-                            let row = res?;
-                            Ok(#result_name { #row_decode })
-                        }))
-                }
-            }
-        }
-    } else {
-        TokenStream::new()
-    };
+    let stream_map_def = gen_stream_map_adapter(parsed, validation);
 
     let execute_dispatcher = gen_variant_dispatcher(parsed, variants, false, |sql_lit| {
         quote! {
@@ -543,25 +456,13 @@ fn gen_dynamic_executor_impls(
         }
     };
 
-    if has_any_params {
-        quote! {
-            #stream_map_def
+    quote! {
+        #stream_map_def
 
-            #[allow(non_camel_case_types)]
-            impl<'_bsql> #executor_name<'_bsql> {
-                #fetch_methods
-                #execute_method
-            }
-        }
-    } else {
-        quote! {
-            #stream_map_def
-
-            #[allow(non_camel_case_types)]
-            impl #executor_name {
-                #fetch_methods
-                #execute_method
-            }
+        #[allow(non_camel_case_types)]
+        impl<'_bsql> #executor_name<'_bsql> {
+            #fetch_methods
+            #execute_method
         }
     }
 }
@@ -667,10 +568,43 @@ fn gen_dynamic_constructor(parsed: &ParsedQuery) -> TokenStream {
         }
     }
 
-    if field_names.is_empty() {
-        quote! { #executor_name }
-    } else {
-        quote! { #executor_name { #(#field_names,)* _marker: ::std::marker::PhantomData } }
+    quote! { #executor_name { #(#field_names,)* _marker: ::std::marker::PhantomData } }
+}
+
+/// Generate the StreamMap adapter struct and Stream impl.
+///
+/// Shared between static and dynamic codegen paths.
+/// Returns empty tokens when the query has no columns.
+fn gen_stream_map_adapter(parsed: &ParsedQuery, validation: &ValidationResult) -> TokenStream {
+    if validation.columns.is_empty() {
+        return TokenStream::new();
+    }
+
+    let result_name = result_struct_name(parsed);
+    let row_decode = gen_row_decode(validation);
+
+    quote! {
+        /// Maps `QueryStream` (raw rows) to typed result structs.
+        struct StreamMap<T> {
+            inner: ::bsql_core::QueryStream,
+            _phantom: ::std::marker::PhantomData<T>,
+        }
+
+        impl ::bsql_core::Stream for StreamMap<#result_name> {
+            type Item = ::bsql_core::BsqlResult<#result_name>;
+
+            fn poll_next(
+                mut self: ::std::pin::Pin<&mut Self>,
+                cx: &mut ::std::task::Context<'_>,
+            ) -> ::std::task::Poll<Option<Self::Item>> {
+                ::std::pin::Pin::new(&mut self.inner)
+                    .poll_next(cx)
+                    .map(|opt| opt.map(|res| {
+                        let row = res?;
+                        Ok(#result_name { #row_decode })
+                    }))
+            }
+        }
     }
 }
 
@@ -689,18 +623,12 @@ fn gen_row_decode(validation: &ValidationResult) -> TokenStream {
 /// Generate the constructor expression that captures variables from scope.
 fn gen_constructor(parsed: &ParsedQuery) -> TokenStream {
     let executor_name = executor_struct_name(parsed);
+    let field_inits = parsed.params.iter().map(|p| {
+        let name = param_ident(&p.name);
+        quote! { #name }
+    });
 
-    if parsed.params.is_empty() {
-        quote! { #executor_name }
-    } else {
-        let field_inits = parsed.params.iter().map(|p| {
-            let name = param_ident(&p.name);
-            quote! { #name }
-        });
-
-        // Always emit PhantomData — matches the always-present `'_bsql`
-        quote! { #executor_name { #(#field_inits,)* _marker: ::std::marker::PhantomData } }
-    }
+    quote! { #executor_name { #(#field_inits,)* _marker: ::std::marker::PhantomData } }
 }
 
 /// Parse a Rust type string and inject `'_bsql` lifetime on bare references.
