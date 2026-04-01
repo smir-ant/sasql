@@ -100,8 +100,15 @@ fn query_impl(input: proc_macro2::TokenStream) -> Result<proc_macro2::TokenStrea
     } else {
         // Dynamic query path — has optional clauses
         let validation = if offline::is_offline() {
-            // OFFLINE: read cached validation result for the base variant
-            // Dynamic queries cache the canonical (variant 0) result
+            // OFFLINE: read cached validation result for the base variant.
+            //
+            // The cache stores variant 0's param_pg_oids, which only covers
+            // the base params (not optional clause params). Param type
+            // checking is skipped here because:
+            //  1. The online build already validated ALL variants' param types.
+            //  2. The cached columns are identical across all variants (the
+            //     SELECT list never changes, only WHERE clauses differ).
+            //  3. Codegen only needs the column info, not per-variant param OIDs.
             offline::lookup_cached_validation(&parsed)
                 .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?
         } else {
