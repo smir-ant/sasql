@@ -15,7 +15,9 @@ CREATE TABLE users (
     active BOOLEAN NOT NULL DEFAULT true,
     score SMALLINT NOT NULL DEFAULT 0,
     rating REAL NOT NULL DEFAULT 0.0,
-    balance DOUBLE PRECISION NOT NULL DEFAULT 0.0
+    balance DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    avatar BYTEA,                    -- nullable, for bytea test
+    tag_ids INTEGER[] NOT NULL DEFAULT '{}'  -- array type test
 );
 
 CREATE TABLE tickets (

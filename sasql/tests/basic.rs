@@ -288,3 +288,51 @@ async fn param_reuse_in_real_query() {
     ).fetch_one(&pool).await.unwrap();
     assert_eq!(user.id, 1);
 }
+
+#[tokio::test]
+async fn fetch_optional_multiple_rows_errors() {
+    let pool = pool().await;
+    // users table has 2+ rows with active=true — fetch_optional must error
+    let result = sasql::query!(
+        "SELECT id, login FROM users WHERE active = true"
+    ).fetch_optional(&pool).await;
+
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        SasqlError::Query(e) => {
+            assert!(e.message.contains("0 or 1 rows"), "unexpected: {}", e.message);
+        }
+        other => panic!("expected Query error, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn bytea_column_round_trip() {
+    let pool = pool().await;
+    let avatar: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
+    let id = 1i32;
+    // Set avatar
+    sasql::query!(
+        "UPDATE users SET avatar = $avatar: &[u8] WHERE id = $id: i32"
+    ).execute(&pool).await.unwrap();
+
+    // Read it back
+    let user = sasql::query!(
+        "SELECT id, avatar FROM users WHERE id = $id: i32"
+    ).fetch_one(&pool).await.unwrap();
+
+    assert_eq!(user.id, 1);
+    assert_eq!(user.avatar.as_deref(), Some(&[0xDE, 0xAD, 0xBE, 0xEF][..]));
+}
+
+#[tokio::test]
+async fn array_column_type() {
+    let pool = pool().await;
+    let id = 1i32;
+    let user = sasql::query!(
+        "SELECT id, tag_ids FROM users WHERE id = $id: i32"
+    ).fetch_one(&pool).await.unwrap();
+
+    assert_eq!(user.id, 1);
+    assert!(user.tag_ids.is_empty()); // default '{}'
+}
