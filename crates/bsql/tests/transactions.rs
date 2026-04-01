@@ -316,3 +316,138 @@ async fn independent_transactions_are_isolated() {
     tx1.rollback().await.unwrap();
     tx2.rollback().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// lazy BEGIN — transaction without queries never sends BEGIN
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn transaction_commit_without_queries_is_noop() {
+    // Create a pool with exactly 1 connection to prove the connection
+    // returns cleanly (if BEGIN were sent without COMMIT, the connection
+    // would be dirty and the pool slot lost).
+    let pool = Pool::builder()
+        .url("postgres://bsql:bsql@localhost/bsql_test")
+        .unwrap()
+        .max_size(1)
+        .build()
+        .await
+        .unwrap();
+
+    // Begin and immediately commit — no queries executed.
+    // Lazy BEGIN means no BEGIN/COMMIT round-trips sent.
+    let tx = pool.begin().await.unwrap();
+    tx.commit().await.unwrap();
+
+    // The single connection should be back in the pool, usable.
+    let id = 1i32;
+    let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(user.id, 1);
+}
+
+#[tokio::test]
+async fn transaction_rollback_without_queries_is_noop() {
+    let pool = Pool::builder()
+        .url("postgres://bsql:bsql@localhost/bsql_test")
+        .unwrap()
+        .max_size(1)
+        .build()
+        .await
+        .unwrap();
+
+    let tx = pool.begin().await.unwrap();
+    tx.rollback().await.unwrap();
+
+    // Connection should be clean and returned to pool.
+    let id = 1i32;
+    let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(user.id, 1);
+}
+
+#[tokio::test]
+async fn transaction_drop_without_queries_returns_connection_clean() {
+    let pool = Pool::builder()
+        .url("postgres://bsql:bsql@localhost/bsql_test")
+        .unwrap()
+        .max_size(1)
+        .build()
+        .await
+        .unwrap();
+
+    {
+        let _tx = pool.begin().await.unwrap();
+        // Drop without any queries — BEGIN was never sent.
+        // Connection should return to pool CLEAN (not discarded).
+    }
+
+    // If the connection was discarded (Object::take), the pool would need
+    // to create a new one. With max_size=1, a second acquire proves the
+    // connection is still in the pool.
+    let id = 1i32;
+    let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(user.id, 1, "connection should be clean and reusable");
+}
+
+#[tokio::test]
+async fn transaction_lazy_begin_first_query_triggers_begin() {
+    let pool = pool().await;
+    let tx = pool.begin().await.unwrap();
+
+    // First query inside tx triggers lazy BEGIN, then runs the query.
+    let id = 1i32;
+    let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
+        .fetch_one(&tx)
+        .await
+        .unwrap();
+    assert_eq!(user.id, 1);
+    assert_eq!(user.login, "alice");
+
+    tx.commit().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// transaction debug format
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn transaction_debug_format() {
+    let pool = pool().await;
+    let tx = pool.begin().await.unwrap();
+
+    let debug = format!("{:?}", tx);
+    assert!(debug.contains("Transaction"), "debug: {debug}");
+    assert!(debug.contains("active"), "debug: {debug}");
+    assert!(debug.contains("committed"), "debug: {debug}");
+    assert!(debug.contains("begun"), "debug: {debug}");
+
+    tx.rollback().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// execute inside transaction
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn transaction_execute_returns_affected_rows() {
+    let pool = pool().await;
+    let tx = pool.begin().await.unwrap();
+
+    let desc = "tx_execute_test";
+    let id = 1i32;
+    let affected = bsql::query!("UPDATE tickets SET description = $desc: &str WHERE id = $id: i32")
+        .execute(&tx)
+        .await
+        .unwrap();
+    assert_eq!(affected, 1);
+
+    tx.rollback().await.unwrap();
+}

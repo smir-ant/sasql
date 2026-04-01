@@ -160,3 +160,61 @@ async fn stream_with_optional_clause() {
     }
     assert!(count >= 2);
 }
+
+#[tokio::test]
+async fn stream_with_optional_clause_some() {
+    let pool = pool().await;
+    let dept: Option<i32> = Some(999);
+    let mut stream = bsql::query!(
+        "SELECT id, title FROM tickets
+         WHERE deleted_at IS NULL
+         [AND department_id = $dept: Option<i32>]
+         ORDER BY id"
+    )
+    .fetch_stream(&pool)
+    .await
+    .unwrap();
+
+    // dept=999 matches nothing
+    assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
+async fn stream_with_multiple_types() {
+    let pool = pool().await;
+    let id = 1i32;
+    let mut stream = bsql::query!(
+        "SELECT id, login, active, score, rating
+         FROM users WHERE id = $id: i32"
+    )
+    .fetch_stream(&pool)
+    .await
+    .unwrap();
+
+    let row = stream.next().await.unwrap().unwrap();
+    assert_eq!(row.id, 1);
+    assert_eq!(row.login, "alice");
+    assert!(row.active);
+    assert_eq!(row.score, 42i16);
+    assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
+async fn stream_early_drop_does_not_panic() {
+    let pool = pool().await;
+    // Create a stream and drop it immediately without consuming any rows
+    {
+        let _stream = bsql::query!("SELECT id, login FROM users ORDER BY id")
+            .fetch_stream(&pool)
+            .await
+            .unwrap();
+        // Dropped here
+    }
+    // Verify pool is still functional
+    let id = 1i32;
+    let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(user.id, 1);
+}

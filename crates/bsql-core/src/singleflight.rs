@@ -157,4 +157,109 @@ mod tests {
         let b = sql_key("SELECT name FROM users");
         assert_ne!(a, b);
     }
+
+    #[test]
+    fn complete_broadcasts_to_follower() {
+        let sf = Singleflight::new();
+        let _ = sf.try_join(42); // leader
+        let mut rx = match sf.try_join(42) {
+            FlightStatus::Follower(rx) => rx,
+            FlightStatus::Leader => panic!("expected follower"),
+        };
+
+        let rows: Arc<[Row]> = Arc::from(Vec::<Row>::new());
+        sf.complete(42, Arc::clone(&rows));
+
+        // Follower should receive the result
+        let received = rx.try_recv();
+        assert!(received.is_ok(), "follower should receive broadcast");
+    }
+
+    #[test]
+    fn abandon_closes_follower_channel() {
+        let sf = Singleflight::new();
+        let _ = sf.try_join(42); // leader
+        let mut rx = match sf.try_join(42) {
+            FlightStatus::Follower(rx) => rx,
+            FlightStatus::Leader => panic!("expected follower"),
+        };
+
+        sf.abandon(42);
+
+        // Follower's channel should be closed (sender dropped)
+        let result = rx.try_recv();
+        assert!(
+            result.is_err(),
+            "follower channel should be closed after abandon"
+        );
+    }
+
+    #[test]
+    fn complete_nonexistent_key_is_noop() {
+        let sf = Singleflight::new();
+        // complete on a key that was never registered — should not panic
+        sf.complete(999, Arc::from(Vec::<Row>::new()));
+    }
+
+    #[test]
+    fn abandon_nonexistent_key_is_noop() {
+        let sf = Singleflight::new();
+        // abandon on a key that was never registered — should not panic
+        sf.abandon(999);
+    }
+
+    #[test]
+    fn multiple_followers_all_receive() {
+        let sf = Singleflight::new();
+        let _ = sf.try_join(42); // leader
+
+        let mut rx1 = match sf.try_join(42) {
+            FlightStatus::Follower(rx) => rx,
+            _ => panic!("expected follower"),
+        };
+        let mut rx2 = match sf.try_join(42) {
+            FlightStatus::Follower(rx) => rx,
+            _ => panic!("expected follower"),
+        };
+
+        let rows: Arc<[Row]> = Arc::from(Vec::<Row>::new());
+        sf.complete(42, rows);
+
+        assert!(rx1.try_recv().is_ok(), "follower 1 should receive");
+        assert!(rx2.try_recv().is_ok(), "follower 2 should receive");
+    }
+
+    #[test]
+    fn reuse_key_after_complete() {
+        let sf = Singleflight::new();
+        let _ = sf.try_join(42);
+        sf.complete(42, Arc::from(Vec::<Row>::new()));
+
+        // Key is free again — new caller should be leader
+        assert!(matches!(sf.try_join(42), FlightStatus::Leader));
+    }
+
+    #[test]
+    fn reuse_key_after_abandon() {
+        let sf = Singleflight::new();
+        let _ = sf.try_join(42);
+        sf.abandon(42);
+
+        // Key is free again — new caller should be leader
+        assert!(matches!(sf.try_join(42), FlightStatus::Leader));
+    }
+
+    #[test]
+    fn sql_key_case_sensitive() {
+        let a = sql_key("SELECT id FROM users");
+        let b = sql_key("select id from users");
+        assert_ne!(a, b, "sql_key should be case-sensitive");
+    }
+
+    #[test]
+    fn sql_key_whitespace_sensitive() {
+        let a = sql_key("SELECT id FROM users");
+        let b = sql_key("SELECT  id  FROM  users");
+        assert_ne!(a, b, "sql_key should be whitespace-sensitive");
+    }
 }

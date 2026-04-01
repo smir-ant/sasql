@@ -342,6 +342,46 @@ async fn enum_string_as_param() {
 }
 
 // ---------------------------------------------------------------------------
+// Chrono tests (feature = "chrono" without "time")
+// ---------------------------------------------------------------------------
+
+#[cfg(all(feature = "chrono", not(feature = "time")))]
+mod chrono_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn chrono_timestamptz_round_trip() {
+        let pool = pool().await;
+        let now = chrono::Utc::now();
+        let id = 1i32;
+
+        // Set deadline using chrono
+        bsql::query!(
+            "UPDATE tickets SET deadline = $now: chrono::DateTime<chrono::Utc> WHERE id = $id: i32"
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Read it back
+        let ticket = bsql::query!("SELECT id, deadline FROM tickets WHERE id = $id: i32")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let deadline = ticket.deadline.expect("deadline should be set");
+        let diff = (deadline - now).num_milliseconds().unsigned_abs();
+        assert!(diff < 2, "timestamps differ by {diff}ms");
+
+        // Clean up
+        bsql::query!("UPDATE tickets SET deadline = NULL WHERE id = $id: i32")
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Decimal tests (feature = "decimal")
 // ---------------------------------------------------------------------------
 

@@ -392,3 +392,109 @@ async fn pool_builder_url_method() {
         .unwrap();
     assert!(users.len() >= 2);
 }
+
+// ---------------------------------------------------------------------------
+// additional coverage: error variant matching
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn fetch_one_multiple_rows_errors() {
+    let pool = pool().await;
+    let result = bsql::query!("SELECT id, login FROM users WHERE active = true")
+        .fetch_one(&pool)
+        .await;
+
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        BsqlError::Query(e) => {
+            assert!(
+                e.message.contains("exactly 1 row"),
+                "unexpected: {}",
+                e.message
+            );
+        }
+        other => panic!("expected Query error, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn pool_builder_max_size_and_status() {
+    let pool = Pool::builder()
+        .url("postgres://bsql:bsql@localhost/bsql_test")
+        .unwrap()
+        .max_size(4)
+        .build()
+        .await
+        .unwrap();
+
+    let status = pool.status();
+    assert_eq!(status.max_size, 4);
+}
+
+#[tokio::test]
+async fn pool_builder_connect_timeout() {
+    let pool = Pool::builder()
+        .url("postgres://bsql:bsql@localhost/bsql_test")
+        .unwrap()
+        .connect_timeout(10)
+        .build()
+        .await
+        .unwrap();
+
+    // Just verify the pool works with custom timeout
+    let id = 1i32;
+    let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(user.id, 1);
+}
+
+#[tokio::test]
+async fn pool_acquire_and_use() {
+    let pool = pool().await;
+    let conn = pool.acquire().await.unwrap();
+
+    let id = 1i32;
+    let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
+        .fetch_one(&conn)
+        .await
+        .unwrap();
+    assert_eq!(user.id, 1);
+}
+
+#[tokio::test]
+async fn pool_builder_bad_url_errors() {
+    let result = Pool::builder().url("not_a_url");
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn execute_returns_zero_for_no_match() {
+    let pool = pool().await;
+    let id = 999999i32;
+    let affected = bsql::query!("UPDATE tickets SET description = 'x' WHERE id = $id: i32")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(affected, 0);
+}
+
+#[tokio::test]
+async fn error_display_format() {
+    let pool = pool().await;
+    let id = 999999i32;
+    let err = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
+        .fetch_one(&pool)
+        .await
+        .unwrap_err();
+
+    let display = format!("{err}");
+    assert!(
+        display.contains("query error"),
+        "BsqlError Display should start with variant name: {display}"
+    );
+
+    // std::error::Error trait is implemented
+    let _: &dyn std::error::Error = &err;
+}

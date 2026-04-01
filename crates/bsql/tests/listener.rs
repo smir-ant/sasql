@@ -272,3 +272,65 @@ async fn listener_debug_format() {
     assert!(debug.contains("Listener"), "debug: {debug}");
     assert!(debug.contains("active"), "debug: {debug}");
 }
+
+#[tokio::test]
+async fn unlisten_empty_name_rejected() {
+    let listener = Listener::connect(DB_URL).await.unwrap();
+    let result = listener.unlisten("").await;
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        BsqlError::Connect(e) => {
+            assert!(
+                e.message.contains("must not be empty"),
+                "unexpected: {}",
+                e.message
+            );
+        }
+        other => panic!("expected Connect error, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn notify_empty_channel_rejected() {
+    let listener = Listener::connect(DB_URL).await.unwrap();
+    let result = listener.notify("", "payload").await;
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        BsqlError::Connect(e) => {
+            assert!(
+                e.message.contains("must not be empty"),
+                "unexpected: {}",
+                e.message
+            );
+        }
+        other => panic!("expected Connect error, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn channel_name_with_double_quotes() {
+    let mut listener = Listener::connect(DB_URL).await.unwrap();
+    // Channel name with embedded double quotes — tests quote_ident escaping
+    listener.listen(r#"my"chan"#).await.unwrap();
+    listener.notify(r#"my"chan"#, "quoted").await.unwrap();
+
+    let notif = listener.recv().await.unwrap();
+    assert_eq!(notif.channel(), r#"my"chan"#);
+    assert_eq!(notif.payload(), "quoted");
+}
+
+#[tokio::test]
+async fn large_payload() {
+    let mut listener = Listener::connect(DB_URL).await.unwrap();
+    listener.listen("large_payload_test").await.unwrap();
+
+    // PG NOTIFY payloads can be up to ~8000 bytes
+    let payload = "x".repeat(4000);
+    listener
+        .notify("large_payload_test", &payload)
+        .await
+        .unwrap();
+
+    let notif = listener.recv().await.unwrap();
+    assert_eq!(notif.payload().len(), 4000);
+}

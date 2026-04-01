@@ -4,6 +4,7 @@
 //! It has four variants matching the four failure modes of a database operation:
 //! pool, query execution, data decoding, and initial connection.
 
+use std::borrow::Cow;
 use std::fmt;
 
 /// The error type for all bsql operations.
@@ -27,14 +28,14 @@ pub enum BsqlError {
 /// Connection pool failure.
 #[derive(Debug)]
 pub struct PoolError {
-    pub message: String,
+    pub message: Cow<'static, str>,
     pub(crate) source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
 /// Query execution failure. Contains the PostgreSQL error code when available.
 #[derive(Debug)]
 pub struct QueryError {
-    pub message: String,
+    pub message: Cow<'static, str>,
     /// The five-character SQLSTATE code (e.g. `"23505"` for unique violation).
     pub pg_code: Option<String>,
     pub(crate) source: Option<Box<dyn std::error::Error + Send + Sync>>,
@@ -51,7 +52,7 @@ pub struct DecodeError {
 /// Initial connection failure.
 #[derive(Debug)]
 pub struct ConnectError {
-    pub message: String,
+    pub message: Cow<'static, str>,
     pub(crate) source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
@@ -79,10 +80,9 @@ impl fmt::Display for PoolError {
 
 impl fmt::Display for QueryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(code) = &self.pg_code {
-            write!(f, "[{code}] {}", self.message)
-        } else {
-            f.write_str(&self.message)
+        match &self.pg_code {
+            Some(code) => write!(f, "[{code}] {}", self.message),
+            None => f.write_str(&self.message),
         }
     }
 }
@@ -145,7 +145,7 @@ impl std::error::Error for ConnectError {
 impl From<tokio_postgres::Error> for BsqlError {
     fn from(e: tokio_postgres::Error) -> Self {
         let pg_code = e.code().map(|c| c.code().to_owned());
-        let message = e.to_string();
+        let message = Cow::Owned(e.to_string());
         BsqlError::Query(QueryError {
             message,
             pg_code,
@@ -156,7 +156,7 @@ impl From<tokio_postgres::Error> for BsqlError {
 
 impl From<deadpool_postgres::PoolError> for BsqlError {
     fn from(e: deadpool_postgres::PoolError) -> Self {
-        let message = e.to_string();
+        let message = Cow::Owned(e.to_string());
         BsqlError::Pool(PoolError {
             message,
             source: Some(Box::new(e)),
@@ -169,7 +169,7 @@ impl From<deadpool_postgres::PoolError> for BsqlError {
 impl PoolError {
     pub fn exhausted() -> BsqlError {
         BsqlError::Pool(PoolError {
-            message: "pool exhausted: all connections in use".into(),
+            message: Cow::Borrowed("pool exhausted: all connections in use"),
             source: None,
         })
     }
@@ -178,7 +178,7 @@ impl PoolError {
 impl ConnectError {
     pub fn create(msg: impl Into<String>) -> BsqlError {
         BsqlError::Connect(ConnectError {
-            message: msg.into(),
+            message: Cow::Owned(msg.into()),
             source: None,
         })
     }
@@ -188,7 +188,7 @@ impl ConnectError {
         source: impl std::error::Error + Send + Sync + 'static,
     ) -> BsqlError {
         BsqlError::Connect(ConnectError {
-            message: msg.into(),
+            message: Cow::Owned(msg.into()),
             source: Some(Box::new(source)),
         })
     }
@@ -197,7 +197,7 @@ impl ConnectError {
 impl QueryError {
     pub fn row_count(expected: &str, actual: u64) -> BsqlError {
         BsqlError::Query(QueryError {
-            message: format!("expected {expected}, got {actual} rows"),
+            message: Cow::Owned(format!("expected {expected}, got {actual} rows")),
             pg_code: None,
             source: None,
         })
@@ -207,6 +207,7 @@ impl QueryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::error::Error as _;
 
     #[test]
     fn pool_error_display() {
@@ -220,7 +221,7 @@ mod tests {
     #[test]
     fn query_error_with_code_display() {
         let e = BsqlError::Query(QueryError {
-            message: "duplicate key".into(),
+            message: Cow::Borrowed("duplicate key"),
             pg_code: Some("23505".into()),
             source: None,
         });
@@ -281,5 +282,71 @@ mod tests {
         fn _accepts_pool_error(e: deadpool_postgres::PoolError) -> BsqlError {
             e.into()
         }
+    }
+
+    #[test]
+    fn pool_exhausted_uses_borrowed_cow() {
+        let e = PoolError::exhausted();
+        match e {
+            BsqlError::Pool(ref pe) => {
+                assert!(
+                    matches!(pe.message, Cow::Borrowed(_)),
+                    "exhausted() should use Cow::Borrowed for zero-alloc"
+                );
+            }
+            _ => panic!("expected Pool variant"),
+        }
+    }
+
+    #[test]
+    fn connect_error_uses_owned_cow() {
+        let e = ConnectError::create("dynamic message");
+        match e {
+            BsqlError::Connect(ref ce) => {
+                assert!(
+                    matches!(ce.message, Cow::Owned(_)),
+                    "create() with dynamic msg should use Cow::Owned"
+                );
+            }
+            _ => panic!("expected Connect variant"),
+        }
+    }
+
+    #[test]
+    fn query_row_count_uses_owned_cow() {
+        let e = QueryError::row_count("exactly 1 row", 5);
+        match e {
+            BsqlError::Query(ref qe) => {
+                assert!(
+                    matches!(qe.message, Cow::Owned(_)),
+                    "row_count() with formatted msg should use Cow::Owned"
+                );
+            }
+            _ => panic!("expected Query variant"),
+        }
+    }
+
+    #[test]
+    fn pool_error_source_chain() {
+        let e = PoolError::exhausted();
+        // exhausted() has no source
+        assert!(e.source().is_none());
+    }
+
+    #[test]
+    fn connect_error_with_source_chain() {
+        let inner = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        let e = ConnectError::with_source("connection failed", inner);
+        assert!(e.source().is_some());
+    }
+
+    #[test]
+    fn decode_error_has_no_source() {
+        let e = BsqlError::Decode(DecodeError {
+            column: "col".into(),
+            expected: "i32",
+            actual: "text".into(),
+        });
+        assert!(e.source().is_none());
     }
 }

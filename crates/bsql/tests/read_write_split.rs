@@ -169,3 +169,67 @@ async fn transaction_always_uses_primary() {
 
     txn.rollback().await.unwrap();
 }
+
+/// PoolConnection queries always use primary (connection is bound).
+#[tokio::test]
+async fn pool_connection_uses_primary() {
+    let pool = Pool::builder()
+        .host("localhost")
+        .port(5432)
+        .dbname("bsql_test")
+        .user("bsql")
+        .password("bsql")
+        .replica("postgres://bsql:bsql@localhost/bsql_test")
+        .build()
+        .await
+        .unwrap();
+
+    let conn = pool.acquire().await.unwrap();
+
+    let users = bsql::query!("SELECT id, login FROM users ORDER BY id")
+        .fetch_all(&conn)
+        .await
+        .unwrap();
+    assert!(users.len() >= 2);
+}
+
+/// Execute (DML) always hits primary even with replicas.
+#[tokio::test]
+async fn execute_always_uses_primary_with_replicas() {
+    let pool = Pool::builder()
+        .host("localhost")
+        .port(5432)
+        .dbname("bsql_test")
+        .user("bsql")
+        .password("bsql")
+        .replica("postgres://bsql:bsql@localhost/bsql_test")
+        .build()
+        .await
+        .unwrap();
+
+    let desc = "rw-split-execute-with-replica";
+    let id = 1i32;
+    let affected = bsql::query!("UPDATE tickets SET description = $desc: &str WHERE id = $id: i32")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(affected, 1);
+}
+
+/// Pool status reflects connection counts.
+#[tokio::test]
+async fn pool_status_reports_metrics() {
+    let pool = pool().await;
+    let status = pool.status();
+    assert!(status.max_size > 0, "max_size should be positive");
+    assert!(status.max_size >= status.size, "size <= max_size");
+}
+
+/// Pool without replicas reports is_pgbouncer false for direct connections.
+#[tokio::test]
+async fn pool_direct_is_not_pgbouncer() {
+    let pool = pool().await;
+    // Direct connection (not through PgBouncer) should report false
+    assert!(!pool.is_pgbouncer());
+    assert!(pool.supports_named_statements());
+}

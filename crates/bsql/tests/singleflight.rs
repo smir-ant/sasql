@@ -135,3 +135,77 @@ async fn execute_not_affected_by_singleflight() {
         .unwrap();
     assert_eq!(affected, 1);
 }
+
+/// After concurrent queries complete, subsequent queries still work.
+/// Verifies singleflight does not leak entries or corrupt state.
+#[tokio::test]
+async fn queries_work_after_concurrent_burst() {
+    use std::sync::Arc;
+
+    let pool = Arc::new(pool().await);
+
+    // Burst of 20 concurrent identical queries
+    let mut handles = Vec::new();
+    for _ in 0..20 {
+        let pool = Arc::clone(&pool);
+        handles.push(tokio::spawn(async move {
+            bsql::query!("SELECT id, login FROM users ORDER BY id")
+                .fetch_all(pool.as_ref())
+                .await
+        }));
+    }
+
+    for handle in handles {
+        let _ = handle.await.expect("task panicked").unwrap();
+    }
+
+    // After the burst, normal queries should still work
+    let id = 1i32;
+    let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
+        .fetch_one(pool.as_ref())
+        .await
+        .unwrap();
+    assert_eq!(user.id, 1);
+    assert_eq!(user.login, "alice");
+}
+
+/// fetch_optional through singleflight path works.
+#[tokio::test]
+async fn singleflight_fetch_optional_works() {
+    let pool = pool().await;
+    let id = 1i32;
+    let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+    assert!(user.is_some());
+    assert_eq!(user.unwrap().login, "alice");
+}
+
+/// Different SQL texts are independently handled by singleflight.
+#[tokio::test]
+async fn different_queries_are_independent() {
+    use std::sync::Arc;
+
+    let pool = Arc::new(pool().await);
+
+    let pool1 = Arc::clone(&pool);
+    let h1 = tokio::spawn(async move {
+        bsql::query!("SELECT id, login FROM users ORDER BY id")
+            .fetch_all(pool1.as_ref())
+            .await
+    });
+
+    let pool2 = Arc::clone(&pool);
+    let h2 = tokio::spawn(async move {
+        bsql::query!("SELECT id FROM tickets ORDER BY id")
+            .fetch_all(pool2.as_ref())
+            .await
+    });
+
+    let users = h1.await.expect("task panicked").unwrap();
+    let tickets = h2.await.expect("task panicked").unwrap();
+
+    assert!(users.len() >= 2);
+    assert!(!tickets.is_empty());
+}
