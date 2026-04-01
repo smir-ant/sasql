@@ -66,22 +66,17 @@ fn query_impl(input: proc_macro2::TokenStream) -> Result<proc_macro2::TokenStrea
         syn::Error::new(proc_macro2::Span::call_site(), msg)
     })?;
 
-    // 2. Check param declarations (duplicates, etc.) — no PG needed
-    validate::check_param_declarations(&parsed.params).map_err(|msg| {
-        syn::Error::new(proc_macro2::Span::call_site(), msg)
-    })?;
-
-    // 3. Validate against PostgreSQL via PREPARE
+    // 2. Validate against PostgreSQL via PREPARE
     let validation = connection::with_connection(|rt, client| {
         validate::validate_query(&parsed, rt, client)
     })?;
 
-    // 4. Check parameter type compatibility
+    // 3. Check parameter type compatibility
     validate::check_param_types(&parsed, &validation).map_err(|msg| {
         syn::Error::new(proc_macro2::Span::call_site(), msg)
     })?;
 
-    // 5. Generate Rust code
+    // 4. Generate Rust code
     Ok(codegen::generate_query_code(&parsed, &validation))
 }
 

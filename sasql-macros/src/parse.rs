@@ -34,8 +34,6 @@ pub enum QueryKind {
 /// Result of parsing a `query!` macro invocation.
 #[derive(Debug, Clone)]
 pub struct ParsedQuery {
-    /// The original SQL exactly as the user wrote it (with `$name: Type`).
-    pub raw_sql: String,
     /// Normalized SQL with params replaced by `$1`, `$2`, etc.
     /// Whitespace collapsed, keywords lowercased, comments stripped.
     pub normalized_sql: String,
@@ -47,6 +45,7 @@ pub struct ParsedQuery {
     /// What kind of DML this is.
     pub kind: QueryKind,
     /// Whether the query has a RETURNING clause.
+    #[allow(dead_code)] // tested in parse tests; will be consumed by codegen
     pub has_returning: bool,
     /// Prepared statement name: `s_{rapidhash:016x}`.
     pub statement_name: String,
@@ -67,7 +66,6 @@ pub fn parse_query(sql: &str) -> Result<ParsedQuery, String> {
     let stmt_name = statement_name(&normalized_sql);
 
     Ok(ParsedQuery {
-        raw_sql: sql.to_owned(),
         normalized_sql,
         positional_sql,
         params,

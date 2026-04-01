@@ -7,7 +7,7 @@
 use tokio::runtime::Runtime;
 use tokio_postgres::Client;
 
-use crate::parse::{Param, ParsedQuery};
+use crate::parse::ParsedQuery;
 
 /// Metadata about a single result column, resolved from PostgreSQL.
 #[derive(Debug, Clone)]
@@ -15,10 +15,13 @@ pub struct ColumnInfo {
     /// Column name as returned by PostgreSQL.
     pub name: String,
     /// PostgreSQL type OID.
+    #[allow(dead_code)] // retained for diagnostics and future error messages
     pub pg_oid: u32,
     /// PostgreSQL type name (e.g. `"int4"`, `"text"`).
+    #[allow(dead_code)] // retained for diagnostics and future error messages
     pub pg_type_name: String,
     /// Whether this column can be NULL.
+    #[allow(dead_code)] // retained for diagnostics; nullability is baked into rust_type
     pub is_nullable: bool,
     /// The Rust type string for code generation (e.g. `"i32"`, `"Option<String>"`).
     pub rust_type: String,
@@ -213,35 +216,5 @@ fn format_pg_error(e: &tokio_postgres::Error, parsed: &ParsedQuery) -> String {
         out
     } else {
         format!("PostgreSQL error: {msg}\n  SQL: {}", parsed.positional_sql)
-    }
-}
-
-/// Verify parameter declarations in the parsed query.
-/// Called before connecting to PG — catches obvious errors early.
-///
-/// Note: duplicate parameter names are handled in `extract_params` (they are
-/// unified to the same positional index if types match, or rejected with an
-/// error if types conflict). By the time this function is called, `params`
-/// contains only unique entries.
-pub fn check_param_declarations(_params: &[Param]) -> Result<(), String> {
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unique_param_names_pass() {
-        let params = vec![
-            Param { name: "id".into(), rust_type: "i32".into(), position: 1 },
-            Param { name: "name".into(), rust_type: "&str".into(), position: 2 },
-        ];
-        assert!(check_param_declarations(&params).is_ok());
-    }
-
-    #[test]
-    fn empty_params_pass() {
-        assert!(check_param_declarations(&[]).is_ok());
     }
 }

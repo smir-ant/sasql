@@ -5,7 +5,7 @@
 
 use tokio_postgres::types::ToSql;
 
-use crate::error::{QueryError, SasqlError, SasqlResult};
+use crate::error::{SasqlError, SasqlResult};
 use crate::pool::{Pool, PoolConnection};
 
 /// Execute a prepared query and return raw rows.
@@ -67,12 +67,12 @@ impl Executor for PoolConnection {
             .inner
             .prepare_cached(sql)
             .await
-            .map_err(pg_err_to_query)?;
+            .map_err(SasqlError::from)?;
 
         self.inner
             .query(&stmt, params)
             .await
-            .map_err(pg_err_to_sasql)
+            .map_err(SasqlError::from)
     }
 
     async fn execute_raw(
@@ -84,25 +84,11 @@ impl Executor for PoolConnection {
             .inner
             .prepare_cached(sql)
             .await
-            .map_err(pg_err_to_query)?;
+            .map_err(SasqlError::from)?;
 
         self.inner
             .execute(&stmt, params)
             .await
-            .map_err(pg_err_to_sasql)
+            .map_err(SasqlError::from)
     }
-}
-
-fn pg_err_to_query(e: tokio_postgres::Error) -> SasqlError {
-    let message = e.to_string();
-    let pg_code = e.code().map(|c| c.code().to_owned());
-    SasqlError::Query(QueryError {
-        message,
-        pg_code,
-        source: Some(Box::new(e)),
-    })
-}
-
-fn pg_err_to_sasql(e: tokio_postgres::Error) -> SasqlError {
-    SasqlError::from(e)
 }
