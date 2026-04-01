@@ -1,11 +1,11 @@
 # sasql
 
-- **Your SQL is checked before your program even runs.** Every query is validated against a real PostgreSQL database during compilation. If your code compiles, every SQL query in it is guaranteed to be correct.
-- **There is no way to write unchecked SQL.** Other libraries give you a "safe" function and an "unsafe" function side by side. sasql only has the safe one. The unsafe one doesn't exist.
-- **You write real SQL, not a substitute.** No custom query language to learn. If you know PostgreSQL, you know sasql. CTEs, JOINs, window functions, subqueries — all work on day one.
-- **Dangerous patterns are caught at compile time.** `UPDATE` without `WHERE`? Won't compile. Wrong column type? Won't compile. Table doesn't exist? Won't compile.
-- **No unsafe memory operations anywhere.** The entire codebase is proven free of unsafe code by the Rust compiler itself.
-- **Your app never hangs waiting for a database connection.** If connections are exhausted, you get an error instantly — not after a timeout.
+- **If it compiles, every SQL query is correct.** Validated against a real PostgreSQL instance during `cargo build`. Not at runtime. Not "if you use the right function". Always.
+- **No escape hatch exists.** There is no function that accepts unchecked SQL. Not deprecated, not hidden — it does not exist.
+- **Pure SQL, not a DSL.** Write real PostgreSQL — CTEs, JOINs, window functions, subqueries. If you know SQL, you know sasql.
+- **100% unsafe-free.** Guaranteed by the Rust compiler. No exceptions, no opt-outs.
+- **Fail-fast, not fail-silent.** No timeouts. No "wait and hope". Every failure is immediate and explicit.
+- **Dangerous SQL won't compile.** `UPDATE` without `WHERE`, wrong column type, nonexistent table — all caught before the binary is produced.
 
 ```rust
 let id = 42i32;
@@ -17,32 +17,33 @@ let user = sasql::query!(
 
 ---
 
-## Why Does This Matter?
+## Why Not the Alternatives?
 
-Imagine you have 500 SQL queries in your project. All of them are validated at compile time. Your codebase is "safe."
+| Library | What's missing |
+|---------|---------------|
+| **sqlx** | `query()` and `query!()` live side by side. One missing `!` — no compile-time check, runtime crash. You won't see it in code review. |
+| **Diesel** | Complex SQL (CTEs, window functions, `LATERAL`) can't be expressed in the DSL. You end up calling `sql_query()` — raw strings, zero validation. |
+| **SeaORM** | No compile-time SQL checking at all. Every error is discovered when the query hits PostgreSQL in production. |
+| **Cornucopia / Clorinde** | SQL lives in separate `.sql` files. Dozens of files, constant jumping between SQL and Rust. No dynamic queries. At scale, unmaintainable. |
 
-Then someone adds one query using an unchecked function. Maybe they were in a hurry. Maybe the safe macro didn't support their use case. That one query bypasses all safety checks. It has a typo in a column name. It deploys to production. It crashes at 3 AM.
+What sasql does differently:
 
-Every existing Rust SQL library makes this possible:
+- **Inline SQL** — your query lives next to the code that uses it. No file-hopping. Code review sees SQL and Rust in the same diff.
+- **No unchecked path** — not "be disciplined and use the safe function". There is only one function. It is safe.
+- **Dynamic queries** (v0.3) — optional clauses `[AND col = $param]` expand to every combination at compile time. Each combination is validated. No string concatenation.
+- **Architecture for performance** — designed from day one for arena allocation, binary PostgreSQL protocol, SIMD-accelerated processing, and sonic-rs for JSONB. Not bolted on later.
 
-- **sqlx** provides both `query!()` (safe) and `query()` (unchecked) in the same module. Nothing prevents using the wrong one.
-- **Diesel** provides `sql_query()` for writing raw SQL strings when the DSL can't express your query. No validation.
-- **SeaORM** doesn't check any SQL at compile time. All errors are discovered at runtime.
-- **Cornucopia** is fully safe, but SQL lives in separate files. You constantly jump between `.sql` files and Rust code. No dynamic queries.
+## What Gets Checked at Compile Time
 
-sasql makes the unchecked path impossible. There is no function to misuse. If your project uses sasql, every SQL query is validated — not because developers are disciplined, but because there is no alternative.
-
-## What Gets Checked
-
-| What | What happens |
-|------|-------------|
-| Table name has a typo | Compile error: `table "tcikets" not found` |
-| Column doesn't exist | Compile error: `column "naem" not found in table "users"` |
-| Parameter type is wrong | Compile error: `expected i32, found &str for column "users.id"` |
-| Column can be NULL | Automatically becomes `Option<T>` in your Rust struct |
-| `UPDATE` without `WHERE` | Compile error: refuses to compile a full-table update |
-| `DELETE` without `WHERE` | Compile error: refuses to compile a full-table delete |
-| SQL syntax error | Compile error with PostgreSQL's own error message |
+| Your mistake | What happens |
+|-------------|-------------|
+| Table name typo | `table "tcikets" not found` |
+| Column doesn't exist | `column "naem" not found in table "users"` |
+| Wrong parameter type | `expected i32, found &str for column "users.id"` |
+| Nullable column | Automatically becomes `Option<T>` — you can't forget to handle NULL |
+| `UPDATE` without `WHERE` | Won't compile — prevents accidental full-table updates |
+| `DELETE` without `WHERE` | Won't compile — same protection |
+| SQL syntax error | PostgreSQL's own error message, at compile time |
 
 ## Quick Start
 
@@ -51,8 +52,6 @@ sasql makes the unchecked path impossible. There is no function to misuse. If yo
 sasql = { version = "0.2", features = ["time", "uuid"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
-
-Tell sasql where your database is (for compile-time validation):
 
 ```bash
 export SASQL_DATABASE_URL="postgres://user:pass@localhost/mydb"
@@ -65,51 +64,32 @@ use sasql::Pool;
 async fn main() -> Result<(), sasql::SasqlError> {
     let pool = Pool::connect("postgres://user:pass@localhost/mydb").await?;
 
-    // This query is validated at compile time.
-    // If the table, columns, or types are wrong — it won't compile.
     let id = 1i32;
     let user = sasql::query!(
         "SELECT id, login, first_name FROM users WHERE id = $id: i32"
     ).fetch_one(&pool).await?;
 
-    // The result is a typed struct — IDE autocomplete works.
     println!("{} ({})", user.first_name, user.login);
-
-    // INSERT with RETURNING — also compile-time validated
-    let title = "Fix the bug";
-    let creator = 1i32;
-    let ticket = sasql::query!(
-        "INSERT INTO tickets (title, created_by_user_id)
-         VALUES ($title: &str, $creator: i32)
-         RETURNING id"
-    ).fetch_one(&pool).await?;
-
-    println!("Created ticket #{}", ticket.id);
-
     Ok(())
 }
 ```
 
 ## Optional Type Support
 
-By default, sasql supports basic types (integers, floats, booleans, strings, byte arrays). For dates, UUIDs, or decimals, enable the feature you need:
-
 ```toml
 sasql = { version = "0.2", features = ["time", "uuid", "decimal"] }
 ```
 
-| Feature | What it adds | PostgreSQL types |
-|---------|-------------|-----------------|
-| `time` | Dates and timestamps | TIMESTAMPTZ, TIMESTAMP, DATE, TIME |
-| `chrono` | Dates and timestamps (alternative) | Same as `time` |
-| `uuid` | Universally unique identifiers | UUID |
-| `decimal` | Exact decimal numbers | NUMERIC, DECIMAL |
+| Feature | PostgreSQL types | Rust types |
+|---------|-----------------|------------|
+| `time` | TIMESTAMPTZ, TIMESTAMP, DATE, TIME | `time::OffsetDateTime`, `Date`, `Time` |
+| `chrono` | Same (alternative to `time`) | `chrono::DateTime<Utc>`, `NaiveDateTime` |
+| `uuid` | UUID | `uuid::Uuid` |
+| `decimal` | NUMERIC, DECIMAL | `rust_decimal::Decimal` |
 
-If your query returns a column that needs a feature you haven't enabled, you get a clear compile error telling you exactly which feature to add.
+No default features. If a column needs a feature you haven't enabled — clear compile error with the feature name.
 
 ## PostgreSQL Enums
-
-Map PostgreSQL enum types to Rust enums with compile-time safety:
 
 ```rust
 #[sasql::pg_enum]
@@ -121,59 +101,42 @@ enum TicketStatus {
 }
 ```
 
-The generated code only accepts the specific PostgreSQL enum type it was designed for — it won't silently deserialize a different enum type with overlapping labels.
-
-## How It Works
-
-When you run `cargo build`:
-
-1. The `query!()` macro extracts your SQL and parameter declarations
-2. It connects to PostgreSQL (once per build, shared across all queries)
-3. It runs `PREPARE` — PostgreSQL validates the SQL syntax, table names, column names, and types
-4. It introspects `pg_catalog` to determine which columns are nullable
-5. It generates a Rust struct with correctly typed fields
-6. If anything is wrong, compilation stops with a clear error message
-
-The compiled binary contains only validated SQL. There is no runtime SQL parsing, no string concatenation, no chance of a query failing because of a typo.
+Type-safe PG enum mapping. Only accepts the specific PostgreSQL enum type it was defined for.
 
 ## Execution Methods
 
-| Method | Returns | When to use |
-|--------|---------|-------------|
-| `.fetch_one(&pool)` | One row (`T`) | When exactly one row is expected |
-| `.fetch_all(&pool)` | All rows (`Vec<T>`) | When you want all matching rows |
-| `.fetch_optional(&pool)` | Maybe one row (`Option<T>`) | When the row might not exist |
-| `.execute(&pool)` | Affected row count (`u64`) | For INSERT/UPDATE/DELETE without RETURNING |
+| Method | Returns | Use when |
+|--------|---------|----------|
+| `.fetch_one(&pool)` | `T` | Exactly one row expected |
+| `.fetch_all(&pool)` | `Vec<T>` | All matching rows |
+| `.fetch_optional(&pool)` | `Option<T>` | Row might not exist |
+| `.execute(&pool)` | `u64` | INSERT/UPDATE/DELETE without RETURNING |
 
 ## What sasql Is Not
 
-- **Not an ORM.** No `User::find(42)`, no `user.save()`, no `belongs_to`. You write SQL.
-- **Not a query builder.** No `.filter()`, `.select()`, `.join()` method chains. You write SQL.
-- **Not database-agnostic.** Built for PostgreSQL. Not MySQL. Not SQLite. PostgreSQL.
-- **Not a migration tool.** Use whatever migration tool you prefer — sasql validates against whatever schema exists.
+- **Not an ORM.** You write SQL, not method chains.
+- **Not a query builder.** No `.filter()`, `.select()`, `.join()`.
+- **Not database-agnostic.** PostgreSQL only.
+- **Not a migration tool.** Use dbmate, sqitch, or whatever you prefer.
 
 ## Roadmap
 
-See the full roadmap on GitHub: [Projects](https://github.com/smir-ant/sasql/milestones)
-
 | Version | Status | What |
 |---------|--------|------|
-| v0.1 | Released | `query!` macro, compile-time validation, base types, connection pool |
-| v0.2 | **Current** | Feature-gated types (`time`, `uuid`, `decimal`), PG enums, CI pipeline |
-| v0.3 | Planned | Dynamic queries with compile-time verified optional clauses |
-| v0.4 | Planned | Offline mode — validate without a live database |
-| v0.5 | Planned | Transactions with automatic rollback on drop |
-| v0.6 | Planned | Request coalescing, streaming results, LISTEN/NOTIFY |
-| v0.7 | Planned | Cross-query analysis, query plan insights, automatic read/write splitting |
-| v1.0 | Planned | Stable release with arena allocation, binary protocol, SIMD optimizations |
+| v0.1 | Released | `query!` macro, compile-time validation, base types, pool |
+| v0.2 | **Current** | `time`, `uuid`, `decimal`, `chrono`, PG enums, CI on PG 15-18 |
+| v0.3 | Planned | Dynamic queries: `[optional clauses]`, sort enums |
+| v0.4 | Planned | Offline mode: `sasql prepare` + bitcode cache. Configurable database URL sources beyond env vars |
+| v0.5 | Planned | Transactions: `begin()`, `commit()`, `rollback()`, auto-rollback on drop |
+| v0.6 | Planned | Singleflight request coalescing, streaming, LISTEN/NOTIFY |
+| v0.7 | Planned | Cross-query analysis, EXPLAIN at compile time, read/write splitting |
+| v1.0 | Planned | Arena allocation, binary protocol, SIMD, stable API |
 
 ## About the Development Process
 
-This project was built with [Claude Code](https://claude.ai/code). I could have hidden that. But ask yourself: would you trust a strong solo developer more, or a strong solo developer backed by an advisor with the collective knowledge of the entire software engineering field?
+Built with [Claude Code](https://claude.ai/code). Specifications and 17 design principles written before the first line of code. Six rounds of architectural audit. 166 tests — unit, integration, and compile-fail — proving not just that the code works, but that broken code is rejected.
 
-What matters is not who wrote the code. What matters is the process: specifications written before the first line of code. 17 non-negotiable design principles. Six rounds of architectural audit before implementation began. 166 tests — unit, integration, and compile-fail — that prove not just that the code works, but that broken code is rejected.
-
-Without this process, I would not have considered bitcode for serialization, arena allocation for result sets, or rapidhash over FNV-1a. I would have written tests that confirm the code handles specific inputs, not tests that prove the system rejects invalid ones. I would have shipped UTF-8 bugs in the SQL parser because I would have tested with ASCII and called it done.
+Without this process, I would not have discovered bitcode for serialization, rapidhash over FNV-1a, or the fail-fast pool pattern. I would have shipped UTF-8 bugs because I would have tested with ASCII only.
 
 The value is in the discipline: constant audits, clear specifications, and test coverage that treats every untested path as a bug.
 
