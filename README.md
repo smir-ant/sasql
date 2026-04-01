@@ -24,14 +24,14 @@ let user = sasql::query!(
 | **sqlx** | `query()` and `query!()` live side by side. One missing `!` — no compile-time check, runtime crash. You won't see it in code review. |
 | **Diesel** | Complex SQL (CTEs, window functions, `LATERAL`) can't be expressed in the DSL. You end up calling `sql_query()` — raw strings, zero validation. |
 | **SeaORM** | No compile-time SQL checking at all. Every error is discovered when the query hits PostgreSQL in production. |
-| **Cornucopia / Clorinde** | SQL lives in separate `.sql` files. Dozens of files, constant jumping between SQL and Rust. No dynamic queries. At scale, unmaintainable. |
+| **Cornucopia / Clorinde** | SQL in separate `.sql` files — either one unreadable giant file or dozens of scattered ones. File-hopping hell. No dynamic queries. |
 
 What sasql does differently:
 
-- **Inline SQL** — your query lives next to the code that uses it. No file-hopping. Code review sees SQL and Rust in the same diff.
+- **Inline SQL** — the query is where it's used. No jumping between files. Code review sees SQL and Rust in the same diff.
 - **No unchecked path** — not "be disciplined and use the safe function". There is only one function. It is safe.
-- **Dynamic queries** (v0.3) — optional clauses `[AND col = $param]` expand to every combination at compile time. Each combination is validated. No string concatenation.
-- **Architecture for performance** — designed from day one for arena allocation, binary PostgreSQL protocol, SIMD-accelerated processing, and sonic-rs for JSONB. Not bolted on later.
+- **Dynamic queries** — optional clauses `[AND col = $param]` expand to every combination at compile time. Each combination is validated. No string concatenation.
+- **Built for performance** — arena allocation, binary PostgreSQL protocol, SIMD-accelerated processing, sonic-rs for JSONB. Not optimizations added later — architectural decisions.
 
 ## What Gets Checked at Compile Time
 
