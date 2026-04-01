@@ -221,14 +221,20 @@ mod time_tests {
     #[tokio::test]
     async fn select_nullable_time_column() {
         let pool = pool().await;
-        let id = 1i32;
-        let ticket = sasql::query!("SELECT id, start_time FROM tickets WHERE id = $id: i32")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        // Insert a fresh ticket with no start_time (NULL by default)
+        let title = "nullable_time_test";
+        let uid = 1i32;
+        let ticket = sasql::query!(
+            "INSERT INTO tickets (title, status, created_by_user_id)
+             VALUES ($title: &str, 'new', $uid: i32)
+             RETURNING id, start_time"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
 
-        assert_eq!(ticket.id, 1);
-        // Default is NULL
+        assert!(ticket.id > 0);
+        // start_time has no default → NULL
         assert!(ticket.start_time.is_none());
     }
 
@@ -236,24 +242,26 @@ mod time_tests {
     async fn time_round_trip() {
         let pool = pool().await;
         let t = time::Time::from_hms(14, 30, 0).expect("valid time");
-        let id = 1i32;
 
-        sasql::query!("UPDATE tickets SET start_time = $t: time::Time WHERE id = $id: i32")
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        let ticket = sasql::query!("SELECT id, start_time FROM tickets WHERE id = $id: i32")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        // Create own ticket to avoid interfering with other tests
+        let title = "time_round_trip_test";
+        let uid = 1i32;
+        let ticket = sasql::query!(
+            "INSERT INTO tickets (title, status, created_by_user_id, start_time)
+             VALUES ($title: &str, 'new', $uid: i32, $t: time::Time)
+             RETURNING id, start_time"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
 
         let start_time = ticket.start_time.expect("start_time should be set");
         assert_eq!(start_time.hour(), 14);
         assert_eq!(start_time.minute(), 30);
 
-        // Clean up
-        sasql::query!("UPDATE tickets SET start_time = NULL WHERE id = $id: i32")
+        // Clean up — delete our test ticket
+        let ticket_id = ticket.id;
+        sasql::query!("DELETE FROM tickets WHERE id = $ticket_id: i32")
             .execute(&pool)
             .await
             .unwrap();
