@@ -59,9 +59,6 @@ pub struct ParsedQuery {
     pub params: Vec<Param>,
     /// What kind of DML this is.
     pub kind: QueryKind,
-    /// Whether the query has a RETURNING clause.
-    #[allow(dead_code)] // tested in parse tests; will be consumed by codegen
-    pub has_returning: bool,
     /// Prepared statement name: `s_{rapidhash:016x}`.
     pub statement_name: String,
     /// Optional clauses extracted from `[...]` blocks.
@@ -80,7 +77,6 @@ pub fn parse_query(sql: &str) -> Result<ParsedQuery, String> {
     let (positional_sql, params, optional_clauses) = extract_params(&comment_stripped)?;
     let normalized_sql = normalize_sql(&positional_sql);
     let kind = detect_query_kind(&normalized_sql)?;
-    let has_returning = detect_returning(&normalized_sql);
     let stmt_name = statement_name(&normalized_sql);
 
     Ok(ParsedQuery {
@@ -88,7 +84,6 @@ pub fn parse_query(sql: &str) -> Result<ParsedQuery, String> {
         positional_sql,
         params,
         kind,
-        has_returning,
         statement_name: stmt_name,
         optional_clauses,
     })
@@ -117,19 +112,7 @@ fn extract_params(sql: &str) -> Result<(String, Vec<Param>, Vec<OptionalClause>)
         // String literal: copy verbatim (preserves multi-byte UTF-8)
         if b == b'\'' {
             let start = i;
-            i += 1;
-            while i < len {
-                if bytes[i] == b'\'' {
-                    i += 1;
-                    // Escaped quote '' — continue the literal
-                    if i < len && bytes[i] == b'\'' {
-                        i += 1;
-                        continue;
-                    }
-                    break;
-                }
-                i += 1;
-            }
+            i = skip_string_literal(bytes, i);
             out.push_str(&sql[start..i]);
             continue;
         }
@@ -321,18 +304,7 @@ fn parse_optional_clause(
         // String literal inside clause: copy verbatim
         if b == b'\'' {
             let lit_start = i;
-            i += 1;
-            while i < len {
-                if bytes[i] == b'\'' {
-                    i += 1;
-                    if i < len && bytes[i] == b'\'' {
-                        i += 1;
-                        continue;
-                    }
-                    break;
-                }
-                i += 1;
-            }
+            i = skip_string_literal(bytes, i);
             clause_sql.push_str(&sql[lit_start..i]);
             continue;
         }
@@ -526,18 +498,7 @@ fn strip_comments(sql: &str) -> String {
         // Single-quoted string: preserve verbatim
         if bytes[i] == b'\'' {
             let start = i;
-            i += 1;
-            while i < len {
-                if bytes[i] == b'\'' {
-                    i += 1;
-                    if i < len && bytes[i] == b'\'' {
-                        i += 1;
-                        continue;
-                    }
-                    break;
-                }
-                i += 1;
-            }
+            i = skip_string_literal(bytes, i);
             out.push_str(&sql[start..i]);
             continue;
         }
@@ -592,6 +553,26 @@ fn strip_comments(sql: &str) -> String {
     }
 
     out
+}
+
+/// Skip a single-quoted string literal starting at `start` (the `'` byte).
+/// Handles `''` escaped quotes. Returns the byte position after the closing `'`.
+fn skip_string_literal(bytes: &[u8], start: usize) -> usize {
+    let len = bytes.len();
+    let mut i = start + 1;
+    while i < len {
+        if bytes[i] == b'\'' {
+            i += 1;
+            // Escaped quote '' — continue the literal
+            if i < len && bytes[i] == b'\'' {
+                i += 1;
+                continue;
+            }
+            break;
+        }
+        i += 1;
+    }
+    i
 }
 
 /// Skip a dollar-quoted string starting at `start`. Returns end position, or None.
@@ -664,12 +645,6 @@ fn detect_query_kind(normalized: &str) -> Result<QueryKind, String> {
             "unsupported statement type: `{other}`. bsql supports SELECT, INSERT, UPDATE, DELETE"
         )),
     }
-}
-
-/// Check if the normalized SQL contains a RETURNING clause (outside string literals).
-fn detect_returning(normalized: &str) -> bool {
-    // After normalization, RETURNING is lowercase. We look for the word boundary.
-    normalized.split_whitespace().any(|w| w == "returning")
 }
 
 #[cfg(test)]
@@ -802,26 +777,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.kind, QueryKind::Select);
-    }
-
-    // --- RETURNING ---
-
-    #[test]
-    fn detect_returning_clause() {
-        let r = parse_query("INSERT INTO t (a) VALUES ($a: i32) RETURNING id").unwrap();
-        assert!(r.has_returning);
-    }
-
-    #[test]
-    fn no_returning() {
-        let r = parse_query("INSERT INTO t (a) VALUES ($a: i32)").unwrap();
-        assert!(!r.has_returning);
-    }
-
-    #[test]
-    fn returning_in_delete() {
-        let r = parse_query("DELETE FROM t WHERE id = $id: i32 RETURNING id, name").unwrap();
-        assert!(r.has_returning);
     }
 
     // --- normalization applied ---
@@ -1143,14 +1098,6 @@ mod tests {
             0,
             "content inside $tag$ should not be parsed as params"
         );
-    }
-
-    #[test]
-    fn returning_in_update() {
-        let r =
-            parse_query("UPDATE t SET a = $a: i32 WHERE id = $id: i32 RETURNING id, a").unwrap();
-        assert!(r.has_returning);
-        assert_eq!(r.kind, QueryKind::Update);
     }
 
     #[test]

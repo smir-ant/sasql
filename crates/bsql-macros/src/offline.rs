@@ -217,7 +217,8 @@ fn cached_to_validation(cached: &CachedQuery) -> ValidationResult {
         columns,
         param_pg_oids: cached.param_pg_oids.clone(),
         param_is_pg_enum: cached.param_is_pg_enum.clone(),
-        explain_plan: None, // EXPLAIN is online-only
+        #[cfg(feature = "explain")]
+        explain_plan: None,
     }
 }
 
@@ -321,14 +322,6 @@ fn validation_to_cached(
 /// names into generated code. Only types that `resolve_rust_type` or the
 /// base type map can produce are accepted.
 fn validate_cached_type(rust_type: &str) -> Result<(), String> {
-    // Must parse as valid Rust type syntax
-    if syn::parse_str::<syn::Type>(rust_type).is_err() {
-        return Err(format!(
-            "offline cache contains invalid type syntax: `{rust_type}` \
-             — run `cargo build` with a live PostgreSQL connection to regenerate"
-        ));
-    }
-
     // Strip Option<> wrapper if present
     let inner = rust_type
         .strip_prefix("Option<")
@@ -354,6 +347,15 @@ fn validate_cached_type(rust_type: &str) -> Result<(), String> {
         || KNOWN_PREFIXES.iter().any(|p| element.starts_with(p))
     {
         return Ok(());
+    }
+
+    // Fallback: parse as Rust type syntax to distinguish "unknown but valid"
+    // from "corrupt garbage". Only reached for types not in our allowlist.
+    if syn::parse_str::<syn::Type>(rust_type).is_err() {
+        return Err(format!(
+            "offline cache contains invalid type syntax: `{rust_type}` \
+             — run `cargo build` with a live PostgreSQL connection to regenerate"
+        ));
     }
 
     Err(format!(
@@ -488,6 +490,7 @@ mod tests {
             }],
             param_pg_oids: vec![25, 23],
             param_is_pg_enum: vec![false, false],
+            #[cfg(feature = "explain")]
             explain_plan: None,
         };
 

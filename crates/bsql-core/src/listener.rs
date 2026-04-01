@@ -21,6 +21,10 @@ use tokio_postgres::NoTls;
 
 use crate::error::{BsqlError, BsqlResult, ConnectError};
 
+/// Buffer capacity for the notification channel. Notifications beyond
+/// this count are dropped with a debug warning.
+const NOTIFICATION_BUFFER_SIZE: usize = 10_000;
+
 /// A notification received from PostgreSQL via LISTEN/NOTIFY.
 ///
 /// Zero-copy wrapper around `tokio_postgres::Notification` — avoids
@@ -88,7 +92,7 @@ impl Listener {
             .await
             .map_err(|e| ConnectError::create(format!("listener connect failed: {e}")))?;
 
-        let (tx, rx) = mpsc::channel(10_000);
+        let (tx, rx) = mpsc::channel(NOTIFICATION_BUFFER_SIZE);
 
         let handle = tokio::spawn(async move {
             drive_connection(connection, tx).await;
@@ -231,7 +235,7 @@ async fn drive_connection<S, T>(
                     #[cfg(debug_assertions)]
                     eprintln!(
                         "bsql: listener notification dropped \
-                             — channel buffer full (10000)"
+                             — channel buffer full ({NOTIFICATION_BUFFER_SIZE})"
                     );
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => return,

@@ -73,8 +73,6 @@ pub use bsql_core::listener::{Listener, Notification};
 pub use bsql_core::pool::{Pool, PoolBuilder, PoolConnection, PoolStatus};
 pub use bsql_core::stream::QueryStream;
 pub use bsql_core::transaction::Transaction;
-pub use bsql_core::types;
-
 // Re-export the postgres_types crate so pg_enum generated code can access it
 // via `::bsql_core::pg_types::*` paths.
 #[doc(hidden)]
@@ -82,4 +80,4 @@ pub use bsql_core::pg_types;
 
 // Re-export Stream trait so users can consume QueryStream without
 // adding futures-core as a direct dependency.
-pub use futures_core::Stream;
+pub use bsql_core::Stream;

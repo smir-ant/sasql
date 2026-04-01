@@ -80,6 +80,7 @@ fn gen_result_struct(parsed: &ParsedQuery, validation: &ValidationResult) -> Tok
     });
 
     // EXPLAIN plan as doc comment (v0.7, opt-in via `explain` feature)
+    #[cfg(feature = "explain")]
     let explain_doc = if let Some(ref plan) = validation.explain_plan {
         let doc_lines: Vec<TokenStream> = std::iter::once(quote! { #[doc = ""] })
             .chain(std::iter::once(quote! { #[doc = "**Query plan:**"] }))
@@ -94,6 +95,8 @@ fn gen_result_struct(parsed: &ParsedQuery, validation: &ValidationResult) -> Tok
     } else {
         TokenStream::new()
     };
+    #[cfg(not(feature = "explain"))]
+    let explain_doc = TokenStream::new();
 
     quote! {
         #explain_doc
@@ -726,8 +729,8 @@ fn executor_struct_name(parsed: &ParsedQuery) -> proc_macro2::Ident {
 /// Rust keywords (2021 edition) that cannot be used as bare identifiers.
 const RUST_KEYWORDS: &[&str] = &[
     "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
-    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
-    "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
+    "false", "fn", "for", "gen", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut",
+    "pub", "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
     "unsafe", "use", "where", "while", "yield",
 ];
 
@@ -795,6 +798,7 @@ mod tests {
             columns,
             param_pg_oids: vec![],
             param_is_pg_enum: vec![],
+            #[cfg(feature = "explain")]
             explain_plan: None,
         }
     }
@@ -1446,6 +1450,7 @@ mod tests {
 
     // --- v0.7: EXPLAIN doc comment ---
 
+    #[cfg(feature = "explain")]
     #[test]
     fn explain_plan_embedded_as_doc_comment() {
         let parsed = parse_query("SELECT id FROM t WHERE id = $id: i32").unwrap();

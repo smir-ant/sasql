@@ -51,11 +51,8 @@ impl Singleflight {
         if let Some(tx) = map.get(&key) {
             FlightStatus::Follower(tx.subscribe())
         } else {
-            // 16 is the broadcast channel capacity. Receivers that lag will
-            // get `RecvError::Lagged` -- but since we only ever send ONE
-            // message per flight, capacity=1 would suffice. We use 2 for
-            // safety against edge-case timing.
-            let (tx, _rx) = broadcast::channel(2);
+            // Only one message per flight is ever sent, so capacity=1 suffices.
+            let (tx, _rx) = broadcast::channel(1);
             map.insert(key, tx);
             FlightStatus::Leader
         }

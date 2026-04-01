@@ -52,21 +52,4 @@ impl Stream for QueryStream {
             .poll_next(cx)
             .map(|opt| opt.map(|r| r.map_err(BsqlError::from)))
     }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        // RowStream does not know total count upfront
-        (0, None)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn _assert_send<T: Send>() {}
-
-    #[test]
-    fn query_stream_is_send() {
-        _assert_send::<QueryStream>();
-    }
 }

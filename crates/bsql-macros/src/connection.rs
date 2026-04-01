@@ -76,21 +76,3 @@ where
     f(&conn.runtime, &conn.client)
         .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn missing_env_var_produces_error() {
-        // When neither BSQL_DATABASE_URL nor DATABASE_URL is set,
-        // with_connection should return an error.
-        // NOTE: this test may pass or fail depending on the test environment.
-        // If DATABASE_URL is set in CI, this test succeeds differently.
-        // We test the error message format when connection is unavailable.
-        let result: Result<(), syn::Error> = with_connection(|_rt, _client| Ok(()));
-        // We can't assert Err here because the env var might be set.
-        // Instead, verify the function compiles and runs without panic.
-        let _ = result;
-    }
-}

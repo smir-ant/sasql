@@ -33,22 +33,9 @@ pub struct Pool {
     replicas: Vec<deadpool_postgres::Pool>,
     /// Atomic counter for round-robin replica selection.
     replica_idx: std::sync::atomic::AtomicUsize,
-    pgbouncer: PgBouncerInfo,
-    singleflight: Singleflight,
-}
-
-/// PgBouncer detection result.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct PgBouncerInfo {
     /// True if PgBouncer was detected between the client and PostgreSQL.
-    is_pgbouncer: bool,
-}
-
-impl PgBouncerInfo {
-    #[cfg(test)]
-    const DIRECT: Self = Self {
-        is_pgbouncer: false,
-    };
+    pgbouncer: bool,
+    singleflight: Singleflight,
 }
 
 /// Builder for configuring a connection pool.
@@ -72,25 +59,12 @@ impl PoolBuilder {
     ///
     /// Returns an error if the URL cannot be parsed.
     pub fn url(mut self, url: &str) -> Result<Self, BsqlError> {
-        let config: tokio_postgres::Config = url
-            .parse()
-            .map_err(|e: tokio_postgres::Error| ConnectError::create(e.to_string()))?;
-
-        self.host = config.get_hosts().first().map(|h| match h {
-            tokio_postgres::config::Host::Tcp(s) => s.clone(),
-            #[cfg(unix)]
-            tokio_postgres::config::Host::Unix(p) => p.to_string_lossy().into_owned(),
-        });
-        self.port = config.get_ports().first().copied();
-        self.dbname = config.get_dbname().map(String::from);
-        self.user = config.get_user().map(String::from);
-        self.password =
-            match config.get_password() {
-                Some(p) => Some(String::from_utf8(p.to_vec()).map_err(|_| {
-                    ConnectError::create("database password contains invalid UTF-8")
-                })?),
-                None => None,
-            };
+        let parsed = parse_pg_url(url)?;
+        self.host = parsed.host;
+        self.port = parsed.port;
+        self.dbname = parsed.dbname;
+        self.user = parsed.user;
+        self.password = parsed.password;
         Ok(self)
     }
 
@@ -170,7 +144,7 @@ impl PoolBuilder {
             .map_err(|e| ConnectError::create(e.to_string()))?;
 
         // FIX 11: detect PgBouncer -- propagate connection failure
-        let pgbouncer = detect_pgbouncer(&pool).await?;
+        let mut pgbouncer = detect_pgbouncer(&pool).await?;
 
         // Build replica pools, detecting PgBouncer on each.
         // If ANY pool (primary or replica) is behind PgBouncer, we disable
@@ -178,14 +152,10 @@ impl PoolBuilder {
         // a mixed topology is unusual, and the performance cost of unnamed
         // statements is negligible compared to a hard failure.
         let mut replicas = Vec::with_capacity(self.replica_urls.len());
-        let mut merged_pgbouncer = pgbouncer;
         for url in &self.replica_urls {
             let replica_pool =
                 create_pool_from_url(url, self.max_size, self.connect_timeout_secs).await?;
-            let replica_pgb = detect_pgbouncer(&replica_pool).await?;
-            if replica_pgb.is_pgbouncer {
-                merged_pgbouncer.is_pgbouncer = true;
-            }
+            pgbouncer |= detect_pgbouncer(&replica_pool).await?;
             replicas.push(replica_pool);
         }
 
@@ -193,7 +163,7 @@ impl PoolBuilder {
             primary: pool,
             replicas,
             replica_idx: std::sync::atomic::AtomicUsize::new(0),
-            pgbouncer: merged_pgbouncer,
+            pgbouncer,
             singleflight: Singleflight::new(),
         })
     }
@@ -228,15 +198,12 @@ impl Pool {
     pub async fn acquire(&self) -> BsqlResult<PoolConnection> {
         let conn = self.primary.get().await.map_err(BsqlError::from)?;
 
-        Ok(PoolConnection {
-            inner: conn,
-            pgbouncer: self.pgbouncer,
-        })
+        Ok(PoolConnection { inner: conn })
     }
 
     /// Whether PgBouncer was detected between the client and PostgreSQL.
     pub fn is_pgbouncer(&self) -> bool {
-        self.pgbouncer.is_pgbouncer
+        self.pgbouncer
     }
 
     /// Whether read replicas are configured.
@@ -419,7 +386,7 @@ impl std::fmt::Debug for Pool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Pool")
             .field("status", &self.status())
-            .field("is_pgbouncer", &self.pgbouncer.is_pgbouncer)
+            .field("is_pgbouncer", &self.pgbouncer)
             .field("replicas", &self.replicas.len())
             .finish()
     }
@@ -430,14 +397,6 @@ impl std::fmt::Debug for Pool {
 /// Returned to the pool when dropped.
 pub struct PoolConnection {
     pub(crate) inner: deadpool_postgres::Object,
-    pub(crate) pgbouncer: PgBouncerInfo,
-}
-
-impl PoolConnection {
-    /// Whether PgBouncer was detected on this connection.
-    pub fn is_pgbouncer(&self) -> bool {
-        self.pgbouncer.is_pgbouncer
-    }
 }
 
 /// Snapshot of pool utilization.
@@ -448,6 +407,45 @@ pub struct PoolStatus {
     pub max_size: usize,
 }
 
+/// Parsed fields from a PostgreSQL connection URL.
+struct ParsedUrl {
+    host: Option<String>,
+    port: Option<u16>,
+    dbname: Option<String>,
+    user: Option<String>,
+    password: Option<String>,
+}
+
+/// Parse a PostgreSQL connection URL into its component fields.
+fn parse_pg_url(url: &str) -> BsqlResult<ParsedUrl> {
+    let config: tokio_postgres::Config = url
+        .parse()
+        .map_err(|e: tokio_postgres::Error| ConnectError::create(e.to_string()))?;
+
+    let host = config.get_hosts().first().map(|h| match h {
+        tokio_postgres::config::Host::Tcp(s) => s.clone(),
+        #[cfg(unix)]
+        tokio_postgres::config::Host::Unix(p) => p.to_string_lossy().into_owned(),
+    });
+    let port = config.get_ports().first().copied();
+    let dbname = config.get_dbname().map(String::from);
+    let user = config.get_user().map(String::from);
+    let password = match config.get_password() {
+        Some(p) => Some(
+            String::from_utf8(p.to_vec())
+                .map_err(|_| ConnectError::create("database password contains invalid UTF-8"))?,
+        ),
+        None => None,
+    };
+    Ok(ParsedUrl {
+        host,
+        port,
+        dbname,
+        user,
+        password,
+    })
+}
+
 /// Create a deadpool-postgres pool from a connection URL.
 ///
 /// Used internally for both primary and replica pools.
@@ -456,26 +454,14 @@ async fn create_pool_from_url(
     max_size: usize,
     connect_timeout_secs: u64,
 ) -> BsqlResult<deadpool_postgres::Pool> {
-    let config: tokio_postgres::Config = url
-        .parse()
-        .map_err(|e: tokio_postgres::Error| ConnectError::create(e.to_string()))?;
+    let parsed = parse_pg_url(url)?;
 
     let mut cfg = Config::new();
-    cfg.host = config.get_hosts().first().map(|h| match h {
-        tokio_postgres::config::Host::Tcp(s) => s.clone(),
-        #[cfg(unix)]
-        tokio_postgres::config::Host::Unix(p) => p.to_string_lossy().into_owned(),
-    });
-    cfg.port = config.get_ports().first().copied();
-    cfg.dbname = config.get_dbname().map(String::from);
-    cfg.user = config.get_user().map(String::from);
-    cfg.password = match config.get_password() {
-        Some(p) => Some(
-            String::from_utf8(p.to_vec())
-                .map_err(|_| ConnectError::create("database password contains invalid UTF-8"))?,
-        ),
-        None => None,
-    };
+    cfg.host = parsed.host;
+    cfg.port = parsed.port;
+    cfg.dbname = parsed.dbname;
+    cfg.user = parsed.user;
+    cfg.password = parsed.password;
     cfg.connect_timeout = Some(std::time::Duration::from_secs(connect_timeout_secs));
     cfg.manager = Some(ManagerConfig {
         recycling_method: RecyclingMethod::Fast,
@@ -508,16 +494,14 @@ async fn create_pool_from_url(
 /// Strategy: try `SHOW POOLS` -- only PgBouncer responds to this.
 ///
 /// Returns `Err` if the initial connection fails, instead of silently
-/// returning `DIRECT`. A pool that can't connect on creation is broken.
-async fn detect_pgbouncer(pool: &deadpool_postgres::Pool) -> BsqlResult<PgBouncerInfo> {
+/// assuming direct. A pool that can't connect on creation is broken.
+async fn detect_pgbouncer(pool: &deadpool_postgres::Pool) -> BsqlResult<bool> {
     let conn = pool.get().await.map_err(|e| {
         ConnectError::with_source(format!("failed to establish initial connection: {e}"), e)
     })?;
 
     // PgBouncer responds to `SHOW POOLS`; PostgreSQL does not.
-    let is_pgbouncer = conn.simple_query("SHOW POOLS").await.is_ok();
-
-    Ok(PgBouncerInfo { is_pgbouncer })
+    Ok(conn.simple_query("SHOW POOLS").await.is_ok())
 }
 
 #[cfg(test)]
@@ -558,17 +542,5 @@ mod tests {
             .replica("postgres://replica1:5432/db")
             .replica("postgres://replica2:5432/db");
         assert_eq!(b.replica_urls.len(), 2);
-    }
-
-    #[test]
-    fn pgbouncer_direct_defaults() {
-        let info = PgBouncerInfo::DIRECT;
-        assert!(!info.is_pgbouncer);
-    }
-
-    #[test]
-    fn pool_status_type_is_copy() {
-        fn assert_copy<T: Copy>() {}
-        assert_copy::<PoolStatus>();
     }
 }

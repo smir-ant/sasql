@@ -320,6 +320,42 @@ async fn channel_name_with_double_quotes() {
 }
 
 #[tokio::test]
+async fn payload_with_multiple_quotes() {
+    let mut listener = Listener::connect(DB_URL).await.unwrap();
+    listener.listen("multi_quote_test").await.unwrap();
+
+    let payload = "it''s a ''test''";
+    listener.notify("multi_quote_test", payload).await.unwrap();
+
+    let notif = listener.recv().await.unwrap();
+    assert_eq!(notif.payload(), payload);
+}
+
+#[tokio::test]
+async fn payload_with_backslash() {
+    let mut listener = Listener::connect(DB_URL).await.unwrap();
+    listener.listen("backslash_test").await.unwrap();
+
+    let payload = r"C:\Users\test\file.txt";
+    listener.notify("backslash_test", payload).await.unwrap();
+
+    let notif = listener.recv().await.unwrap();
+    assert_eq!(notif.payload(), payload);
+}
+
+#[tokio::test]
+async fn payload_with_lone_quote() {
+    let mut listener = Listener::connect(DB_URL).await.unwrap();
+    listener.listen("lone_quote_test").await.unwrap();
+
+    let payload = "it's";
+    listener.notify("lone_quote_test", payload).await.unwrap();
+
+    let notif = listener.recv().await.unwrap();
+    assert_eq!(notif.payload(), payload);
+}
+
+#[tokio::test]
 async fn large_payload() {
     let mut listener = Listener::connect(DB_URL).await.unwrap();
     listener.listen("large_payload_test").await.unwrap();

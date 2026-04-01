@@ -258,116 +258,52 @@ mod tests {
     }
 
     #[test]
-    fn param_compatibility_exact_match() {
+    fn param_compatible_accepts_valid_pairs() {
+        // Scalar exact matches
+        assert!(is_param_compatible("bool", 16));
+        assert!(is_param_compatible("i16", 21));
         assert!(is_param_compatible("i32", 23));
         assert!(is_param_compatible("i64", 20));
-        assert!(is_param_compatible("bool", 16));
+        assert!(is_param_compatible("f32", 700));
         assert!(is_param_compatible("f64", 701));
-    }
-
-    #[test]
-    fn param_compatibility_string_types() {
+        assert!(is_param_compatible("u32", 26));
+        // String-like: &str and String for text/varchar/bpchar
         assert!(is_param_compatible("&str", 25));
         assert!(is_param_compatible("&str", 1043));
+        assert!(is_param_compatible("&str", 1042));
         assert!(is_param_compatible("String", 25));
-    }
-
-    #[test]
-    fn param_compatibility_byte_types() {
+        assert!(is_param_compatible("String", 1043));
+        // Bytes
         assert!(is_param_compatible("&[u8]", 17));
         assert!(is_param_compatible("Vec<u8>", 17));
-    }
-
-    #[test]
-    fn param_compatibility_array_types() {
+        // Arrays
         assert!(is_param_compatible("&[i32]", 1007));
         assert!(is_param_compatible("Vec<i32>", 1007));
         assert!(is_param_compatible("&[&str]", 1009));
-    }
-
-    #[test]
-    fn param_incompatible_rejects_wrong_type() {
-        assert!(!is_param_compatible("&str", 23)); // &str for int4
-        assert!(!is_param_compatible("i32", 20)); // i32 for int8 (no widening)
-        assert!(!is_param_compatible("i64", 23)); // i64 for int4 (no narrowing)
-        assert!(!is_param_compatible("bool", 25)); // bool for text
-    }
-
-    #[test]
-    fn param_incompatible_unknown_oid() {
-        assert!(!is_param_compatible("i32", 99999));
-    }
-
-    // --- bad-path coverage: type mapping edge cases ---
-
-    #[test]
-    fn no_implicit_widening_i16_to_i32() {
-        assert!(!is_param_compatible("i16", 23)); // i16 for int4
-    }
-
-    #[test]
-    fn no_implicit_narrowing_i64_to_i32() {
-        assert!(!is_param_compatible("i64", 23)); // i64 for int4
-    }
-
-    #[test]
-    fn f32_not_compatible_with_f64() {
-        assert!(!is_param_compatible("f32", 701)); // f32 for float8
-    }
-
-    #[test]
-    fn f64_not_compatible_with_f32() {
-        assert!(!is_param_compatible("f64", 700)); // f64 for float4
-    }
-
-    #[test]
-    fn string_owned_for_text() {
-        assert!(is_param_compatible("String", 25));
-    }
-
-    #[test]
-    fn string_owned_for_varchar() {
-        assert!(is_param_compatible("String", 1043));
-    }
-
-    #[test]
-    fn str_ref_for_bpchar() {
-        assert!(is_param_compatible("&str", 1042));
-    }
-
-    #[test]
-    fn vec_u8_for_bytea() {
-        assert!(is_param_compatible("Vec<u8>", 17));
-    }
-
-    #[test]
-    fn bool_not_for_int() {
-        assert!(!is_param_compatible("bool", 23));
-    }
-
-    #[test]
-    fn int_not_for_bool() {
-        assert!(!is_param_compatible("i32", 16));
-    }
-
-    #[test]
-    fn u32_for_oid() {
-        assert!(is_param_compatible("u32", 26));
-    }
-
-    #[test]
-    fn i32_not_for_oid() {
-        assert!(!is_param_compatible("i32", 26));
-    }
-
-    #[test]
-    fn vec_string_for_text_array() {
         assert!(is_param_compatible("Vec<String>", 1009));
     }
 
     #[test]
-    fn vec_i32_not_for_text_array() {
+    fn param_compatible_rejects_mismatches() {
+        // No implicit widening/narrowing
+        assert!(!is_param_compatible("i16", 23));
+        assert!(!is_param_compatible("i32", 20));
+        assert!(!is_param_compatible("i64", 23));
+        assert!(!is_param_compatible("f32", 701));
+        assert!(!is_param_compatible("f64", 700));
+        // Cross-category
+        assert!(!is_param_compatible("&str", 23));
+        assert!(!is_param_compatible("bool", 25));
+        assert!(!is_param_compatible("bool", 23));
+        assert!(!is_param_compatible("i32", 16));
+        assert!(!is_param_compatible("i32", 26));
+        // Array mismatch
         assert!(!is_param_compatible("Vec<i32>", 1009));
+    }
+
+    #[test]
+    fn param_compatible_unknown_oid() {
+        assert!(!is_param_compatible("i32", 99999));
     }
 
     #[test]

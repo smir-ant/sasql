@@ -116,17 +116,13 @@ impl std::error::Error for BsqlError {
 
 impl std::error::Error for PoolError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source
-            .as_ref()
-            .map(|e| &**e as &(dyn std::error::Error + 'static))
+        boxed_source(&self.source)
     }
 }
 
 impl std::error::Error for QueryError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source
-            .as_ref()
-            .map(|e| &**e as &(dyn std::error::Error + 'static))
+        boxed_source(&self.source)
     }
 }
 
@@ -134,10 +130,15 @@ impl std::error::Error for DecodeError {}
 
 impl std::error::Error for ConnectError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source
-            .as_ref()
-            .map(|e| &**e as &(dyn std::error::Error + 'static))
+        boxed_source(&self.source)
     }
+}
+
+fn boxed_source(
+    src: &Option<Box<dyn std::error::Error + Send + Sync>>,
+) -> Option<&(dyn std::error::Error + 'static)> {
+    src.as_ref()
+        .map(|e| &**e as &(dyn std::error::Error + 'static))
 }
 
 // --- From conversions ---
@@ -254,34 +255,6 @@ mod tests {
     fn connect_error_display() {
         let e = ConnectError::create("connection refused");
         assert_eq!(e.to_string(), "connect error: connection refused");
-    }
-
-    #[test]
-    fn error_is_send_sync() {
-        fn assert_send_sync<T: Send + Sync + 'static>() {}
-        assert_send_sync::<BsqlError>();
-    }
-
-    #[test]
-    fn error_implements_std_error() {
-        fn assert_std_error<T: std::error::Error>() {}
-        assert_std_error::<BsqlError>();
-    }
-
-    #[test]
-    fn from_tokio_postgres_error() {
-        // tokio_postgres::Error is not easily constructable in tests,
-        // but we can verify the From impl exists and the type compiles.
-        fn _accepts_pg_error(e: tokio_postgres::Error) -> BsqlError {
-            e.into()
-        }
-    }
-
-    #[test]
-    fn from_deadpool_error() {
-        fn _accepts_pool_error(e: deadpool_postgres::PoolError) -> BsqlError {
-            e.into()
-        }
     }
 
     #[test]

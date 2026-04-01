@@ -16,13 +16,10 @@ pub struct ColumnInfo {
     /// Column name as returned by PostgreSQL.
     pub name: String,
     /// PostgreSQL type OID.
-    #[allow(dead_code)] // retained for diagnostics and future error messages
     pub pg_oid: u32,
     /// PostgreSQL type name (e.g. `"int4"`, `"text"`).
-    #[allow(dead_code)] // retained for diagnostics and future error messages
     pub pg_type_name: String,
     /// Whether this column can be NULL.
-    #[allow(dead_code)] // retained for diagnostics; nullability is baked into rust_type
     pub is_nullable: bool,
     /// The Rust type string for code generation (e.g. `"i32"`, `"Option<String>"`).
     pub rust_type: String,
@@ -40,6 +37,7 @@ pub struct ValidationResult {
     /// any `#[bsql::pg_enum]`-annotated Rust enum.
     pub param_is_pg_enum: Vec<bool>,
     /// EXPLAIN plan summary (only populated when `explain` feature is enabled).
+    #[cfg(feature = "explain")]
     pub explain_plan: Option<String>,
 }
 
@@ -72,20 +70,32 @@ async fn validate_async(parsed: &ParsedQuery, client: &Client) -> Result<Validat
         .map(|t| matches!(t.kind(), postgres_types::Kind::Enum(_)))
         .collect();
 
-    // Resolve nullability for ALL columns in a single batched query
-    let nullable_flags = resolve_nullability_batch(client, stmt.columns()).await;
+    let columns = build_columns(client, stmt.columns()).await?;
 
-    // Build column metadata
-    let mut columns = Vec::with_capacity(stmt.columns().len());
-    for (i, col) in stmt.columns().iter().enumerate() {
+    Ok(ValidationResult {
+        columns,
+        param_pg_oids,
+        param_is_pg_enum,
+        #[cfg(feature = "explain")]
+        explain_plan: fetch_explain_plan(client, parsed).await,
+    })
+}
+
+/// Resolve column metadata (name, type, nullability) from a prepared statement.
+async fn build_columns(
+    client: &Client,
+    pg_columns: &[tokio_postgres::Column],
+) -> Result<Vec<ColumnInfo>, String> {
+    let nullable_flags = resolve_nullability_batch(client, pg_columns).await;
+
+    let mut columns = Vec::with_capacity(pg_columns.len());
+    for (i, col) in pg_columns.iter().enumerate() {
         let pg_oid = col.type_().oid();
         let pg_type_name = col.type_().name().to_owned();
         let name = col.name().to_owned();
         let is_nullable = nullable_flags[i];
 
-        let is_pg_enum = matches!(col.type_().kind(), postgres_types::Kind::Enum(_));
-
-        if is_pg_enum {
+        if matches!(col.type_().kind(), postgres_types::Kind::Enum(_)) {
             return Err(format!(
                 "column \"{name}\" is PostgreSQL enum type `{pg_type_name}`. \
                  Define a Rust enum with #[bsql::pg_enum] or cast to text: {name}::text"
@@ -109,16 +119,7 @@ async fn validate_async(parsed: &ParsedQuery, client: &Client) -> Result<Validat
             rust_type,
         });
     }
-
-    // EXPLAIN plan (opt-in via `explain` feature)
-    let explain_plan = fetch_explain_plan(client, parsed).await;
-
-    Ok(ValidationResult {
-        columns,
-        param_pg_oids,
-        param_is_pg_enum,
-        explain_plan,
-    })
+    Ok(columns)
 }
 
 /// Fetch EXPLAIN output for a query (only when `explain` feature is enabled).
@@ -156,11 +157,6 @@ async fn fetch_explain_plan(client: &Client, parsed: &ParsedQuery) -> Option<Str
         }
         Err(_) => None,
     }
-}
-
-#[cfg(not(feature = "explain"))]
-async fn fetch_explain_plan(_client: &Client, _parsed: &ParsedQuery) -> Option<String> {
-    None
 }
 
 /// Determine nullability for all columns in a single PG round-trip.
@@ -205,14 +201,20 @@ async fn resolve_nullability_batch(
         )";
 
     if let Ok(rows) = client.query(query, &[&table_oids, &col_nums]).await {
+        // Build lookup: (table_oid, col_num) -> original column index
+        let mut lookup: std::collections::HashMap<(u32, i16), Vec<usize>> =
+            std::collections::HashMap::with_capacity(table_oids.len());
+        for (idx, (&t, &c)) in table_oids.iter().zip(col_nums.iter()).enumerate() {
+            lookup.entry((t, c)).or_default().push(col_indices[idx]);
+        }
+
         for row in &rows {
             let oid: u32 = row.get(0);
             let num: i16 = row.get(1);
             let is_nullable: bool = row.get(2);
-            // Match back to the original column index
-            for (idx, (&t, &c)) in table_oids.iter().zip(col_nums.iter()).enumerate() {
-                if t == oid && c == num {
-                    result[col_indices[idx]] = is_nullable;
+            if let Some(indices) = lookup.get(&(oid, num)) {
+                for &idx in indices {
+                    result[idx] = is_nullable;
                 }
             }
         }
@@ -302,46 +304,14 @@ async fn validate_variant_async(
         .map(|t| matches!(t.kind(), postgres_types::Kind::Enum(_)))
         .collect();
 
-    let nullable_flags = resolve_nullability_batch(client, stmt.columns()).await;
-
-    let mut columns = Vec::with_capacity(stmt.columns().len());
-    for (i, col) in stmt.columns().iter().enumerate() {
-        let pg_oid = col.type_().oid();
-        let pg_type_name = col.type_().name().to_owned();
-        let name = col.name().to_owned();
-        let is_nullable = nullable_flags[i];
-        let is_pg_enum = matches!(col.type_().kind(), postgres_types::Kind::Enum(_));
-
-        if is_pg_enum {
-            return Err(format!(
-                "column \"{name}\" is PostgreSQL enum type `{pg_type_name}`. \
-                 Define a Rust enum with #[bsql::pg_enum] or cast to text: {name}::text"
-            ));
-        }
-
-        let base_rust_type = crate::types::resolve_rust_type(pg_oid)
-            .map_err(|msg| format!("column \"{name}\": {msg}"))?;
-
-        let rust_type = if is_nullable {
-            format!("Option<{base_rust_type}>")
-        } else {
-            base_rust_type.to_owned()
-        };
-
-        columns.push(ColumnInfo {
-            name,
-            pg_oid,
-            pg_type_name,
-            is_nullable,
-            rust_type,
-        });
-    }
+    let columns = build_columns(client, stmt.columns()).await?;
 
     Ok(ValidationResult {
         columns,
         param_pg_oids,
         param_is_pg_enum,
-        explain_plan: None, // variants don't get individual EXPLAIN plans
+        #[cfg(feature = "explain")]
+        explain_plan: None,
     })
 }
 

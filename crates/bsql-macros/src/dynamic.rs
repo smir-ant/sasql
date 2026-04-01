@@ -81,35 +81,73 @@ fn build_variant(parsed: &ParsedQuery, mask: u32) -> Result<QueryVariant, String
         let included = (mask & (1 << clause_idx)) != 0;
 
         if included {
-            // Build the clause SQL with correct positional params
-            let mut clause_sql = clause.sql_fragment.clone();
-
+            // Build position mapping for clause params, then single-pass replace
+            let mut pos_map: Vec<(usize, usize)> = Vec::with_capacity(clause.params.len());
             for p in &clause.params {
-                let inner_placeholder = format!("${{P_{}}}", p.position);
                 let new_pos = all_params.len() + 1;
+                pos_map.push((p.position, new_pos));
                 all_params.push(Param {
                     name: p.name.clone(),
                     rust_type: p.rust_type.clone(),
                     position: new_pos,
                 });
-                clause_sql = clause_sql.replace(&inner_placeholder, &format!("${new_pos}"));
             }
 
-            // Splice: replace placeholder with space + clause SQL + space
-            // The leading space prevents token concatenation issues.
+            // Single-pass: scan clause SQL for ${P_N} placeholders
+            let frag = &clause.sql_fragment;
+            let mut clause_sql = String::with_capacity(frag.len());
+            let frag_bytes = frag.as_bytes();
+            let frag_len = frag_bytes.len();
+            let mut j = 0;
+            while j < frag_len {
+                if frag_bytes[j] == b'$'
+                    && j + 3 < frag_len
+                    && frag_bytes[j + 1] == b'{'
+                    && frag_bytes[j + 2] == b'P'
+                    && frag_bytes[j + 3] == b'_'
+                {
+                    // Parse ${P_N}
+                    let num_start = j + 4;
+                    let mut num_end = num_start;
+                    while num_end < frag_len && frag_bytes[num_end].is_ascii_digit() {
+                        num_end += 1;
+                    }
+                    if num_end < frag_len && frag_bytes[num_end] == b'}' {
+                        let old_pos: usize = frag[num_start..num_end].parse().unwrap_or(0);
+                        if let Some(&(_, new_pos)) = pos_map.iter().find(|&&(op, _)| op == old_pos)
+                        {
+                            clause_sql.push('$');
+                            clause_sql.push_str(&new_pos.to_string());
+                            j = num_end + 1;
+                            continue;
+                        }
+                    }
+                }
+                clause_sql.push(frag_bytes[j] as char);
+                j += 1;
+            }
+
             sql = sql.replace(&placeholder, &format!(" {clause_sql} "));
         } else {
-            // Exclude: remove the placeholder (replace with single space)
             sql = sql.replace(&placeholder, " ");
         }
     }
 
-    // Collapse any double/triple spaces from splice/removal
-    while sql.contains("  ") {
-        sql = sql.replace("  ", " ");
+    // Single-pass collapse of consecutive spaces
+    let mut collapsed = String::with_capacity(sql.len());
+    let mut prev_space = false;
+    for c in sql.chars() {
+        if c == ' ' {
+            if !prev_space {
+                collapsed.push(' ');
+            }
+            prev_space = true;
+        } else {
+            prev_space = false;
+            collapsed.push(c);
+        }
     }
-    // Trim leading/trailing whitespace
-    let sql = sql.trim().to_owned();
+    let sql = collapsed.trim().to_owned();
 
     Ok(QueryVariant {
         sql,

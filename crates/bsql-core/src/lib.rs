@@ -39,8 +39,9 @@ pub use pool::{Pool, PoolBuilder, PoolConnection, PoolStatus};
 pub use stream::QueryStream;
 pub use transaction::Transaction;
 
-/// Hash a string using rapidhash. Shared utility for singleflight keys,
-/// statement names, and offline cache keys.
+/// Hash a string using rapidhash. Used by singleflight, statement naming,
+/// and offline cache keys. Not part of the public API.
+#[doc(hidden)]
 pub fn rapid_hash_str(s: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = rapidhash::quality::RapidHasher::default();

@@ -138,7 +138,6 @@ version = "0.7.0"
 dependencies = [
  "bsql-core",
  "bsql-macros",
- "futures-core",
  "rust_decimal",
  "time",
  "tokio",
