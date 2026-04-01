@@ -1,0 +1,33 @@
+name: Publish to crates.io
+
+on:
+  release:
+    types: [published]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: Publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish bsql-core
+        run: cargo publish -p bsql-core --token ${{ secrets.CRATES_IO_TOKEN }}
+
+      - name: Wait for crates.io index update
+        run: sleep 30
+
+      - name: Publish bsql-macros
+        run: cargo publish -p bsql-macros --token ${{ secrets.CRATES_IO_TOKEN }}
+
+      - name: Wait for crates.io index update
+        run: sleep 30
+
+      - name: Publish bsql
+        run: cargo publish -p bsql --token ${{ secrets.CRATES_IO_TOKEN }}
