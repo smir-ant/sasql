@@ -27,6 +27,23 @@
 use proc_macro2::TokenStream;
 use quote::quote;
 
+/// Convert `CamelCase` to `snake_case` for PG type name derivation.
+/// `TicketStatus` → `ticket_status`, `HTTPCode` → `httpcode` (simplified).
+fn to_snake_case(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    for (i, c) in s.chars().enumerate() {
+        if c.is_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// A single parsed enum variant with its SQL label.
 struct EnumVariant {
     /// The Rust variant identifier.
@@ -64,6 +81,7 @@ pub fn expand_pg_enum(
 
     let enum_name = &input.ident;
     let vis = &input.vis;
+    let pg_type_name = to_snake_case(&enum_name.to_string());
 
     // Preserve any existing attributes except #[sql(...)] on variants
     let enum_attrs: Vec<_> = input.attrs.iter().collect();
@@ -81,10 +99,10 @@ pub fn expand_pg_enum(
     });
 
     // Generate FromSql implementation
-    let from_sql_impl = gen_from_sql(enum_name, &variants);
+    let from_sql_impl = gen_from_sql(enum_name, &variants, &pg_type_name);
 
     // Generate ToSql implementation
-    let to_sql_impl = gen_to_sql(enum_name, &variants);
+    let to_sql_impl = gen_to_sql(enum_name, &variants, &pg_type_name);
 
     // Generate Display impl (useful for debugging, logging)
     let display_impl = gen_display(enum_name, &variants);
@@ -160,7 +178,7 @@ fn extract_sql_attr(variant: &syn::Variant) -> Result<String, syn::Error> {
 ///
 /// For enums with <=8 variants, uses a (len, first_byte) match for efficiency.
 /// For larger enums, falls back to a simple byte-slice comparison chain.
-fn gen_from_sql(enum_name: &syn::Ident, variants: &[EnumVariant]) -> TokenStream {
+fn gen_from_sql(enum_name: &syn::Ident, variants: &[EnumVariant], pg_type_name: &str) -> TokenStream {
     let match_body = gen_from_sql_match(enum_name, variants);
     let enum_name_str = enum_name.to_string();
 
@@ -182,7 +200,11 @@ fn gen_from_sql(enum_name: &syn::Ident, variants: &[EnumVariant]) -> TokenStream
             }
 
             fn accepts(ty: &::sasql_core::pg_types::Type) -> bool {
-                matches!(ty.kind(), ::sasql_core::pg_types::Kind::Enum(_))
+                // Only accept the specific PG enum type, not any enum
+                match ty.kind() {
+                    ::sasql_core::pg_types::Kind::Enum(_) => ty.name() == #pg_type_name,
+                    _ => false,
+                }
             }
         }
     }
@@ -284,7 +306,7 @@ fn gen_from_sql_linear(enum_name: &syn::Ident, variants: &[EnumVariant]) -> Toke
 }
 
 /// Generate `impl ToSql` for the enum.
-fn gen_to_sql(enum_name: &syn::Ident, variants: &[EnumVariant]) -> TokenStream {
+fn gen_to_sql(enum_name: &syn::Ident, variants: &[EnumVariant], pg_type_name: &str) -> TokenStream {
     let to_sql_arms: Vec<TokenStream> = variants
         .iter()
         .map(|v| {
@@ -312,7 +334,10 @@ fn gen_to_sql(enum_name: &syn::Ident, variants: &[EnumVariant]) -> TokenStream {
             }
 
             fn accepts(ty: &::sasql_core::pg_types::Type) -> bool {
-                matches!(ty.kind(), ::sasql_core::pg_types::Kind::Enum(_))
+                match ty.kind() {
+                    ::sasql_core::pg_types::Kind::Enum(_) => ty.name() == #pg_type_name,
+                    _ => false,
+                }
             }
 
             fn to_sql_checked(

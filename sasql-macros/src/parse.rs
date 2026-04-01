@@ -317,11 +317,14 @@ fn detect_query_kind(normalized: &str) -> Result<QueryKind, String> {
     if first_word == "with" {
         // Find the main statement after the CTE
         // Simplified: look for select/insert/update/delete not inside parens
-        let mut depth: u32 = 0;
+        let mut depth: i32 = 0;
         for word in normalized.split_whitespace() {
+            let opens = word.matches('(').count() as i32;
+            let closes = word.matches(')').count() as i32;
+            depth += opens - closes;
+            if depth < 0 { depth = 0; } // malformed SQL — PG will catch it
+
             match word {
-                w if w.contains('(') => depth += w.matches('(').count() as u32 - w.matches(')').count() as u32,
-                w if w.contains(')') => depth = depth.saturating_sub(w.matches(')').count() as u32 - w.matches('(').count() as u32),
                 "select" if depth == 0 => return Ok(QueryKind::Select),
                 "insert" if depth == 0 => return Ok(QueryKind::Insert),
                 "update" if depth == 0 => return Ok(QueryKind::Update),

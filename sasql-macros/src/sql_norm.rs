@@ -67,6 +67,26 @@ pub fn normalize_sql(sql: &str) -> String {
             continue;
         }
 
+        // Double-quoted identifier: preserve verbatim (case-sensitive in PG)
+        if b == b'"' {
+            let start = i;
+            i += 1;
+            while i < len {
+                if bytes[i] == b'"' {
+                    i += 1;
+                    // Escaped "" inside identifier — continue
+                    if i < len && bytes[i] == b'"' {
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+
         // Dollar-quoted string: slice original &str verbatim
         if b == b'$' {
             if let Some((_tag, end)) = find_dollar_quote(bytes, i) {
@@ -283,6 +303,32 @@ mod tests {
         assert_eq!(
             normalize_sql("SELECT * FROM t WHERE name = 'Д''Артаньян'"),
             "select * from t where name = 'Д''Артаньян'"
+        );
+    }
+
+    // --- Double-quoted identifier preservation ---
+
+    #[test]
+    fn preserves_double_quoted_identifier() {
+        assert_eq!(
+            normalize_sql(r#"SELECT "MyColumn" FROM "MyTable""#),
+            r#"select "MyColumn" from "MyTable""#
+        );
+    }
+
+    #[test]
+    fn preserves_unicode_in_double_quoted_identifier() {
+        assert_eq!(
+            normalize_sql(r#"SELECT "Ёлка" FROM "Таблица""#),
+            r#"select "Ёлка" from "Таблица""#
+        );
+    }
+
+    #[test]
+    fn preserves_escaped_double_quote() {
+        assert_eq!(
+            normalize_sql(r#"SELECT "col""name" FROM t"#),
+            r#"select "col""name" from t"#
         );
     }
 }
