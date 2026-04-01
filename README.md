@@ -1,11 +1,11 @@
 # sasql
 
-**100% compile-time SQL safety. Zero escape hatches. Zero runtime SQL errors. Zero unsafe code.**
-
-sasql validates every SQL query against a real PostgreSQL instance during `cargo build`. If the binary is produced, every query in it is correct — tables exist, columns exist, types match, nullability is handled. Not "probably correct". Not "correct if you used the right function". Correct. Always.
-
-> Write SQL. Not a DSL. Not a query builder. Real PostgreSQL SQL — CTEs, window functions, JOINs, subqueries.
-> The compiler guarantees it works. There is no way to bypass this guarantee.
+- **100% compile-time SQL safety** — every query validated against a real PostgreSQL instance during `cargo build`
+- **Zero escape hatches** — no `query()`, no `raw_sql()`, no backdoor. The unchecked path does not exist
+- **Zero runtime SQL errors** — if the binary is produced, every query in it is correct
+- **Zero unsafe code** — `#![forbid(unsafe_code)]` on every crate
+- **Pure SQL** — write real PostgreSQL: CTEs, window functions, JOINs, subqueries. No DSL, no query builder
+- **Fail-fast architecture** — pool never blocks, errors surface immediately, no timeouts as a design pattern
 
 ```rust
 let id = 42i32;
