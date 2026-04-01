@@ -9,7 +9,7 @@
 use deadpool_postgres::{Config, ManagerConfig, RecyclingMethod, Runtime};
 use tokio_postgres::NoTls;
 
-use crate::error::{ConnectError, PoolError, SasqlResult};
+use crate::error::{ConnectError, SasqlError, SasqlResult};
 
 /// A PostgreSQL connection pool.
 ///
@@ -193,7 +193,7 @@ impl Pool {
             .inner
             .get()
             .await
-            .map_err(|_| PoolError::exhausted())?;
+            .map_err(SasqlError::from)?;
 
         Ok(PoolConnection {
             inner: conn,
@@ -217,9 +217,9 @@ impl Pool {
     pub fn status(&self) -> PoolStatus {
         let status = self.inner.status();
         PoolStatus {
-            available: status.available as usize,
-            size: status.size as usize,
-            max_size: status.max_size as usize,
+            available: status.available,
+            size: status.size,
+            max_size: status.max_size,
         }
     }
 }

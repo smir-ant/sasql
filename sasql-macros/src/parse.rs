@@ -59,7 +59,8 @@ pub fn parse_query(sql: &str) -> Result<ParsedQuery, String> {
         return Err("empty SQL query".into());
     }
 
-    let (positional_sql, params) = extract_params(sql)?;
+    let comment_stripped = strip_comments(sql);
+    let (positional_sql, params) = extract_params(&comment_stripped)?;
     let normalized_sql = normalize_sql(&positional_sql);
     let kind = detect_query_kind(&normalized_sql)?;
     let has_returning = detect_returning(&normalized_sql);
@@ -271,6 +272,74 @@ fn parse_one_param(sql: &str, start: usize) -> Result<(Param, usize), String> {
         },
         i,
     ))
+}
+
+/// Strip SQL comments (`--` line, `/* */` block) while preserving string literals
+/// and dollar-quoted strings. Must run before `extract_params` so that `$name: Type`
+/// inside comments is ignored. Uses `&str` slicing to preserve UTF-8.
+fn strip_comments(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        // Single-quoted string: preserve verbatim
+        if bytes[i] == b'\'' {
+            let start = i;
+            i += 1;
+            while i < len {
+                if bytes[i] == b'\'' {
+                    i += 1;
+                    if i < len && bytes[i] == b'\'' { i += 1; continue; }
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str(&sql[start..i]);
+            continue;
+        }
+
+        // Dollar-quoted string: preserve verbatim
+        if bytes[i] == b'$' {
+            if let Some(end) = skip_dollar_quote(bytes, i) {
+                out.push_str(&sql[i..end]);
+                i = end;
+                continue;
+            }
+        }
+
+        // Line comment: skip to end of line
+        if bytes[i] == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
+            i += 2;
+            while i < len && bytes[i] != b'\n' { i += 1; }
+            out.push(' ');
+            continue;
+        }
+
+        // Block comment: skip (with nesting support)
+        if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            i += 2;
+            let mut depth = 1u32;
+            while i + 1 < len && depth > 0 {
+                if bytes[i] == b'/' && bytes[i + 1] == b'*' { depth += 1; i += 2; continue; }
+                if bytes[i] == b'*' && bytes[i + 1] == b'/' { depth -= 1; i += 2; continue; }
+                i += 1;
+            }
+            out.push(' ');
+            continue;
+        }
+
+        // Non-comment content: slice from original str to preserve UTF-8
+        // ASCII bytes are single-byte in UTF-8, so this is safe for the
+        // control characters above. For multi-byte chars outside quotes,
+        // we need to advance by the full char width.
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
+    out
 }
 
 /// Skip a dollar-quoted string starting at `start`. Returns end position, or None.

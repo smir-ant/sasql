@@ -112,7 +112,8 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
     // Only for SELECT queries — LIMIT cannot be appended to INSERT/UPDATE/DELETE RETURNING.
     let needs_limit = has_columns
         && parsed.kind == crate::parse::QueryKind::Select
-        && !parsed.normalized_sql.contains(" limit ");
+        && !parsed.normalized_sql.contains(" limit ")
+        && !parsed.normalized_sql.contains(" for ");
     let limited_sql = if needs_limit {
         format!("{} LIMIT 2", parsed.positional_sql)
     } else {
@@ -292,22 +293,25 @@ fn parse_result_type(type_str: &str) -> TokenStream {
 ///
 /// For `SELECT u.id, t.id FROM ...` this produces `["id", "id_1"]`.
 fn deduplicate_column_names(columns: &[crate::validate::ColumnInfo]) -> Vec<String> {
-    let mut names: Vec<String> = columns
+    let names: Vec<String> = columns
         .iter()
         .enumerate()
         .map(|(i, col)| sanitize_column_name(&col.name, i))
         .collect();
 
-    let mut seen = std::collections::HashMap::<String, u32>::new();
-    for name in &mut names {
-        let count = seen.entry(name.clone()).or_insert(0);
-        if *count > 0 {
-            *name = format!("{}_{}", name, count);
+    // Deduplicate: suffix with _1, _2, etc. until unique
+    let mut final_names: Vec<String> = Vec::with_capacity(names.len());
+    for name in &names {
+        let mut candidate = name.clone();
+        let mut suffix = 1u32;
+        while final_names.contains(&candidate) {
+            candidate = format!("{name}_{suffix}");
+            suffix += 1;
         }
-        *count += 1;
+        final_names.push(candidate);
     }
 
-    names
+    final_names
 }
 
 fn result_struct_name(parsed: &ParsedQuery) -> proc_macro2::Ident {
