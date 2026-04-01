@@ -196,14 +196,21 @@ pub fn check_param_types(
     {
         let is_pg_enum = validation.param_is_pg_enum.get(i).copied().unwrap_or(false);
 
-        // PG enum params accept &str/String (text representation)
+        // PG enum params: accept &str/String (text representation) and
+        // unknown types (likely #[sasql::pg_enum] user enums, verified at runtime
+        // by ToSql). Reject types that are provably incompatible.
         if is_pg_enum {
             if matches!(param.rust_type.as_str(), "&str" | "String") {
                 continue;
             }
-            // Also accept any type — if the user passes a pg_enum type, ToSql
-            // handles it at runtime. We can't verify custom enum types at compile
-            // time since their OIDs are dynamic.
+            if crate::types::is_known_non_enum_type(&param.rust_type) {
+                return Err(format!(
+                    "type `{}` cannot be used for PostgreSQL enum parameter `${}`. \
+                     Use `&str`, `String`, or a `#[sasql::pg_enum]` type.",
+                    param.rust_type, param.name
+                ));
+            }
+            // Unknown type (likely a #[pg_enum] type) — accept, runtime ToSql verifies
             continue;
         }
 
@@ -352,13 +359,25 @@ pub fn check_variant_param_types(
         .enumerate()
     {
         let is_pg_enum = validation.param_is_pg_enum.get(i).copied().unwrap_or(false);
-        if is_pg_enum {
-            continue;
-        }
 
         // For optional clause params, the declared type is Option<T>.
         // PostgreSQL sees the inner type T. Strip Option<> for comparison.
         let check_type = strip_option(&param.rust_type);
+
+        if is_pg_enum {
+            if matches!(check_type, "&str" | "String") {
+                continue;
+            }
+            if crate::types::is_known_non_enum_type(check_type) {
+                return Err(format!(
+                    "type `{}` cannot be used for PostgreSQL enum parameter `${}`. \
+                     Use `&str`, `String`, or a `#[sasql::pg_enum]` type.",
+                    param.rust_type, param.name
+                ));
+            }
+            // Unknown type (likely a #[pg_enum] type) — accept, runtime ToSql verifies
+            continue;
+        }
 
         if !crate::types::is_param_compatible_extended(check_type, pg_oid) {
             let pg_name = sasql_core::types::pg_name_for_oid(pg_oid).unwrap_or("unknown");

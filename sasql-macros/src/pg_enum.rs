@@ -28,13 +28,26 @@ use proc_macro2::TokenStream;
 use quote::quote;
 
 /// Convert `CamelCase` to `snake_case` for PG type name derivation.
-/// `TicketStatus` → `ticket_status`, `HTTPCode` → `httpcode` (simplified).
+///
+/// Handles consecutive uppercase correctly:
+/// - `TicketStatus` -> `ticket_status`
+/// - `HTTPCode`     -> `http_code`
+/// - `A`            -> `a`
 fn to_snake_case(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 4);
-    for (i, c) in s.chars().enumerate() {
+    let chars: Vec<char> = s.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
         if c.is_uppercase() {
+            // Insert underscore before uppercase if:
+            // - Not at start, AND
+            // - Previous char was lowercase, OR
+            // - Next char exists and is lowercase (handles "HTTPCode" -> "http_code")
             if i > 0 {
-                out.push('_');
+                let prev_lower = chars[i - 1].is_lowercase();
+                let next_lower = chars.get(i + 1).is_some_and(|c| c.is_lowercase());
+                if prev_lower || next_lower {
+                    out.push('_');
+                }
             }
             out.push(c.to_ascii_lowercase());
         } else {
@@ -567,7 +580,7 @@ mod tests {
     fn snake_case_conversion() {
         assert_eq!(to_snake_case("TicketStatus"), "ticket_status");
         assert_eq!(to_snake_case("Color"), "color");
-        assert_eq!(to_snake_case("HTTPCode"), "h_t_t_p_code");
+        assert_eq!(to_snake_case("HTTPCode"), "http_code");
         assert_eq!(to_snake_case("A"), "a");
     }
 
@@ -765,5 +778,17 @@ mod tests {
     #[test]
     fn snake_case_empty() {
         assert_eq!(to_snake_case(""), "");
+    }
+
+    #[test]
+    fn snake_case_consecutive_uppercase() {
+        assert_eq!(to_snake_case("HTMLParser"), "html_parser");
+        assert_eq!(to_snake_case("IOError"), "io_error");
+    }
+
+    #[test]
+    fn snake_case_all_uppercase() {
+        assert_eq!(to_snake_case("URL"), "url");
+        assert_eq!(to_snake_case("HTTP"), "http");
     }
 }

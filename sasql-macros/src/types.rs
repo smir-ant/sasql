@@ -224,6 +224,49 @@ fn feature_error(pg_type: &str, oid: u32, features: &[&str]) -> String {
     format!("column type is {pg_type} (OID {oid}) — enable feature {features_str} in sasql")
 }
 
+/// Returns true if the Rust type is a known scalar/array type that is
+/// provably incompatible with PG enum parameters.
+///
+/// Used by `validate.rs` to reject obviously wrong types for PG enum columns
+/// (e.g. `$status: i32` on an enum column) while still allowing unknown types
+/// that might be `#[sasql::pg_enum]` user enums.
+pub fn is_known_non_enum_type(rust_type: &str) -> bool {
+    matches!(
+        rust_type,
+        "bool"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "f32"
+            | "f64"
+            | "u32"
+            | "Vec<u8>"
+            | "&[u8]"
+            | "Vec<bool>"
+            | "Vec<i16>"
+            | "Vec<i32>"
+            | "Vec<i64>"
+            | "Vec<f32>"
+            | "Vec<f64>"
+            | "Vec<String>"
+            | "&[bool]"
+            | "&[i16]"
+            | "&[i32]"
+            | "&[i64]"
+            | "&[f32]"
+            | "&[f64]"
+            | "&[&str]"
+            | "&[String]"
+    ) || rust_type.starts_with("::time::")
+        || rust_type.starts_with("time::")
+        || rust_type.starts_with("::chrono::")
+        || rust_type.starts_with("chrono::")
+        || rust_type.starts_with("::uuid::")
+        || rust_type.starts_with("uuid::")
+        || rust_type.starts_with("::rust_decimal::")
+        || rust_type.starts_with("rust_decimal::")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,5 +394,48 @@ mod tests {
             err.contains("decimal"),
             "should suggest decimal feature: {err}"
         );
+    }
+
+    // --- is_known_non_enum_type ---
+
+    #[test]
+    fn known_non_enum_scalars() {
+        assert!(is_known_non_enum_type("bool"));
+        assert!(is_known_non_enum_type("i32"));
+        assert!(is_known_non_enum_type("i64"));
+        assert!(is_known_non_enum_type("f64"));
+        assert!(is_known_non_enum_type("u32"));
+    }
+
+    #[test]
+    fn known_non_enum_arrays() {
+        assert!(is_known_non_enum_type("Vec<u8>"));
+        assert!(is_known_non_enum_type("Vec<i32>"));
+        assert!(is_known_non_enum_type("&[i64]"));
+        assert!(is_known_non_enum_type("&[&str]"));
+    }
+
+    #[test]
+    fn known_non_enum_crate_types() {
+        assert!(is_known_non_enum_type("::time::OffsetDateTime"));
+        assert!(is_known_non_enum_type("time::Date"));
+        assert!(is_known_non_enum_type("::chrono::NaiveDate"));
+        assert!(is_known_non_enum_type("chrono::NaiveDateTime"));
+        assert!(is_known_non_enum_type("::uuid::Uuid"));
+        assert!(is_known_non_enum_type("uuid::Uuid"));
+        assert!(is_known_non_enum_type("::rust_decimal::Decimal"));
+        assert!(is_known_non_enum_type("rust_decimal::Decimal"));
+    }
+
+    #[test]
+    fn str_and_string_not_known_non_enum() {
+        assert!(!is_known_non_enum_type("&str"));
+        assert!(!is_known_non_enum_type("String"));
+    }
+
+    #[test]
+    fn unknown_custom_type_not_known_non_enum() {
+        assert!(!is_known_non_enum_type("TicketStatus"));
+        assert!(!is_known_non_enum_type("MyEnum"));
     }
 }

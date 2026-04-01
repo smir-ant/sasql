@@ -30,11 +30,13 @@ static MACRO_CONN: LazyLock<Result<MacroConnection, String>> = LazyLock::new(|| 
 
     let rt = Runtime::new().map_err(|e| format!("sasql: failed to create tokio runtime: {e}"))?;
 
+    let mut pg_config: tokio_postgres::Config = database_url
+        .parse()
+        .map_err(|e| format!("sasql: invalid DATABASE_URL: {e}"))?;
+    pg_config.connect_timeout(std::time::Duration::from_secs(10));
+
     let (client, connection) = rt
-        .block_on(tokio_postgres::connect(
-            &database_url,
-            tokio_postgres::NoTls,
-        ))
+        .block_on(pg_config.connect(tokio_postgres::NoTls))
         .map_err(|e| {
             format!(
                 "sasql: failed to connect to PostgreSQL at compile time: {e}. \

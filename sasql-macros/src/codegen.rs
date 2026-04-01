@@ -103,7 +103,7 @@ fn gen_executor_struct(parsed: &ParsedQuery) -> TokenStream {
         }
     } else {
         let fields = parsed.params.iter().map(|p| {
-            let name = format_ident!("{}", p.name);
+            let name = param_ident(&p.name);
             let ty = inject_lifetime(&p.rust_type);
             quote! { #name: #ty }
         });
@@ -132,7 +132,7 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
         .params
         .iter()
         .map(|p| {
-            let name = format_ident!("{}", p.name);
+            let name = param_ident(&p.name);
             quote! { &self.#name as &(dyn ::sasql_core::pg::ToSql + Sync) }
         })
         .collect();
@@ -251,7 +251,7 @@ fn gen_dynamic_executor_struct(parsed: &ParsedQuery) -> TokenStream {
     let mut seen_names: Vec<String> = Vec::new();
 
     for p in &parsed.params {
-        let name = format_ident!("{}", p.name);
+        let name = param_ident(&p.name);
         let ty = inject_lifetime(&p.rust_type);
         fields.push(quote! { #name: #ty });
         seen_names.push(p.name.clone());
@@ -260,7 +260,7 @@ fn gen_dynamic_executor_struct(parsed: &ParsedQuery) -> TokenStream {
     for clause in &parsed.optional_clauses {
         for p in &clause.params {
             if !seen_names.contains(&p.name) {
-                let name = format_ident!("{}", p.name);
+                let name = param_ident(&p.name);
                 let ty = inject_lifetime(&p.rust_type);
                 fields.push(quote! { #name: #ty });
                 seen_names.push(p.name.clone());
@@ -430,7 +430,7 @@ where
     let discriminants: Vec<proc_macro2::Ident> = parsed
         .optional_clauses
         .iter()
-        .map(|c| format_ident!("{}", c.params[0].name))
+        .map(|c| param_ident(&c.params[0].name))
         .collect();
 
     let match_tuple = quote! { (#(self.#discriminants.is_some()),*) };
@@ -462,7 +462,7 @@ where
                 .params
                 .iter()
                 .map(|p| {
-                    let name = format_ident!("{}", p.name);
+                    let name = param_ident(&p.name);
                     if p.rust_type.starts_with("Option<") {
                         // Optional param — unwrap (we know it's Some in this arm)
                         quote! { self.#name.as_ref().unwrap() as &(dyn ::sasql_core::pg::ToSql + Sync) }
@@ -500,14 +500,14 @@ fn gen_dynamic_constructor(parsed: &ParsedQuery) -> TokenStream {
     let mut seen: Vec<String> = Vec::new();
 
     for p in &parsed.params {
-        field_names.push(format_ident!("{}", p.name));
+        field_names.push(param_ident(&p.name));
         seen.push(p.name.clone());
     }
 
     for clause in &parsed.optional_clauses {
         for p in &clause.params {
             if !seen.contains(&p.name) {
-                field_names.push(format_ident!("{}", p.name));
+                field_names.push(param_ident(&p.name));
                 seen.push(p.name.clone());
             }
         }
@@ -540,7 +540,7 @@ fn gen_constructor(parsed: &ParsedQuery) -> TokenStream {
         quote! { #executor_name }
     } else {
         let field_inits = parsed.params.iter().map(|p| {
-            let name = format_ident!("{}", p.name);
+            let name = param_ident(&p.name);
             quote! { #name }
         });
 
@@ -644,10 +644,35 @@ fn executor_struct_name(parsed: &ParsedQuery) -> proc_macro2::Ident {
     format_ident!("SasqlExecutor_{}", &parsed.statement_name)
 }
 
+/// Rust keywords (2021 edition) that cannot be used as bare identifiers.
+const RUST_KEYWORDS: &[&str] = &[
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
+    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
+    "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
+    "unsafe", "use", "where", "while", "yield",
+];
+
+/// Sanitize a user-declared parameter name into a valid Rust identifier.
+///
+/// Suffixes Rust keywords with `_` (e.g. `type` -> `type_`).
+fn sanitize_param_name(name: &str) -> String {
+    if RUST_KEYWORDS.contains(&name) {
+        format!("{name}_")
+    } else {
+        name.to_owned()
+    }
+}
+
+/// Create a `format_ident!` for a parameter name, handling Rust keywords.
+fn param_ident(name: &str) -> proc_macro2::Ident {
+    format_ident!("{}", sanitize_param_name(name))
+}
+
 /// Sanitize a PostgreSQL column name into a valid Rust identifier.
 ///
 /// PG returns `?column?` for unnamed expressions (e.g. `SELECT 1`).
-/// This function replaces invalid characters and provides fallback names.
+/// This function replaces invalid characters, provides fallback names,
+/// and suffixes Rust keywords with `_` (e.g. `type` -> `type_`).
 fn sanitize_column_name(name: &str, index: usize) -> String {
     if name == "?column?" || name.is_empty() {
         return format!("col_{index}");
@@ -666,8 +691,15 @@ fn sanitize_column_name(name: &str, index: usize) -> String {
         .collect();
 
     // Ensure it doesn't start with a digit
-    if sanitized.starts_with(|c: char| c.is_ascii_digit()) {
+    let sanitized = if sanitized.starts_with(|c: char| c.is_ascii_digit()) {
         format!("col_{sanitized}")
+    } else {
+        sanitized
+    };
+
+    // Suffix Rust keywords to avoid conflicts
+    if RUST_KEYWORDS.contains(&sanitized.as_str()) {
+        format!("{sanitized}_")
     } else {
         sanitized
     }
@@ -1009,6 +1041,41 @@ mod tests {
         assert_eq!(sanitize_column_name("user_name", 0), "user_name");
     }
 
+    // --- Rust keyword sanitization ---
+
+    #[test]
+    fn sanitize_column_keyword_type() {
+        assert_eq!(sanitize_column_name("type", 0), "type_");
+    }
+
+    #[test]
+    fn sanitize_column_keyword_fn() {
+        assert_eq!(sanitize_column_name("fn", 0), "fn_");
+    }
+
+    #[test]
+    fn sanitize_column_keyword_match() {
+        assert_eq!(sanitize_column_name("match", 0), "match_");
+    }
+
+    #[test]
+    fn sanitize_column_non_keyword_passthrough() {
+        assert_eq!(sanitize_column_name("status", 0), "status");
+    }
+
+    #[test]
+    fn sanitize_param_keyword() {
+        assert_eq!(sanitize_param_name("type"), "type_");
+        assert_eq!(sanitize_param_name("fn"), "fn_");
+        assert_eq!(sanitize_param_name("match"), "match_");
+    }
+
+    #[test]
+    fn sanitize_param_non_keyword() {
+        assert_eq!(sanitize_param_name("id"), "id");
+        assert_eq!(sanitize_param_name("name"), "name");
+    }
+
     // --- codegen: INSERT/UPDATE/DELETE without RETURNING has no result struct ---
 
     #[test]
@@ -1154,5 +1221,22 @@ mod tests {
             code_str.contains("pub id : i32"),
             "single column struct: {code_str}"
         );
+    }
+
+    // --- keyword column in generated code ---
+
+    #[test]
+    fn keyword_column_name_in_result_struct() {
+        let parsed = parse_query("SELECT 1").unwrap();
+        let validation = make_validation(vec![col("type", "String")]);
+        let code = generate_query_code(&parsed, &validation);
+        let code_str = code.to_string();
+
+        assert!(
+            code_str.contains("type_"),
+            "keyword column should be suffixed: {code_str}"
+        );
+        // Should NOT contain bare `type` as a field name (which would be invalid Rust)
+        // The suffixed version `type_` is a valid identifier
     }
 }

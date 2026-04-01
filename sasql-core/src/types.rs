@@ -264,6 +264,32 @@ impl<'a> postgres_types::FromSql<'a> for EnumString {
     }
 }
 
+impl postgres_types::ToSql for EnumString {
+    fn to_sql(
+        &self,
+        _ty: &postgres_types::Type,
+        out: &mut postgres_types::private::BytesMut,
+    ) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        out.extend_from_slice(self.0.as_bytes());
+        Ok(postgres_types::IsNull::No)
+    }
+
+    fn accepts(ty: &postgres_types::Type) -> bool {
+        <Self as postgres_types::FromSql>::accepts(ty)
+    }
+
+    fn to_sql_checked(
+        &self,
+        ty: &postgres_types::Type,
+        out: &mut postgres_types::private::BytesMut,
+    ) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        if !<Self as postgres_types::ToSql>::accepts(ty) {
+            return Err(format!("cannot convert EnumString to PostgreSQL type {ty:?}").into());
+        }
+        self.to_sql(ty, out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
