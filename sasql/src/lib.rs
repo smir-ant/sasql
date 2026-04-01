@@ -69,6 +69,7 @@ pub use sasql_macros::query;
 pub use sasql_core::error::{self, SasqlError, SasqlResult};
 pub use sasql_core::executor::Executor;
 pub use sasql_core::pool::{Pool, PoolBuilder, PoolConnection, PoolStatus};
+pub use sasql_core::transaction::Transaction;
 pub use sasql_core::types;
 
 // Re-export the postgres_types crate so pg_enum generated code can access it

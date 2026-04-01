@@ -15,6 +15,7 @@ pub use postgres_types as pg_types;
 pub mod error;
 pub mod executor;
 pub mod pool;
+pub mod transaction;
 pub mod types;
 
 /// Re-exports from `tokio-postgres` and `postgres-types` used by generated code.
@@ -27,3 +28,4 @@ pub mod pg {
 pub use error::{SasqlError, SasqlResult};
 pub use executor::Executor;
 pub use pool::{Pool, PoolBuilder, PoolConnection, PoolStatus};
+pub use transaction::Transaction;

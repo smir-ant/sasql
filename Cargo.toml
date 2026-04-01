@@ -3,7 +3,7 @@ resolver = "2"
 members = ["sasql", "sasql-core", "sasql-macros"]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -33,8 +33,8 @@ uuid = { version = "1", default-features = false }
 rust_decimal = { version = "1", default-features = false, features = ["std"] }
 
 # Internal
-sasql-core = { path = "sasql-core", version = "0.4.0" }
-sasql-macros = { path = "sasql-macros", version = "0.4.0" }
+sasql-core = { path = "sasql-core", version = "0.5.0" }
+sasql-macros = { path = "sasql-macros", version = "0.5.0" }
 
 # --- Build profiles ---
 # NOTE: these only affect workspace-internal builds (tests, benchmarks).

@@ -996,7 +996,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "sasql"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "sasql-core",
  "sasql-macros",
@@ -1008,7 +1008,7 @@ dependencies = [
 
 [[package]]
 name = "sasql-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "chrono",
  "deadpool-postgres",
@@ -1022,7 +1022,7 @@ dependencies = [
 
 [[package]]
 name = "sasql-macros"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bitcode",
  "postgres-types",

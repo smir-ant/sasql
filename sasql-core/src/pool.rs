@@ -10,6 +10,7 @@ use deadpool_postgres::{Config, ManagerConfig, RecyclingMethod, Runtime};
 use tokio_postgres::NoTls;
 
 use crate::error::{ConnectError, SasqlError, SasqlResult};
+use crate::transaction::Transaction;
 
 /// A PostgreSQL connection pool.
 ///
@@ -207,6 +208,22 @@ impl Pool {
     /// False when PgBouncer is detected without `prepared_statements=yes`.
     pub fn supports_named_statements(&self) -> bool {
         self.pgbouncer.supports_named_stmts
+    }
+
+    /// Begin a new transaction.
+    ///
+    /// Acquires a connection from the pool and sends `BEGIN`. The connection
+    /// is held for the lifetime of the returned [`Transaction`].
+    ///
+    /// **Fail-fast**: returns `SasqlError::Pool` immediately if no connections
+    /// are available. See CREDO principle #17.
+    pub async fn begin(&self) -> SasqlResult<Transaction> {
+        let conn = self.acquire().await?;
+        conn.inner
+            .batch_execute("BEGIN")
+            .await
+            .map_err(SasqlError::from)?;
+        Ok(Transaction::new(conn))
     }
 
     /// Current pool status: available and total connections.

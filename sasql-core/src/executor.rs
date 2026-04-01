@@ -7,6 +7,7 @@ use tokio_postgres::types::ToSql;
 
 use crate::error::{SasqlError, SasqlResult};
 use crate::pool::{Pool, PoolConnection};
+use crate::transaction::Transaction;
 
 /// Execute a prepared query and return raw rows.
 ///
@@ -33,6 +34,7 @@ mod sealed {
     pub trait Sealed {}
     impl Sealed for super::Pool {}
     impl Sealed for super::PoolConnection {}
+    impl Sealed for super::Transaction {}
 }
 
 impl Executor for Pool {
@@ -82,5 +84,19 @@ impl Executor for PoolConnection {
             .execute(&stmt, params)
             .await
             .map_err(SasqlError::from)
+    }
+}
+
+impl Executor for Transaction {
+    async fn query_raw(
+        &self,
+        sql: &str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> SasqlResult<Vec<tokio_postgres::Row>> {
+        self.connection().query_raw(sql, params).await
+    }
+
+    async fn execute_raw(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> SasqlResult<u64> {
+        self.connection().execute_raw(sql, params).await
     }
 }
