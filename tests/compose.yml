@@ -1,4 +1,5 @@
-# Run with: podman compose up -d
+# Run with: docker compose up -d
+# or:       podman compose up -d
 services:
   postgres:
     image: postgres:18
