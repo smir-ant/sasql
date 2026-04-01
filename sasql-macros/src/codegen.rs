@@ -203,6 +203,53 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
                     )),
                 }
             }
+
+            /// Stream rows one at a time, decoding each into the typed result struct.
+            ///
+            /// Only available on `&Pool` — the returned stream holds a connection
+            /// from the pool for its entire lifetime.
+            pub async fn fetch_stream(
+                self,
+                pool: &::sasql_core::Pool,
+            ) -> ::sasql_core::SasqlResult<
+                impl ::sasql_core::Stream<Item = ::sasql_core::SasqlResult<#result_name>> + '_
+            > {
+                use ::sasql_core::Stream as _;
+                let raw = pool.query_stream(#sql_lit, #params_slice).await?;
+                Ok(StreamMap { inner: raw, _phantom: ::std::marker::PhantomData::<#result_name> })
+            }
+        }
+    } else {
+        TokenStream::new()
+    };
+
+    // Generate the StreamMap adapter (only when columns exist)
+    let stream_map_def = if has_columns {
+        let result_name = result_struct_name(parsed);
+        let row_decode = gen_row_decode(validation);
+
+        quote! {
+            /// Maps `QueryStream` (raw rows) to typed result structs.
+            struct StreamMap<T> {
+                inner: ::sasql_core::QueryStream,
+                _phantom: ::std::marker::PhantomData<T>,
+            }
+
+            impl ::sasql_core::Stream for StreamMap<#result_name> {
+                type Item = ::sasql_core::SasqlResult<#result_name>;
+
+                fn poll_next(
+                    mut self: ::std::pin::Pin<&mut Self>,
+                    cx: &mut ::std::task::Context<'_>,
+                ) -> ::std::task::Poll<Option<Self::Item>> {
+                    ::std::pin::Pin::new(&mut self.inner)
+                        .poll_next(cx)
+                        .map(|opt| opt.map(|res| {
+                            let row = res?;
+                            Ok(#result_name { #row_decode })
+                        }))
+                }
+            }
         }
     } else {
         TokenStream::new()
@@ -219,6 +266,8 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
 
     if has_params {
         quote! {
+            #stream_map_def
+
             #[allow(non_camel_case_types)]
             impl<'_sasql> #executor_name<'_sasql> {
                 #fetch_methods
@@ -227,6 +276,8 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
         }
     } else {
         quote! {
+            #stream_map_def
+
             #[allow(non_camel_case_types)]
             impl #executor_name {
                 #fetch_methods
@@ -352,6 +403,13 @@ fn gen_dynamic_executor_impls(
                 }
             });
 
+        let fetch_stream_dispatcher = gen_variant_dispatcher(parsed, variants, false, |sql_lit| {
+            quote! {
+                let raw = pool.query_stream(#sql_lit, &params_slice[..]).await?;
+                Ok(StreamMap { inner: raw, _phantom: ::std::marker::PhantomData::<#result_name> })
+            }
+        });
+
         quote! {
             pub async fn fetch_one<E: ::sasql_core::Executor>(
                 self,
@@ -372,6 +430,51 @@ fn gen_dynamic_executor_impls(
                 executor: &E,
             ) -> ::sasql_core::SasqlResult<Option<#result_name>> {
                 #fetch_optional_dispatcher
+            }
+
+            /// Stream rows one at a time, decoding each into the typed result struct.
+            ///
+            /// Only available on `&Pool` — the returned stream holds a connection
+            /// from the pool for its entire lifetime.
+            pub async fn fetch_stream(
+                self,
+                pool: &::sasql_core::Pool,
+            ) -> ::sasql_core::SasqlResult<
+                impl ::sasql_core::Stream<Item = ::sasql_core::SasqlResult<#result_name>> + '_
+            > {
+                use ::sasql_core::Stream as _;
+                #fetch_stream_dispatcher
+            }
+        }
+    } else {
+        TokenStream::new()
+    };
+
+    // Generate the StreamMap adapter (only when columns exist)
+    let stream_map_def = if has_columns {
+        let result_name = result_struct_name(parsed);
+        let row_decode = gen_row_decode(validation);
+
+        quote! {
+            struct StreamMap<T> {
+                inner: ::sasql_core::QueryStream,
+                _phantom: ::std::marker::PhantomData<T>,
+            }
+
+            impl ::sasql_core::Stream for StreamMap<#result_name> {
+                type Item = ::sasql_core::SasqlResult<#result_name>;
+
+                fn poll_next(
+                    mut self: ::std::pin::Pin<&mut Self>,
+                    cx: &mut ::std::task::Context<'_>,
+                ) -> ::std::task::Poll<Option<Self::Item>> {
+                    ::std::pin::Pin::new(&mut self.inner)
+                        .poll_next(cx)
+                        .map(|opt| opt.map(|res| {
+                            let row = res?;
+                            Ok(#result_name { #row_decode })
+                        }))
+                }
             }
         }
     } else {
@@ -395,6 +498,8 @@ fn gen_dynamic_executor_impls(
 
     if has_any_params {
         quote! {
+            #stream_map_def
+
             #[allow(non_camel_case_types)]
             impl<'_sasql> #executor_name<'_sasql> {
                 #fetch_methods
@@ -403,6 +508,8 @@ fn gen_dynamic_executor_impls(
         }
     } else {
         quote! {
+            #stream_map_def
+
             #[allow(non_camel_case_types)]
             impl #executor_name {
                 #fetch_methods
@@ -778,7 +885,60 @@ mod tests {
             code_str.contains("fetch_optional"),
             "missing fetch_optional: {code_str}"
         );
+        assert!(
+            code_str.contains("fetch_stream"),
+            "missing fetch_stream: {code_str}"
+        );
         assert!(code_str.contains("execute"), "missing execute: {code_str}");
+    }
+
+    #[test]
+    fn fetch_stream_uses_pool_not_executor() {
+        let parsed = parse_query("SELECT id FROM t WHERE id = $id: i32").unwrap();
+        let validation = make_validation(vec![col("id", "i32")]);
+        let code = generate_query_code(&parsed, &validation);
+        let code_str = code.to_string();
+
+        // fetch_stream takes &Pool, not generic E: Executor
+        assert!(
+            code_str.contains("pool : & :: sasql_core :: Pool")
+                || code_str.contains("pool: &::sasql_core::Pool"),
+            "fetch_stream should accept &Pool: {code_str}"
+        );
+    }
+
+    #[test]
+    fn fetch_stream_generates_stream_map() {
+        let parsed = parse_query("SELECT id, login FROM t WHERE id = $id: i32").unwrap();
+        let validation = make_validation(vec![col("id", "i32"), col("login", "String")]);
+        let code = generate_query_code(&parsed, &validation);
+        let code_str = code.to_string();
+
+        assert!(
+            code_str.contains("StreamMap"),
+            "missing StreamMap adapter: {code_str}"
+        );
+        assert!(
+            code_str.contains("poll_next"),
+            "StreamMap should implement poll_next: {code_str}"
+        );
+    }
+
+    #[test]
+    fn execute_only_query_has_no_fetch_stream() {
+        let parsed = parse_query("UPDATE t SET a = $a: i32 WHERE id = $id: i32").unwrap();
+        let validation = make_validation(vec![]);
+        let code = generate_query_code(&parsed, &validation);
+        let code_str = code.to_string();
+
+        assert!(
+            !code_str.contains("fetch_stream"),
+            "execute-only query should not have fetch_stream: {code_str}"
+        );
+        assert!(
+            !code_str.contains("StreamMap"),
+            "execute-only query should not have StreamMap: {code_str}"
+        );
     }
 
     #[test]

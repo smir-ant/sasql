@@ -59,6 +59,7 @@
 //! | `.fetch_one(&pool)` | `T` | 0 rows, or 2+ rows |
 //! | `.fetch_all(&pool)` | `Vec<T>` | never (empty = empty vec) |
 //! | `.fetch_optional(&pool)` | `Option<T>` | 2+ rows |
+//! | `.fetch_stream(&pool)` | `impl Stream<Item = Result<T>>` | never |
 //! | `.execute(&pool)` | `u64` (affected rows) | never |
 
 // Re-export the query! macro and pg_enum attribute macro
@@ -68,7 +69,9 @@ pub use sasql_macros::query;
 // Re-export all runtime types
 pub use sasql_core::error::{self, SasqlError, SasqlResult};
 pub use sasql_core::executor::Executor;
+pub use sasql_core::listener::{Listener, Notification};
 pub use sasql_core::pool::{Pool, PoolBuilder, PoolConnection, PoolStatus};
+pub use sasql_core::stream::QueryStream;
 pub use sasql_core::transaction::Transaction;
 pub use sasql_core::types;
 
@@ -76,3 +79,7 @@ pub use sasql_core::types;
 // via `::sasql_core::pg_types::*` paths.
 #[doc(hidden)]
 pub use sasql_core::pg_types;
+
+// Re-export Stream trait so users can consume QueryStream without
+// adding futures-core as a direct dependency.
+pub use futures_core::Stream;

@@ -14,7 +14,9 @@ pub use postgres_types as pg_types;
 
 pub mod error;
 pub mod executor;
+pub mod listener;
 pub mod pool;
+pub mod stream;
 pub mod transaction;
 pub mod types;
 
@@ -25,7 +27,13 @@ pub mod pg {
     pub use tokio_postgres::Row;
 }
 
+/// Re-export `futures_core::Stream` so consumers can use `QueryStream`
+/// without adding `futures-core` as a direct dependency.
+pub use futures_core::Stream;
+
 pub use error::{SasqlError, SasqlResult};
 pub use executor::Executor;
+pub use listener::{Listener, Notification};
 pub use pool::{Pool, PoolBuilder, PoolConnection, PoolStatus};
+pub use stream::QueryStream;
 pub use transaction::Transaction;

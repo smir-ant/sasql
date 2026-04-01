@@ -996,22 +996,25 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "sasql"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
+ "futures-core",
  "sasql-core",
  "sasql-macros",
  "time",
  "tokio",
+ "tokio-stream",
  "trybuild",
  "uuid",
 ]
 
 [[package]]
 name = "sasql-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "deadpool-postgres",
+ "futures-core",
  "postgres-types",
  "rust_decimal",
  "time",
@@ -1022,7 +1025,7 @@ dependencies = [
 
 [[package]]
 name = "sasql-macros"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bitcode",
  "postgres-types",
@@ -1301,6 +1304,17 @@ dependencies = [
  "tokio",
  "tokio-util",
  "whoami",
+]
+
+[[package]]
+name = "tokio-stream"
+version = "0.1.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32da49809aab5c3bc678af03902d4ccddea2a87d028d86392a4b1560c6906c70"
+dependencies = [
+ "futures-core",
+ "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]

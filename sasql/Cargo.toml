@@ -16,9 +16,11 @@ decimal = ["sasql-core/decimal", "sasql-macros/decimal"]
 [dependencies]
 sasql-core = { workspace = true }
 sasql-macros = { workspace = true }
+futures-core = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio-stream = { workspace = true }
 trybuild = "1"
 time = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }

@@ -8,8 +8,10 @@
 
 use deadpool_postgres::{Config, ManagerConfig, RecyclingMethod, Runtime};
 use tokio_postgres::NoTls;
+use tokio_postgres::types::ToSql;
 
 use crate::error::{ConnectError, SasqlError, SasqlResult};
+use crate::stream::QueryStream;
 use crate::transaction::Transaction;
 
 /// A PostgreSQL connection pool.
@@ -224,6 +226,40 @@ impl Pool {
             .await
             .map_err(SasqlError::from)?;
         Ok(Transaction::new(conn))
+    }
+
+    /// Execute a query and return a stream of rows.
+    ///
+    /// Acquires a connection from the pool and returns a [`QueryStream`]
+    /// that holds the connection alive until the stream is consumed or
+    /// dropped. Rows arrive one at a time, avoiding buffering the
+    /// entire result set in memory.
+    ///
+    /// **Fail-fast**: returns `SasqlError::Pool` immediately if no connections
+    /// are available. See CREDO principle #17.
+    ///
+    /// This method is only available on `Pool` (not `PoolConnection` or
+    /// `Transaction`) because the stream must own the connection for its
+    /// entire lifetime.
+    pub async fn query_stream(
+        &self,
+        sql: &str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> SasqlResult<QueryStream> {
+        let conn = self.acquire().await?;
+        let stmt = conn
+            .inner
+            .prepare_cached(sql)
+            .await
+            .map_err(SasqlError::from)?;
+
+        let row_stream = conn
+            .inner
+            .query_raw(&stmt, params.iter().copied())
+            .await
+            .map_err(SasqlError::from)?;
+
+        Ok(QueryStream::new(conn, row_stream))
     }
 
     /// Current pool status: available and total connections.
