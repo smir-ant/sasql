@@ -39,8 +39,9 @@ fn gen_result_struct(parsed: &ParsedQuery, validation: &ValidationResult) -> Tok
     }
 
     let struct_name = result_struct_name(parsed);
+    let deduped_names = deduplicate_column_names(&validation.columns);
     let fields = validation.columns.iter().enumerate().map(|(i, col)| {
-        let field_name = format_ident!("{}", sanitize_column_name(&col.name, i));
+        let field_name = format_ident!("{}", deduped_names[i]);
         let field_type = parse_result_type(&col.rust_type);
         quote! { pub #field_name: #field_type }
     });
@@ -55,9 +56,12 @@ fn gen_result_struct(parsed: &ParsedQuery, validation: &ValidationResult) -> Tok
 }
 
 /// Generate the executor struct (captures query parameters).
+///
+/// Always emits `<'_sasql>` lifetime and `PhantomData` — no branching.
+/// When no fields use the lifetime, PhantomData ties it to the struct.
+/// This is zero-cost (PhantomData is ZST).
 fn gen_executor_struct(parsed: &ParsedQuery) -> TokenStream {
     let struct_name = executor_struct_name(parsed);
-    let needs_lifetime = has_reference_params(parsed);
 
     if parsed.params.is_empty() {
         quote! {
@@ -67,34 +71,28 @@ fn gen_executor_struct(parsed: &ParsedQuery) -> TokenStream {
     } else {
         let fields = parsed.params.iter().map(|p| {
             let name = format_ident!("{}", p.name);
-            let ty = parse_rust_type(&p.rust_type);
+            let ty = inject_lifetime(&p.rust_type);
             quote! { #name: #ty }
         });
 
-        if needs_lifetime {
-            quote! {
-                #[allow(non_camel_case_types)]
-                struct #struct_name<'_sasql> {
-                    #(#fields,)*
-                    _marker: ::std::marker::PhantomData<&'_sasql ()>,
-                }
-            }
-        } else {
-            quote! {
-                #[allow(non_camel_case_types)]
-                struct #struct_name {
-                    #(#fields,)*
-                }
+        quote! {
+            #[allow(non_camel_case_types)]
+            struct #struct_name<'_sasql> {
+                #(#fields,)*
+                _marker: ::std::marker::PhantomData<&'_sasql ()>,
             }
         }
     }
 }
 
 /// Generate `fetch_one`, `fetch_all`, `fetch_optional`, `execute` methods.
+///
+/// FIX 10: for `fetch_one` and `fetch_optional`, if the SQL has no LIMIT clause,
+/// inject `LIMIT 2` so PG stops early instead of fetching an entire table.
 fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> TokenStream {
     let executor_name = executor_struct_name(parsed);
     let sql_lit = &parsed.positional_sql;
-    let needs_lifetime = has_reference_params(parsed);
+    let has_params = !parsed.params.is_empty();
 
     // Build the params slice: &[&self.id, &self.name, ...]
     let param_refs: Vec<TokenStream> = parsed.params.iter().map(|p| {
@@ -110,6 +108,18 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
 
     let has_columns = !validation.columns.is_empty();
 
+    // FIX 10: generate a LIMIT 2 variant for fetch_one/fetch_optional.
+    // Only for SELECT queries — LIMIT cannot be appended to INSERT/UPDATE/DELETE RETURNING.
+    let needs_limit = has_columns
+        && parsed.kind == crate::parse::QueryKind::Select
+        && !parsed.normalized_sql.contains(" limit ");
+    let limited_sql = if needs_limit {
+        format!("{} LIMIT 2", parsed.positional_sql)
+    } else {
+        parsed.positional_sql.clone()
+    };
+    let limited_sql_lit = &limited_sql;
+
     let fetch_methods = if has_columns {
         let result_name = result_struct_name(parsed);
         let row_decode = gen_row_decode(validation);
@@ -119,7 +129,7 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
                 self,
                 executor: &E,
             ) -> ::sasql_core::SasqlResult<#result_name> {
-                let rows = executor.query_raw(#sql_lit, #params_slice).await?;
+                let rows = executor.query_raw(#limited_sql_lit, #params_slice).await?;
                 if rows.len() != 1 {
                     return Err(::sasql_core::error::QueryError::row_count(
                         "exactly 1 row",
@@ -142,7 +152,7 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
                 self,
                 executor: &E,
             ) -> ::sasql_core::SasqlResult<Option<#result_name>> {
-                let rows = executor.query_raw(#sql_lit, #params_slice).await?;
+                let rows = executor.query_raw(#limited_sql_lit, #params_slice).await?;
                 match rows.len() {
                     0 => Ok(None),
                     1 => {
@@ -169,7 +179,7 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
         }
     };
 
-    let impl_block = if needs_lifetime {
+    let impl_block = if has_params {
         quote! {
             #[allow(non_camel_case_types)]
             impl<'_sasql> #executor_name<'_sasql> {
@@ -192,8 +202,9 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
 
 /// Generate row field decoding: `field_name: row.get(0), ...`
 fn gen_row_decode(validation: &ValidationResult) -> TokenStream {
-    let fields = validation.columns.iter().enumerate().map(|(i, col)| {
-        let field_name = format_ident!("{}", sanitize_column_name(&col.name, i));
+    let deduped_names = deduplicate_column_names(&validation.columns);
+    let fields = deduped_names.iter().enumerate().map(|(i, name)| {
+        let field_name = format_ident!("{}", name);
         let idx = i;
         quote! { #field_name: row.get(#idx) }
     });
@@ -213,44 +224,90 @@ fn gen_constructor(parsed: &ParsedQuery) -> TokenStream {
             quote! { #name }
         });
 
-        if has_reference_params(parsed) {
-            quote! { #executor_name { #(#field_inits,)* _marker: ::std::marker::PhantomData } }
-        } else {
-            quote! { #executor_name { #(#field_inits),* } }
+        // Always emit PhantomData — matches the always-present `'_sasql`
+        quote! { #executor_name { #(#field_inits,)* _marker: ::std::marker::PhantomData } }
+    }
+}
+
+/// Parse a Rust type string and inject `'_sasql` lifetime on bare references.
+///
+/// Uses `syn::parse_str` to build a proper type AST, then walks it to add
+/// lifetimes. This handles nested types correctly: `Option<&str>`, `&[&str]`,
+/// `Vec<&[u8]>`, etc.
+fn inject_lifetime(type_str: &str) -> TokenStream {
+    match syn::parse_str::<syn::Type>(type_str) {
+        Ok(ty) => {
+            let rewritten = add_lifetime_to_refs(ty);
+            quote! { #rewritten }
+        }
+        Err(_) => {
+            let msg = format!("internal error: cannot parse type `{type_str}`");
+            quote! { compile_error!(#msg) }
         }
     }
 }
 
-/// Check if any parameter type contains a reference (`&`).
-fn has_reference_params(parsed: &ParsedQuery) -> bool {
-    parsed.params.iter().any(|p| p.rust_type.contains('&'))
-}
-
-/// Parse a Rust type string into a TokenStream.
-///
-/// Handles: `i32`, `String`, `Option<i32>`, `Vec<u8>`, `Vec<Vec<u8>>`, `&str`, `&[u8]`, etc.
-/// For executor struct fields, reference types get the `'_sasql` lifetime.
-fn parse_rust_type(type_str: &str) -> TokenStream {
-    // Add lifetime to reference types for the executor struct
-    let with_lifetime = type_str
-        .replace("&str", "&'_sasql str")
-        .replace("&[", "&'_sasql [");
-
-    with_lifetime.parse().unwrap_or_else(|_| {
-        // Fallback: try original string
-        type_str.parse().unwrap_or_else(|_| {
-            let ident = format_ident!("{}", type_str);
-            quote! { #ident }
-        })
-    })
+/// Recursively add `'_sasql` lifetime to bare (elided) references in a type.
+fn add_lifetime_to_refs(ty: syn::Type) -> syn::Type {
+    match ty {
+        syn::Type::Reference(mut r) => {
+            if r.lifetime.is_none() {
+                r.lifetime = Some(syn::Lifetime::new("'_sasql", proc_macro2::Span::call_site()));
+            }
+            r.elem = Box::new(add_lifetime_to_refs(*r.elem));
+            syn::Type::Reference(r)
+        }
+        syn::Type::Slice(mut s) => {
+            s.elem = Box::new(add_lifetime_to_refs(*s.elem));
+            syn::Type::Slice(s)
+        }
+        syn::Type::Path(mut p) => {
+            for seg in &mut p.path.segments {
+                if let syn::PathArguments::AngleBracketed(args) = &mut seg.arguments {
+                    for arg in &mut args.args {
+                        if let syn::GenericArgument::Type(inner) = arg {
+                            *inner = add_lifetime_to_refs(inner.clone());
+                        }
+                    }
+                }
+            }
+            syn::Type::Path(p)
+        }
+        other => other,
+    }
 }
 
 /// Parse a Rust type for result struct fields (no lifetime needed — these are owned).
 fn parse_result_type(type_str: &str) -> TokenStream {
-    type_str.parse().unwrap_or_else(|_| {
-        let ident = format_ident!("{}", type_str);
-        quote! { #ident }
-    })
+    match syn::parse_str::<syn::Type>(type_str) {
+        Ok(ty) => quote! { #ty },
+        Err(_) => {
+            let msg = format!("internal error: cannot parse type `{type_str}`");
+            quote! { compile_error!(#msg) }
+        }
+    }
+}
+
+/// Deduplicate column names by suffixing duplicates with `_1`, `_2`, etc.
+///
+/// For `SELECT u.id, t.id FROM ...` this produces `["id", "id_1"]`.
+fn deduplicate_column_names(columns: &[crate::validate::ColumnInfo]) -> Vec<String> {
+    let mut names: Vec<String> = columns
+        .iter()
+        .enumerate()
+        .map(|(i, col)| sanitize_column_name(&col.name, i))
+        .collect();
+
+    let mut seen = std::collections::HashMap::<String, u32>::new();
+    for name in &mut names {
+        let count = seen.entry(name.clone()).or_insert(0);
+        if *count > 0 {
+            *name = format!("{}_{}", name, count);
+        }
+        *count += 1;
+    }
+
+    names
 }
 
 fn result_struct_name(parsed: &ParsedQuery) -> proc_macro2::Ident {
@@ -376,9 +433,11 @@ mod tests {
         let code = generate_query_code(&parsed, &validation);
         let code_str = code.to_string();
 
-        // The constructor should reference the variable name `id`
-        assert!(code_str.contains("{ id }") || code_str.contains("{id}"),
+        // The constructor should reference the variable name `id` and include PhantomData
+        assert!(code_str.contains("id ,") || code_str.contains("id,"),
             "missing param capture: {code_str}");
+        assert!(code_str.contains("PhantomData"),
+            "missing PhantomData: {code_str}");
     }
 
     #[test]
@@ -391,5 +450,106 @@ mod tests {
         // The generated code should use positional SQL ($1), not named ($id)
         assert!(code_str.contains("$1"), "should contain positional $1: {code_str}");
         assert!(!code_str.contains("$id"), "should not contain named $id: {code_str}");
+    }
+
+    // --- FIX 5: lifetime injection via syn ---
+
+    #[test]
+    fn inject_lifetime_bare_ref_str() {
+        let ts = inject_lifetime("&str");
+        let s = ts.to_string();
+        assert!(s.contains("'_sasql"), "missing lifetime: {s}");
+    }
+
+    #[test]
+    fn inject_lifetime_bare_ref_slice() {
+        let ts = inject_lifetime("&[u8]");
+        let s = ts.to_string();
+        assert!(s.contains("'_sasql"), "missing lifetime: {s}");
+    }
+
+    #[test]
+    fn inject_lifetime_option_ref() {
+        let ts = inject_lifetime("Option<&str>");
+        let s = ts.to_string();
+        assert!(s.contains("'_sasql"), "missing lifetime in Option<&str>: {s}");
+    }
+
+    #[test]
+    fn inject_lifetime_no_ref_passes_through() {
+        let ts = inject_lifetime("i32");
+        let s = ts.to_string();
+        assert!(!s.contains("'_sasql"), "i32 should have no lifetime: {s}");
+    }
+
+    #[test]
+    fn inject_lifetime_ref_slice_of_refs() {
+        let ts = inject_lifetime("&[&str]");
+        let s = ts.to_string();
+        // Both references should get lifetimes
+        assert_eq!(s.matches("'_sasql").count(), 2,
+            "expected 2 lifetimes in &[&str]: {s}");
+    }
+
+    // --- FIX 6: duplicate column names ---
+
+    #[test]
+    fn duplicate_column_names_deduplicated() {
+        let columns = vec![
+            col("id", "i32"),
+            col("id", "i32"),
+            col("name", "String"),
+        ];
+        let names = deduplicate_column_names(&columns);
+        assert_eq!(names, vec!["id", "id_1", "name"]);
+    }
+
+    #[test]
+    fn three_duplicate_columns() {
+        let columns = vec![
+            col("id", "i32"),
+            col("id", "i32"),
+            col("id", "i32"),
+        ];
+        let names = deduplicate_column_names(&columns);
+        assert_eq!(names, vec!["id", "id_1", "id_2"]);
+    }
+
+    #[test]
+    fn generates_result_struct_with_deduplicated_fields() {
+        let parsed = parse_query("SELECT 1").unwrap();
+        let validation = make_validation(vec![
+            col("id", "i32"),
+            col("id", "i32"),
+        ]);
+        let code = generate_query_code(&parsed, &validation);
+        let code_str = code.to_string();
+
+        assert!(code_str.contains("id"), "missing id field: {code_str}");
+        assert!(code_str.contains("id_1"), "missing id_1 field: {code_str}");
+    }
+
+    // --- FIX 10: LIMIT injection ---
+
+    #[test]
+    fn fetch_one_injects_limit_2() {
+        let parsed = parse_query("SELECT id FROM t WHERE id = $id: i32").unwrap();
+        let validation = make_validation(vec![col("id", "i32")]);
+        let code = generate_query_code(&parsed, &validation);
+        let code_str = code.to_string();
+
+        // fetch_one should use "... LIMIT 2", fetch_all should use original SQL
+        assert!(code_str.contains("LIMIT 2"), "missing LIMIT 2 in fetch_one: {code_str}");
+    }
+
+    #[test]
+    fn existing_limit_not_doubled() {
+        let parsed = parse_query("SELECT id FROM t WHERE id = $id: i32 LIMIT 10").unwrap();
+        let validation = make_validation(vec![col("id", "i32")]);
+        let code = generate_query_code(&parsed, &validation);
+        let code_str = code.to_string();
+
+        // Should NOT inject an additional LIMIT
+        assert!(!code_str.contains("LIMIT 2"), "should not add LIMIT 2 when LIMIT exists: {code_str}");
     }
 }

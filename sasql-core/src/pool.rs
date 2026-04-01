@@ -97,15 +97,23 @@ impl PoolBuilder {
         cfg.manager = Some(ManagerConfig {
             recycling_method: RecyclingMethod::Fast,
         });
+        // FIX 2: fail-fast — zero wait timeout means acquire() never blocks
+        cfg.pool = Some(deadpool_postgres::PoolConfig {
+            max_size: self.max_size,
+            timeouts: deadpool_postgres::Timeouts {
+                wait: Some(std::time::Duration::ZERO),
+                create: None,
+                recycle: None,
+            },
+            ..Default::default()
+        });
 
         let pool = cfg
             .create_pool(Some(Runtime::Tokio1), NoTls)
             .map_err(|e| ConnectError::new(e.to_string()))?;
 
-        pool.resize(self.max_size);
-
-        // Detect PgBouncer on first connection
-        let pgbouncer = detect_pgbouncer(&pool).await;
+        // FIX 11: detect PgBouncer — propagate connection failure
+        let pgbouncer = detect_pgbouncer(&pool).await?;
 
         Ok(Pool {
             inner: pool,
@@ -139,12 +147,23 @@ impl Pool {
         cfg.manager = Some(ManagerConfig {
             recycling_method: RecyclingMethod::Fast,
         });
+        // FIX 2: fail-fast — zero wait timeout means acquire() never blocks
+        cfg.pool = Some(deadpool_postgres::PoolConfig {
+            max_size: 16,
+            timeouts: deadpool_postgres::Timeouts {
+                wait: Some(std::time::Duration::ZERO),
+                create: None,
+                recycle: None,
+            },
+            ..Default::default()
+        });
 
         let pool = cfg
             .create_pool(Some(Runtime::Tokio1), NoTls)
             .map_err(|e| ConnectError::new(e.to_string()))?;
 
-        let pgbouncer = detect_pgbouncer(&pool).await;
+        // FIX 11: detect PgBouncer — propagate connection failure
+        let pgbouncer = detect_pgbouncer(&pool).await?;
 
         Ok(Pool {
             inner: pool,
@@ -232,11 +251,16 @@ pub struct PoolStatus {
 ///
 /// Strategy: try `SHOW POOLS` — only PgBouncer responds to this.
 /// If PgBouncer is detected, check `SHOW CONFIG` for `prepared_statements`.
-async fn detect_pgbouncer(pool: &deadpool_postgres::Pool) -> PgBouncerInfo {
-    let conn = match pool.get().await {
-        Ok(c) => c,
-        Err(_) => return PgBouncerInfo::DIRECT, // can't detect, assume direct
-    };
+///
+/// FIX 11: returns `Err` if the initial connection fails, instead of silently
+/// returning `DIRECT`. A pool that can't connect on creation is broken.
+async fn detect_pgbouncer(pool: &deadpool_postgres::Pool) -> SasqlResult<PgBouncerInfo> {
+    let conn = pool.get().await.map_err(|e| {
+        ConnectError::with_source(
+            format!("failed to establish initial connection: {e}"),
+            e,
+        )
+    })?;
 
     // PgBouncer responds to `SHOW POOLS`; PostgreSQL does not.
     let is_pgbouncer = conn
@@ -245,7 +269,7 @@ async fn detect_pgbouncer(pool: &deadpool_postgres::Pool) -> PgBouncerInfo {
         .is_ok();
 
     if !is_pgbouncer {
-        return PgBouncerInfo::DIRECT;
+        return Ok(PgBouncerInfo::DIRECT);
     }
 
     // Check if PgBouncer supports named prepared statements (1.21+)
@@ -261,10 +285,10 @@ async fn detect_pgbouncer(pool: &deadpool_postgres::Pool) -> PgBouncerInfo {
         Err(_) => false,
     };
 
-    PgBouncerInfo {
+    Ok(PgBouncerInfo {
         detected: true,
         supports_named_stmts: supports_named,
-    }
+    })
 }
 
 #[cfg(test)]

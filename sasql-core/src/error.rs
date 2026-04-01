@@ -28,6 +28,7 @@ pub enum SasqlError {
 #[derive(Debug)]
 pub struct PoolError {
     pub message: String,
+    pub(crate) source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
 /// Query execution failure. Contains the PostgreSQL error code when available.
@@ -36,6 +37,7 @@ pub struct QueryError {
     pub message: String,
     /// The five-character SQLSTATE code (e.g. `"23505"` for unique violation).
     pub pg_code: Option<String>,
+    pub(crate) source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
 /// Row/column decoding failure.
@@ -50,6 +52,7 @@ pub struct DecodeError {
 #[derive(Debug)]
 pub struct ConnectError {
     pub message: String,
+    pub(crate) source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
 /// Convenience alias used throughout sasql.
@@ -102,31 +105,55 @@ impl fmt::Display for ConnectError {
 
 impl std::error::Error for SasqlError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        None
+        match self {
+            Self::Pool(e) => e.source(),
+            Self::Query(e) => e.source(),
+            Self::Decode(_) => None,
+            Self::Connect(e) => e.source(),
+        }
     }
 }
 
-impl std::error::Error for PoolError {}
-impl std::error::Error for QueryError {}
+impl std::error::Error for PoolError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_ref().map(|e| &**e as &(dyn std::error::Error + 'static))
+    }
+}
+
+impl std::error::Error for QueryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_ref().map(|e| &**e as &(dyn std::error::Error + 'static))
+    }
+}
+
 impl std::error::Error for DecodeError {}
-impl std::error::Error for ConnectError {}
+
+impl std::error::Error for ConnectError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_ref().map(|e| &**e as &(dyn std::error::Error + 'static))
+    }
+}
 
 // --- From conversions ---
 
 impl From<tokio_postgres::Error> for SasqlError {
     fn from(e: tokio_postgres::Error) -> Self {
         let pg_code = e.code().map(|c| c.code().to_owned());
+        let message = e.to_string();
         SasqlError::Query(QueryError {
-            message: e.to_string(),
+            message,
             pg_code,
+            source: Some(Box::new(e)),
         })
     }
 }
 
 impl From<deadpool_postgres::PoolError> for SasqlError {
     fn from(e: deadpool_postgres::PoolError) -> Self {
+        let message = e.to_string();
         SasqlError::Pool(PoolError {
-            message: e.to_string(),
+            message,
+            source: Some(Box::new(e)),
         })
     }
 }
@@ -137,6 +164,7 @@ impl PoolError {
     pub fn exhausted() -> SasqlError {
         SasqlError::Pool(PoolError {
             message: "pool exhausted: all connections in use".into(),
+            source: None,
         })
     }
 }
@@ -145,6 +173,14 @@ impl ConnectError {
     pub fn new(msg: impl Into<String>) -> SasqlError {
         SasqlError::Connect(ConnectError {
             message: msg.into(),
+            source: None,
+        })
+    }
+
+    pub fn with_source(msg: impl Into<String>, source: impl std::error::Error + Send + Sync + 'static) -> SasqlError {
+        SasqlError::Connect(ConnectError {
+            message: msg.into(),
+            source: Some(Box::new(source)),
         })
     }
 }
@@ -154,6 +190,7 @@ impl QueryError {
         SasqlError::Query(QueryError {
             message: format!("expected {expected}, got {actual} rows"),
             pg_code: None,
+            source: None,
         })
     }
 }
@@ -176,6 +213,7 @@ mod tests {
         let e = SasqlError::Query(QueryError {
             message: "duplicate key".into(),
             pg_code: Some("23505".into()),
+            source: None,
         });
         assert_eq!(e.to_string(), "query error: [23505] duplicate key");
     }

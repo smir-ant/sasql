@@ -8,10 +8,13 @@
 ///
 /// - Collapses runs of whitespace (spaces, tabs, newlines) to a single space.
 /// - Lowercases everything OUTSIDE of string literals (single-quoted `'...'`).
-/// - Preserves content inside string literals verbatim.
+/// - Preserves content inside string literals verbatim (including multi-byte UTF-8).
 /// - Preserves dollar-quoted strings (`$$...$$`, `$tag$...$tag$`).
 /// - Strips leading/trailing whitespace.
 /// - Strips SQL comments (`--` line comments, `/* */` block comments).
+///
+/// Uses byte-offset slicing of the original `&str` for string literal contents,
+/// so multi-byte characters (Cyrillic, CJK, etc.) are never misinterpreted.
 pub fn normalize_sql(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len());
     let bytes = sql.as_bytes();
@@ -27,7 +30,6 @@ pub fn normalize_sql(sql: &str) -> String {
             while i < len && bytes[i] != b'\n' {
                 i += 1;
             }
-            // The newline itself becomes whitespace, handled below
             continue;
         }
 
@@ -40,47 +42,38 @@ pub fn normalize_sql(sql: &str) -> String {
             if i + 1 < len {
                 i += 2; // skip */
             }
-            // Treat removed comment as whitespace
             if !out.is_empty() && !out.ends_with(' ') {
                 out.push(' ');
             }
             continue;
         }
 
-        // Single-quoted string literal: preserve verbatim
+        // Single-quoted string literal: slice original &str verbatim
         if b == b'\'' {
-            out.push('\'');
+            let start = i;
             i += 1;
             while i < len {
                 if bytes[i] == b'\'' {
-                    out.push('\'');
                     i += 1;
-                    // Escaped quote '' — continue the literal
                     if i < len && bytes[i] == b'\'' {
-                        out.push('\'');
                         i += 1;
                         continue;
                     }
                     break;
                 }
-                out.push(bytes[i] as char);
                 i += 1;
             }
+            out.push_str(&sql[start..i]);
             continue;
         }
 
-        // Dollar-quoted string: $tag$...$tag$
+        // Dollar-quoted string: slice original &str verbatim
         if b == b'$' {
-            if let Some((tag, end)) = find_dollar_quote(bytes, i) {
-                // Copy the entire dollar-quoted string verbatim
-                for &byte in &bytes[i..end] {
-                    out.push(byte as char);
-                }
+            if let Some((_tag, end)) = find_dollar_quote(bytes, i) {
+                out.push_str(&sql[i..end]);
                 i = end;
-                let _ = tag; // tag used only for matching in find_dollar_quote
                 continue;
             }
-            // Not a dollar-quote start — fall through to normal processing
         }
 
         // Whitespace: collapse to single space
@@ -95,7 +88,7 @@ pub fn normalize_sql(sql: &str) -> String {
             continue;
         }
 
-        // Everything else: lowercase
+        // Outside string literals, SQL is ASCII — lowercase safely
         out.push((b as char).to_ascii_lowercase());
         i += 1;
     }
@@ -249,5 +242,47 @@ mod tests {
         let q1 = "  SELECT  id, login,  first_name\n  FROM  users\n  WHERE  id = $1  ";
         let q2 = "select id, login, first_name from users where id = $1";
         assert_eq!(normalize_sql(q1), normalize_sql(q2));
+    }
+
+    // --- UTF-8 preservation ---
+
+    #[test]
+    fn preserves_cyrillic_in_string_literal() {
+        assert_eq!(
+            normalize_sql("SELECT * FROM t WHERE name = 'Москва'"),
+            "select * from t where name = 'Москва'"
+        );
+    }
+
+    #[test]
+    fn preserves_umlaut_in_string_literal() {
+        assert_eq!(
+            normalize_sql("SELECT * FROM t WHERE name = 'Müller'"),
+            "select * from t where name = 'Müller'"
+        );
+    }
+
+    #[test]
+    fn preserves_cjk_in_string_literal() {
+        assert_eq!(
+            normalize_sql("SELECT * FROM t WHERE city = '東京'"),
+            "select * from t where city = '東京'"
+        );
+    }
+
+    #[test]
+    fn preserves_unicode_in_double_dollar_quote() {
+        assert_eq!(
+            normalize_sql("SELECT $$Привет мир$$"),
+            "select $$Привет мир$$"
+        );
+    }
+
+    #[test]
+    fn preserves_escaped_quote_with_unicode() {
+        assert_eq!(
+            normalize_sql("SELECT * FROM t WHERE name = 'Д''Артаньян'"),
+            "select * from t where name = 'Д''Артаньян'"
+        );
     }
 }

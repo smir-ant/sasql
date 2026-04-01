@@ -80,44 +80,49 @@ pub fn parse_query(sql: &str) -> Result<ParsedQuery, String> {
 /// Extract `$name: Type` parameters from SQL, replacing them with `$1`, `$2`, ...
 ///
 /// Returns the rewritten SQL and the list of extracted parameters.
+///
+/// Uses `char_indices()` for iteration so multi-byte UTF-8 inside string
+/// literals is preserved verbatim (we slice the original `&str` by byte
+/// offset, never interpreting individual bytes as chars).
 fn extract_params(sql: &str) -> Result<(String, Vec<Param>), String> {
     let mut out = String::with_capacity(sql.len());
-    let mut params = Vec::new();
+    let mut params: Vec<Param> = Vec::new();
     let bytes = sql.as_bytes();
     let len = bytes.len();
-    let mut i = 0;
+    let mut i = 0; // byte offset into `sql`
 
     while i < len {
         let b = bytes[i];
 
-        // String literal: pass through unchanged
+        // String literal: copy verbatim (preserves multi-byte UTF-8)
         if b == b'\'' {
-            out.push('\'');
+            let start = i;
             i += 1;
             while i < len {
                 if bytes[i] == b'\'' {
-                    out.push('\'');
                     i += 1;
+                    // Escaped quote '' — continue the literal
                     if i < len && bytes[i] == b'\'' {
-                        out.push('\'');
                         i += 1;
                         continue;
                     }
                     break;
                 }
-                out.push(bytes[i] as char);
                 i += 1;
             }
+            out.push_str(&sql[start..i]);
             continue;
         }
 
-        // Dollar-quoted string: pass through unchanged
-        if b == b'$' && i + 1 < len && (bytes[i + 1] == b'$' || bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_') {
-            // Check if this is a dollar-quote (not a param)
+        // Dollar-quoted string: copy verbatim
+        if b == b'$'
+            && i + 1 < len
+            && (bytes[i + 1] == b'$'
+                || bytes[i + 1].is_ascii_alphabetic()
+                || bytes[i + 1] == b'_')
+        {
             if let Some(end) = skip_dollar_quote(bytes, i) {
-                for &byte in &bytes[i..end] {
-                    out.push(byte as char);
-                }
+                out.push_str(&sql[i..end]);
                 i = end;
                 continue;
             }
@@ -125,26 +130,49 @@ fn extract_params(sql: &str) -> Result<(String, Vec<Param>), String> {
 
         // :: cast operator — NOT a param type separator
         if b == b':' && i + 1 < len && bytes[i + 1] == b':' {
-            out.push(':');
-            out.push(':');
+            out.push_str("::");
             i += 2;
             continue;
         }
 
         // Parameter: $name: Type
         if b == b'$' && i + 1 < len && bytes[i + 1].is_ascii_alphabetic() {
-            let (param, end) = parse_one_param(bytes, i)?;
-            params.push(Param {
-                name: param.name,
-                rust_type: param.rust_type,
-                position: params.len() + 1,
-            });
-            out.push('$');
-            out.push_str(&params.len().to_string());
+            let (param, end) = parse_one_param(sql, i)?;
+
+            // FIX 7: allow duplicate parameter names if types match
+            if let Some(existing) = params.iter().find(|p| p.name == param.name) {
+                if existing.rust_type != param.rust_type {
+                    return Err(format!(
+                        "parameter `${}` declared with conflicting types: `{}` and `{}`",
+                        param.name, existing.rust_type, param.rust_type
+                    ));
+                }
+                // Reuse the same positional index
+                out.push('$');
+                out.push_str(&existing.position.to_string());
+            } else {
+                params.push(Param {
+                    name: param.name,
+                    rust_type: param.rust_type,
+                    position: params.len() + 1,
+                });
+                out.push('$');
+                out.push_str(&params.len().to_string());
+            }
             i = end;
             continue;
         }
 
+        // FIX 3: reject manual positional parameters ($1, $2, ...)
+        if b == b'$' && i + 1 < len && bytes[i + 1].is_ascii_digit() {
+            return Err(
+                "manual positional parameters ($1, $2, ...) are not allowed \
+                 in sasql — use $name: Type syntax instead"
+                    .into(),
+            );
+        }
+
+        // Outside of string literals, SQL is ASCII. Copy one byte.
         out.push(b as char);
         i += 1;
     }
@@ -152,22 +180,26 @@ fn extract_params(sql: &str) -> Result<(String, Vec<Param>), String> {
     Ok((out, params))
 }
 
-/// Parse a single `$name: Type` parameter starting at position `start`.
-/// Returns (Param, end_position).
-fn parse_one_param(bytes: &[u8], start: usize) -> Result<(Param, usize), String> {
+/// Parse a single `$name: Type` parameter starting at byte position `start`.
+/// Operates on the `&str` directly, using byte offsets for slicing.
+/// Returns (Param, end_byte_position).
+fn parse_one_param(sql: &str, start: usize) -> Result<(Param, usize), String> {
+    let bytes = sql.as_bytes();
     let len = bytes.len();
     // Skip $
     let mut i = start + 1;
 
-    // Parse name: identifier chars (alphanumeric + _)
+    // Parse name: ASCII identifier chars (alphanumeric + _)
     let name_start = i;
     while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
         i += 1;
     }
-    let name = String::from_utf8_lossy(&bytes[name_start..i]).to_string();
+    let name = &sql[name_start..i];
 
     if name.is_empty() {
-        return Err(format!("expected parameter name after $ at position {start}"));
+        return Err(format!(
+            "expected parameter name after $ at position {start}"
+        ));
     }
 
     // Skip whitespace before :
@@ -219,16 +251,13 @@ fn parse_one_param(bytes: &[u8], start: usize) -> Result<(Param, usize), String>
                 bracket_depth -= 1;
             }
             b',' | b')' | b'\n' if angle_depth == 0 && bracket_depth == 0 => break,
-            b' ' | b'\t' if angle_depth == 0 && bracket_depth == 0 => {
-                // Space ends the type UNLESS we're inside <> or []
-                break;
-            }
+            b' ' | b'\t' if angle_depth == 0 && bracket_depth == 0 => break,
             _ => {}
         }
         i += 1;
     }
 
-    let rust_type = String::from_utf8_lossy(&bytes[type_start..i]).trim().to_string();
+    let rust_type = sql[type_start..i].trim();
 
     if rust_type.is_empty() {
         return Err(format!(
@@ -238,8 +267,8 @@ fn parse_one_param(bytes: &[u8], start: usize) -> Result<(Param, usize), String>
 
     Ok((
         Param {
-            name,
-            rust_type,
+            name: name.to_owned(),
+            rust_type: rust_type.to_owned(),
             position: 0, // filled in by caller
         },
         i,
@@ -512,5 +541,74 @@ mod tests {
         assert!(parse_query("CREATE TABLE t (id int)").is_err());
         assert!(parse_query("DROP TABLE t").is_err());
         assert!(parse_query("ALTER TABLE t ADD COLUMN x int").is_err());
+    }
+
+    // --- FIX 1: UTF-8 preservation ---
+
+    #[test]
+    fn utf8_cyrillic_in_string_literal() {
+        let r = parse_query("SELECT * FROM t WHERE name = 'Москва' AND id = $id: i32").unwrap();
+        assert!(r.positional_sql.contains("'Москва'"), "Cyrillic mangled: {}", r.positional_sql);
+        assert_eq!(r.params.len(), 1);
+    }
+
+    #[test]
+    fn utf8_umlaut_in_string_literal() {
+        let r = parse_query("SELECT * FROM t WHERE name = 'Müller' AND id = $id: i32").unwrap();
+        assert!(r.positional_sql.contains("'Müller'"), "Umlaut mangled: {}", r.positional_sql);
+    }
+
+    #[test]
+    fn utf8_in_dollar_quote() {
+        let r = parse_query("SELECT $$Привет$$").unwrap();
+        assert!(r.positional_sql.contains("$$Привет$$"), "Dollar-quote UTF-8 mangled: {}", r.positional_sql);
+    }
+
+    #[test]
+    fn normalized_sql_preserves_utf8() {
+        let r = parse_query("SELECT * FROM t WHERE name = 'Москва' AND id = $id: i32").unwrap();
+        assert!(r.normalized_sql.contains("'Москва'"), "Normalized Cyrillic mangled: {}", r.normalized_sql);
+    }
+
+    // --- FIX 3: reject manual positional parameters ---
+
+    #[test]
+    fn reject_manual_positional_param() {
+        let result = parse_query("SELECT id FROM t WHERE id = $1");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("manual positional parameters"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn reject_mixed_named_and_positional() {
+        let result = parse_query("SELECT id FROM t WHERE a = $x: i32 AND b = $1");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("manual positional parameters"), "unexpected error: {err}");
+    }
+
+    // --- FIX 7: duplicate parameter names ---
+
+    #[test]
+    fn duplicate_param_same_type_reuses_position() {
+        let r = parse_query(
+            "SELECT id FROM t WHERE a = $x: i32 AND b = $x: i32",
+        )
+        .unwrap();
+        assert_eq!(r.params.len(), 1);
+        assert_eq!(r.params[0].name, "x");
+        assert_eq!(r.params[0].position, 1);
+        assert_eq!(r.positional_sql, "SELECT id FROM t WHERE a = $1 AND b = $1");
+    }
+
+    #[test]
+    fn duplicate_param_conflicting_types_errors() {
+        let result = parse_query(
+            "SELECT id FROM t WHERE a = $x: i32 AND b = $x: &str",
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("conflicting types"), "unexpected error: {err}");
     }
 }

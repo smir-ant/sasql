@@ -94,9 +94,12 @@ impl Executor for PoolConnection {
 }
 
 fn pg_err_to_query(e: tokio_postgres::Error) -> SasqlError {
+    let message = e.to_string();
+    let pg_code = e.code().map(|c| c.code().to_owned());
     SasqlError::Query(QueryError {
-        message: e.to_string(),
-        pg_code: e.code().map(|c| c.code().to_owned()),
+        message,
+        pg_code,
+        source: Some(Box::new(e)),
     })
 }
 

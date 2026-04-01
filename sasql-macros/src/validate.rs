@@ -60,17 +60,17 @@ async fn validate_async(
     // Extract parameter type OIDs
     let param_pg_oids: Vec<u32> = stmt.params().iter().map(|t| t.oid()).collect();
 
-    // Extract column metadata
+    // Resolve nullability for ALL columns in a single batched query
+    let nullable_flags = resolve_nullability_batch(client, stmt.columns()).await;
+
+    // Build column metadata
     let mut columns = Vec::with_capacity(stmt.columns().len());
-    for col in stmt.columns() {
+    for (i, col) in stmt.columns().iter().enumerate() {
         let pg_oid = col.type_().oid();
         let pg_type_name = col.type_().name().to_owned();
         let name = col.name().to_owned();
+        let is_nullable = nullable_flags[i];
 
-        // Determine nullability from pg_catalog
-        let is_nullable = resolve_nullability(client, col).await;
-
-        // Map PG OID to Rust type
         let base_rust_type = sasql_core::types::rust_type_for_oid(pg_oid).ok_or_else(|| {
             format!(
                 "column \"{name}\": unsupported PostgreSQL type `{pg_type_name}` (OID {pg_oid}). \
@@ -99,28 +99,63 @@ async fn validate_async(
     })
 }
 
-/// Determine whether a column is nullable by checking pg_catalog.
+/// Determine nullability for all columns in a single PG round-trip.
 ///
-/// For columns from a real table, queries `pg_attribute.attnotnull`.
-/// For computed expressions (aggregates, functions), defaults to nullable (safe).
-async fn resolve_nullability(client: &Client, col: &tokio_postgres::Column) -> bool {
-    // table_oid = 0 means the column is computed (not from a table).
-    // Computed columns are treated as nullable — the safe default.
-    let table_oid = col.table_oid();
-    let col_id = col.column_id();
+/// For columns backed by a real table, queries `pg_attribute.attnotnull` in
+/// batch using `unnest`. Computed columns (aggregates, functions) default to
+/// nullable (the safe choice).
+async fn resolve_nullability_batch(
+    client: &Client,
+    columns: &[tokio_postgres::Column],
+) -> Vec<bool> {
+    let col_count = columns.len();
+    // Default: all nullable (safe). We overwrite entries we can resolve.
+    let mut result = vec![true; col_count];
 
-    // table_oid/column_id are None for computed columns (expressions, aggregates).
-    let (table_oid, col_id) = match (table_oid, col_id) {
-        (Some(t), Some(c)) if t != 0 && c != 0 => (t, c as i16),
-        _ => return true, // computed → nullable (safe default)
-    };
+    // Collect (table_oid, column_id) pairs for table-backed columns
+    let mut table_oids: Vec<u32> = Vec::new();
+    let mut col_nums: Vec<i16> = Vec::new();
+    let mut col_indices: Vec<usize> = Vec::new();
 
-    // Query pg_attribute for the NOT NULL constraint
-    let query = "SELECT NOT attnotnull FROM pg_attribute WHERE attrelid = $1 AND attnum = $2";
-    match client.query_opt(query, &[&table_oid, &col_id]).await {
-        Ok(Some(row)) => row.get::<_, bool>(0),
-        _ => true, // if we can't determine, assume nullable (safe)
+    for (i, col) in columns.iter().enumerate() {
+        match (col.table_oid(), col.column_id()) {
+            (Some(t), Some(c)) if t != 0 && c != 0 => {
+                table_oids.push(t);
+                col_nums.push(c as i16);
+                col_indices.push(i);
+            }
+            _ => {} // computed → stays true (nullable)
+        }
     }
+
+    if table_oids.is_empty() {
+        return result;
+    }
+
+    // Single batched query: unnest the OID/attnum arrays and join pg_attribute
+    let query = "\
+        SELECT a.attrelid, a.attnum, NOT a.attnotnull \
+        FROM pg_attribute a \
+        WHERE (a.attrelid, a.attnum) IN (\
+            SELECT unnest($1::oid[]), unnest($2::int2[])\
+        )";
+
+    if let Ok(rows) = client.query(query, &[&table_oids, &col_nums]).await {
+        for row in &rows {
+            let oid: u32 = row.get(0);
+            let num: i16 = row.get(1);
+            let is_nullable: bool = row.get(2);
+            // Match back to the original column index
+            for (idx, (&t, &c)) in table_oids.iter().zip(col_nums.iter()).enumerate() {
+                if t == oid && c == num {
+                    result[col_indices[idx]] = is_nullable;
+                }
+            }
+        }
+    }
+    // If the query fails, all columns stay nullable (safe default)
+
+    result
 }
 
 /// Check that user-declared parameter types match what PostgreSQL expects.
@@ -183,36 +218,18 @@ fn format_pg_error(e: &tokio_postgres::Error, parsed: &ParsedQuery) -> String {
 
 /// Verify parameter declarations in the parsed query.
 /// Called before connecting to PG — catches obvious errors early.
-pub fn check_param_declarations(params: &[Param]) -> Result<(), String> {
-    // Check for duplicate parameter names
-    for (i, p) in params.iter().enumerate() {
-        for other in &params[i + 1..] {
-            if p.name == other.name {
-                return Err(format!(
-                    "duplicate parameter name `${}`. Each parameter must have a unique name.",
-                    p.name
-                ));
-            }
-        }
-    }
-
+///
+/// Note: duplicate parameter names are handled in `extract_params` (they are
+/// unified to the same positional index if types match, or rejected with an
+/// error if types conflict). By the time this function is called, `params`
+/// contains only unique entries.
+pub fn check_param_declarations(_params: &[Param]) -> Result<(), String> {
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn duplicate_param_names_detected() {
-        let params = vec![
-            Param { name: "id".into(), rust_type: "i32".into(), position: 1 },
-            Param { name: "id".into(), rust_type: "i32".into(), position: 2 },
-        ];
-        let result = check_param_declarations(&params);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("duplicate parameter name"));
-    }
 
     #[test]
     fn unique_param_names_pass() {
