@@ -47,15 +47,24 @@ impl Transaction {
     pub async fn commit(mut self) -> SasqlResult<()> {
         let conn = self
             .conn
-            .take()
+            .as_ref()
             .expect("sasql bug: Transaction::commit called but connection already taken");
-        conn.inner
-            .batch_execute("COMMIT")
-            .await
-            .map_err(SasqlError::from)?;
-        self.committed = true;
-        // conn drops here, returning to pool (clean state after COMMIT)
-        Ok(())
+        match conn.inner.batch_execute("COMMIT").await {
+            Ok(()) => {
+                self.committed = true;
+                // conn drops with self, returning to pool (clean after COMMIT)
+                Ok(())
+            }
+            Err(e) => {
+                // COMMIT failed — connection is dirty (aborted transaction).
+                // Detach it from the pool so nobody else gets it.
+                if let Some(conn) = self.conn.take() {
+                    let _ = deadpool_postgres::Object::take(conn.inner);
+                }
+                self.committed = true; // suppress Drop warning — we handled it
+                Err(SasqlError::from(e))
+            }
+        }
     }
 
     /// Explicitly roll back the transaction and return the connection to the pool.
@@ -64,16 +73,23 @@ impl Transaction {
     pub async fn rollback(mut self) -> SasqlResult<()> {
         let conn = self
             .conn
-            .take()
+            .as_ref()
             .expect("sasql bug: Transaction::rollback called but connection already taken");
-        conn.inner
-            .batch_execute("ROLLBACK")
-            .await
-            .map_err(SasqlError::from)?;
-        // Mark as committed to suppress the Drop warning — rollback is intentional.
-        self.committed = true;
-        // conn drops here, returning to pool (clean state after ROLLBACK)
-        Ok(())
+        match conn.inner.batch_execute("ROLLBACK").await {
+            Ok(()) => {
+                self.committed = true; // suppress Drop warning — rollback is intentional
+                // conn drops with self, returning to pool (clean after ROLLBACK)
+                Ok(())
+            }
+            Err(e) => {
+                // ROLLBACK failed — connection is broken. Detach from pool.
+                if let Some(conn) = self.conn.take() {
+                    let _ = deadpool_postgres::Object::take(conn.inner);
+                }
+                self.committed = true;
+                Err(SasqlError::from(e))
+            }
+        }
     }
 
     /// Access the inner connection for `Executor` implementation.
