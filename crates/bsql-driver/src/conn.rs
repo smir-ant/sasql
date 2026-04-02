@@ -180,30 +180,41 @@ impl Config {
 
 /// Minimal percent-decoding for connection URL components.
 ///
-/// Returns an error if a `%` is not followed by exactly two hex digits.
+/// Decodes `%XX` hex sequences into raw bytes, then validates as UTF-8.
+/// This correctly handles multi-byte UTF-8 characters that are percent-encoded
+/// byte-by-byte (e.g. `%C3%A9` for 'é').
 fn url_decode(s: &str) -> Result<String, DriverError> {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.as_bytes().iter();
-    while let Some(&b) = chars.next() {
-        if b == b'%' {
-            let hi = *chars.next().ok_or_else(|| {
-                DriverError::Protocol(format!("malformed percent-encoding in URL: '{s}'"))
+    let mut bytes = Vec::with_capacity(s.len());
+    let input = s.as_bytes();
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == b'%' {
+            if i + 2 >= input.len() {
+                return Err(DriverError::Protocol(format!(
+                    "malformed percent-encoding in URL: '{s}'"
+                )));
+            }
+            let hi = hex_val(input[i + 1]).ok_or_else(|| {
+                DriverError::Protocol(format!(
+                    "invalid hex digit '{}' in URL: '{s}'",
+                    input[i + 1] as char
+                ))
             })?;
-            let lo = *chars.next().ok_or_else(|| {
-                DriverError::Protocol(format!("malformed percent-encoding in URL: '{s}'"))
+            let lo = hex_val(input[i + 2]).ok_or_else(|| {
+                DriverError::Protocol(format!(
+                    "invalid hex digit '{}' in URL: '{s}'",
+                    input[i + 2] as char
+                ))
             })?;
-            let hi_val = hex_val(hi).ok_or_else(|| {
-                DriverError::Protocol(format!("invalid hex digit '{}' in URL: '{s}'", hi as char))
-            })?;
-            let lo_val = hex_val(lo).ok_or_else(|| {
-                DriverError::Protocol(format!("invalid hex digit '{}' in URL: '{s}'", lo as char))
-            })?;
-            result.push((hi_val * 16 + lo_val) as char);
+            bytes.push(hi * 16 + lo);
+            i += 3;
         } else {
-            result.push(b as char);
+            bytes.push(input[i]);
+            i += 1;
         }
     }
-    Ok(result)
+    String::from_utf8(bytes)
+        .map_err(|_| DriverError::Protocol(format!("invalid UTF-8 in URL: '{s}'")))
 }
 
 fn hex_val(b: u8) -> Option<u8> {
@@ -279,6 +290,10 @@ pub struct Connection {
     pid: i32,
     secret: i32,
     tx_status: u8,
+    /// Timestamp of the last successful query completion. Used by the pool
+    /// to detect stale connections and discard them instead of returning
+    /// a potentially dead TCP socket.
+    last_used: std::time::Instant,
 }
 
 impl Connection {
@@ -329,6 +344,7 @@ impl Connection {
             pid: 0,
             secret: 0,
             tx_status: b'I',
+            last_used: std::time::Instant::now(),
         };
 
         conn.startup(config).await?;
@@ -787,6 +803,7 @@ impl Connection {
         // ReadyForQuery
         self.expect_ready().await?;
         self.shrink_buffers();
+        self.touch();
 
         Ok(QueryResult {
             all_col_offsets,
@@ -912,6 +929,7 @@ impl Connection {
 
         self.expect_ready().await?;
         self.shrink_buffers();
+        self.touch();
         Ok(affected_rows)
     }
 
@@ -929,6 +947,7 @@ impl Connection {
             match msg {
                 BackendMessage::ReadyForQuery { status } => {
                     self.tx_status = status;
+                    self.touch();
                     return Ok(());
                 }
                 BackendMessage::CommandComplete { .. }
@@ -995,6 +1014,17 @@ impl Connection {
     /// Whether the connection is in a failed transaction.
     pub fn is_in_failed_transaction(&self) -> bool {
         self.tx_status == b'E'
+    }
+
+    /// Record that the connection was just used. Called after successful
+    /// query completion so the pool can detect stale connections.
+    pub fn touch(&mut self) {
+        self.last_used = std::time::Instant::now();
+    }
+
+    /// How long since this connection last completed a query.
+    pub fn idle_duration(&self) -> std::time::Duration {
+        self.last_used.elapsed()
     }
 
     /// Get a server parameter value (set during startup or via SET).
@@ -1472,9 +1502,12 @@ fn parse_data_row_flat(
 }
 
 /// Compute a rapidhash of a SQL string.
+///
+/// Uses `str::hash()` via the `Hash` trait, matching `bsql_core::rapid_hash_str`.
 pub fn hash_sql(sql: &str) -> u64 {
+    use std::hash::Hash;
     let mut hasher = RapidHasher::default();
-    hasher.write(sql.as_bytes());
+    sql.hash(&mut hasher);
     hasher.finish()
 }
 

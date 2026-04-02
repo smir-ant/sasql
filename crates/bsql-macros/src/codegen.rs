@@ -212,7 +212,7 @@ pub fn generate_sort_query_code(
                 ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
                     #build_sql
                     let owned = executor.#qm(&sql, sql_hash, #params_slice).await?;
-                    Ok(owned.iter().map(|row| #result_name { #row_decode }).collect())
+                    owned.iter().map(|row| Ok(#result_name { #row_decode })).collect::<::bsql_core::BsqlResult<Vec<_>>>()
                 }
 
                 pub async fn fetch_optional<E: ::bsql_core::Executor>(
@@ -436,7 +436,7 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
                 executor: &E,
             ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
                 let owned = executor.#query_method(#sql_lit, #sql_hash_val, #params_slice).await?;
-                Ok(owned.iter().map(|row| #result_name { #row_decode }).collect())
+                owned.iter().map(|row| Ok(#result_name { #row_decode })).collect::<::bsql_core::BsqlResult<Vec<_>>>()
             }
 
             pub async fn fetch_optional<E: ::bsql_core::Executor>(
@@ -610,13 +610,17 @@ fn gen_dynamic_executor_impls(
                 }
             });
 
-        let fetch_all_dispatcher =
-            gen_variant_dispatcher(parsed, variants, false, |sql_lit, sql_hash| {
+        let fetch_all_dispatcher = gen_variant_dispatcher(
+            parsed,
+            variants,
+            false,
+            |sql_lit, sql_hash| {
                 quote! {
                     let owned = executor.#qm(#sql_lit, #sql_hash, &params_slice[..]).await?;
-                    Ok(owned.iter().map(|row| #result_name { #row_decode }).collect())
+                    owned.iter().map(|row| Ok(#result_name { #row_decode })).collect::<::bsql_core::BsqlResult<Vec<_>>>()
                 }
-            });
+            },
+        );
 
         let fetch_optional_dispatcher =
             gen_variant_dispatcher(parsed, variants, needs_limit, |sql_lit, sql_hash| {
@@ -893,50 +897,103 @@ fn gen_not_null_decode(idx: usize, rust_type: &str) -> TokenStream {
     }
 }
 
+/// Wrap a fallible decode expression in a match that converts `Err(DriverError)`
+/// to `Err(BsqlError::Decode)` instead of panicking.
+///
+/// Generates: `match <expr> { Ok(v) => v, Err(_) => return Err(BsqlError::Decode(...)) }`
+fn gen_decode_match(idx: usize, type_name: &str, decode_expr: TokenStream) -> TokenStream {
+    let col_idx = idx.to_string();
+    quote! {
+        match #decode_expr {
+            Ok(v) => v,
+            Err(_) => return Err(::bsql_core::BsqlError::Decode(::bsql_core::error::DecodeError {
+                column: #col_idx.into(),
+                expected: #type_name,
+                actual: "undecoded bytes".into(),
+            })),
+        }
+    }
+}
+
 /// Generate decode for a feature-gated type (uuid, time, chrono, decimal).
 /// Uses `row.get_raw(idx)` + the appropriate decode function from bsql_core::driver.
+///
+/// Returns a `BsqlError::Decode` on failure instead of panicking, so the
+/// generated code propagates errors via `?` in the enclosing `BsqlResult`.
 fn gen_feature_gated_decode(idx: usize, rust_type: &str) -> TokenStream {
     match rust_type {
-        "::uuid::Uuid" | "uuid::Uuid" => quote! {
-            ::bsql_core::driver::decode_uuid_type(
-                row.get_raw(#idx).unwrap_or_default()
-            ).expect("uuid decode failed")
-        },
-        "::time::OffsetDateTime" | "time::OffsetDateTime" => quote! {
-            ::bsql_core::driver::decode_timestamptz_time(
-                row.get_raw(#idx).unwrap_or_default()
-            ).expect("timestamptz decode failed")
-        },
-        "::time::Date" | "time::Date" => quote! {
-            ::bsql_core::driver::decode_date_time(
-                row.get_raw(#idx).unwrap_or_default()
-            ).expect("date decode failed")
-        },
-        "::time::Time" | "time::Time" => quote! {
-            ::bsql_core::driver::decode_time_time(
-                row.get_raw(#idx).unwrap_or_default()
-            ).expect("time decode failed")
-        },
-        "::chrono::DateTime<chrono::Utc>" | "chrono::DateTime<chrono::Utc>" => quote! {
-            ::bsql_core::driver::decode_timestamptz_chrono(
-                row.get_raw(#idx).unwrap_or_default()
-            ).expect("timestamptz decode failed")
-        },
-        "::chrono::NaiveDate" | "chrono::NaiveDate" => quote! {
-            ::bsql_core::driver::decode_date_chrono(
-                row.get_raw(#idx).unwrap_or_default()
-            ).expect("date decode failed")
-        },
-        "::chrono::NaiveTime" | "chrono::NaiveTime" => quote! {
-            ::bsql_core::driver::decode_time_chrono(
-                row.get_raw(#idx).unwrap_or_default()
-            ).expect("time decode failed")
-        },
-        "::rust_decimal::Decimal" | "rust_decimal::Decimal" => quote! {
-            ::bsql_core::driver::decode_numeric_decimal(
-                row.get_raw(#idx).unwrap_or_default()
-            ).expect("numeric decode failed")
-        },
+        "::uuid::Uuid" | "uuid::Uuid" => gen_decode_match(
+            idx,
+            "uuid",
+            quote! {
+                ::bsql_core::driver::decode_uuid_type(
+                    row.get_raw(#idx).unwrap_or_default()
+                )
+            },
+        ),
+        "::time::OffsetDateTime" | "time::OffsetDateTime" => gen_decode_match(
+            idx,
+            "timestamptz",
+            quote! {
+                ::bsql_core::driver::decode_timestamptz_time(
+                    row.get_raw(#idx).unwrap_or_default()
+                )
+            },
+        ),
+        "::time::Date" | "time::Date" => gen_decode_match(
+            idx,
+            "date",
+            quote! {
+                ::bsql_core::driver::decode_date_time(
+                    row.get_raw(#idx).unwrap_or_default()
+                )
+            },
+        ),
+        "::time::Time" | "time::Time" => gen_decode_match(
+            idx,
+            "time",
+            quote! {
+                ::bsql_core::driver::decode_time_time(
+                    row.get_raw(#idx).unwrap_or_default()
+                )
+            },
+        ),
+        "::chrono::DateTime<chrono::Utc>" | "chrono::DateTime<chrono::Utc>" => gen_decode_match(
+            idx,
+            "timestamptz",
+            quote! {
+                ::bsql_core::driver::decode_timestamptz_chrono(
+                    row.get_raw(#idx).unwrap_or_default()
+                )
+            },
+        ),
+        "::chrono::NaiveDate" | "chrono::NaiveDate" => gen_decode_match(
+            idx,
+            "date",
+            quote! {
+                ::bsql_core::driver::decode_date_chrono(
+                    row.get_raw(#idx).unwrap_or_default()
+                )
+            },
+        ),
+        "::chrono::NaiveTime" | "chrono::NaiveTime" => gen_decode_match(
+            idx,
+            "time",
+            quote! {
+                ::bsql_core::driver::decode_time_chrono(
+                    row.get_raw(#idx).unwrap_or_default()
+                )
+            },
+        ),
+        "::rust_decimal::Decimal" | "rust_decimal::Decimal" => gen_decode_match(
+            idx,
+            "numeric",
+            quote! {
+                ::bsql_core::driver::decode_numeric_decimal(
+                    row.get_raw(#idx).unwrap_or_default()
+                )
+            },
+        ),
         // Array types
         "Vec<bool>" => quote! {
             ::bsql_core::driver::decode_array_bool(

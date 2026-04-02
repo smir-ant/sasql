@@ -12,7 +12,6 @@ repository = "https://github.com/smir-ant/bsql"
 [workspace.dependencies]
 # Runtime
 tokio-postgres = { version = "0.7.17", default-features = false }
-deadpool-postgres = { version = "0.14.1", default-features = false, features = ["rt_tokio_1"] }
 postgres-types = { version = "0.2.13", default-features = false }
 tokio = { version = "1", default-features = false }
 
@@ -20,10 +19,6 @@ tokio = { version = "1", default-features = false }
 syn = { version = "2.0.117", default-features = false, features = ["full", "parsing", "printing"] }
 quote = "1.0.45"
 proc-macro2 = "1.0.106"
-
-# Streaming
-futures-core = { version = "0.3", default-features = false }
-tokio-stream = { version = "0.1", default-features = false }
 
 # Performance
 rapidhash = "4.4.1"

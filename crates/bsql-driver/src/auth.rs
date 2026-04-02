@@ -147,13 +147,13 @@ impl ScramClient {
     /// Returns `c=biws,r=combined_nonce,p=base64_proof`.
     pub fn client_final_message(&self) -> Result<Vec<u8>, DriverError> {
         // ClientKey = HMAC(SaltedPassword, "Client Key")
-        let client_key = hmac_sha256(&self.salted_password, b"Client Key");
+        let client_key = hmac_sha256(&self.salted_password, b"Client Key")?;
 
         // StoredKey = SHA256(ClientKey)
         let stored_key = Sha256::digest(client_key);
 
         // ClientSignature = HMAC(StoredKey, AuthMessage)
-        let client_signature = hmac_sha256(&stored_key, self.auth_message.as_bytes());
+        let client_signature = hmac_sha256(&stored_key, self.auth_message.as_bytes())?;
 
         // ClientProof = ClientKey XOR ClientSignature
         let mut proof = client_key;
@@ -190,10 +190,10 @@ impl ScramClient {
             .map_err(|_| DriverError::Auth("invalid base64 in server signature".into()))?;
 
         // ServerKey = HMAC(SaltedPassword, "Server Key")
-        let server_key = hmac_sha256(&self.salted_password, b"Server Key");
+        let server_key = hmac_sha256(&self.salted_password, b"Server Key")?;
 
         // Expected = HMAC(ServerKey, AuthMessage)
-        let expected = hmac_sha256(&server_key, self.auth_message.as_bytes());
+        let expected = hmac_sha256(&server_key, self.auth_message.as_bytes())?;
 
         if server_sig.len() != expected.len() || !constant_time_eq(&server_sig, &expected) {
             return Err(DriverError::Auth("server signature mismatch".into()));
@@ -205,19 +205,11 @@ impl ScramClient {
 
 // --- Helpers ---
 
-fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    // HMAC-SHA256 accepts any key length, so new_from_slice cannot fail in practice.
-    // We handle the Result anyway to avoid panics from expect().
-    let mut mac = match HmacSha256::new_from_slice(key) {
-        Ok(m) => m,
-        Err(_) => {
-            // Unreachable for SHA-256 (no key length restriction), but return zeroes
-            // defensively rather than panicking.
-            return [0u8; 32];
-        }
-    };
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Result<[u8; 32], DriverError> {
+    let mut mac = HmacSha256::new_from_slice(key)
+        .map_err(|_| DriverError::Auth("HMAC computation failed".into()))?;
     mac.update(data);
-    mac.finalize().into_bytes().into()
+    Ok(mac.finalize().into_bytes().into())
 }
 
 /// Generate a 24-byte random nonce, base64-encoded.

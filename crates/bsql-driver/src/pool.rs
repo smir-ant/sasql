@@ -81,14 +81,22 @@ impl Pool {
         // Try to pop an idle connection (fast path).
         // std::sync::Mutex — trivial critical section (no I/O), safe to unwrap
         // because we never panic while holding this lock.
+        //
+        // If the connection has been idle > 30s, its TCP socket may be dead
+        // (half-open, firewall timeout, PG idle reaper). Discard it and try
+        // the next one. This is cheaper than a health-check roundtrip.
         {
             let mut stack = self.inner.stack.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(conn) = stack.pop() {
-                return Ok(PoolGuard {
-                    conn: Some(conn),
-                    pool: self.inner.clone(),
-                    discard: false,
-                });
+            while let Some(conn) = stack.pop() {
+                if conn.idle_duration() < std::time::Duration::from_secs(30) {
+                    return Ok(PoolGuard {
+                        conn: Some(conn),
+                        pool: self.inner.clone(),
+                        discard: false,
+                    });
+                }
+                // Stale connection — drop it, free the slot
+                self.inner.open_count.fetch_sub(1, Ordering::AcqRel);
             }
         }
 
