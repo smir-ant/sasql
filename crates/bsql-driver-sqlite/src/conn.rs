@@ -232,6 +232,142 @@ impl SqliteConnection {
         Ok(self.db.changes())
     }
 
+    /// Execute a query and return a streaming iterator.
+    ///
+    /// Unlike `query()`, this does not step all rows into an arena upfront.
+    /// Instead, it prepares the statement and returns a `StreamingQuery` that
+    /// steps `chunk_size` rows at a time into an arena on each call to `next_chunk()`.
+    pub fn query_streaming(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&dyn SqliteEncode],
+        chunk_size: usize,
+    ) -> Result<StreamingQuery, SqliteError> {
+        let stmt = self.get_or_prepare(sql, sql_hash)?;
+
+        stmt.clear_bindings();
+        for (i, param) in params.iter().enumerate() {
+            param.bind(stmt, (i + 1) as i32)?;
+        }
+
+        let col_count = stmt.column_count() as usize;
+
+        Ok(StreamingQuery {
+            sql_hash,
+            col_count,
+            chunk_size,
+            finished: false,
+        })
+    }
+
+    /// Step the streaming query's statement `chunk_size` rows.
+    ///
+    /// Returns the rows in a `QueryResult` + `Arena`. When all rows are
+    /// consumed, returns a result with `row_count == 0`.
+    pub fn streaming_next_chunk(
+        &mut self,
+        streaming: &mut StreamingQuery,
+        arena: &mut Arena,
+    ) -> Result<QueryResult, SqliteError> {
+        if streaming.finished {
+            return Ok(QueryResult {
+                col_count: streaming.col_count,
+                row_count: 0,
+                col_offsets: Vec::new(),
+            });
+        }
+
+        let stmt = self
+            .stmts
+            .get(&streaming.sql_hash)
+            .map(|c| &c.handle)
+            .expect("streaming query: statement not in cache");
+
+        let col_count = streaming.col_count;
+        let mut col_offsets: Vec<(usize, i32)> =
+            Vec::with_capacity(col_count * streaming.chunk_size);
+        let mut row_count: usize = 0;
+
+        for _ in 0..streaming.chunk_size {
+            match stmt.step()? {
+                StepResult::Done => {
+                    streaming.finished = true;
+                    break;
+                }
+                StepResult::Row => {
+                    for col in 0..col_count as i32 {
+                        let col_type = stmt.column_type(col);
+                        match col_type {
+                            raw::SQLITE_NULL => {
+                                col_offsets.push((0, -1));
+                            }
+                            raw::SQLITE_INTEGER => {
+                                let val = stmt.column_int64(col);
+                                let bytes = val.to_le_bytes();
+                                let offset = arena.alloc_copy(&bytes);
+                                col_offsets.push((offset, 8));
+                            }
+                            raw::SQLITE_FLOAT => {
+                                let val = stmt.column_double(col);
+                                let bytes = val.to_le_bytes();
+                                let offset = arena.alloc_copy(&bytes);
+                                col_offsets.push((offset, 8));
+                            }
+                            raw::SQLITE_TEXT => {
+                                let data = stmt.column_text(col);
+                                match data {
+                                    Some(bytes) => {
+                                        let offset = arena.alloc_copy(bytes);
+                                        col_offsets.push((offset, bytes.len() as i32));
+                                    }
+                                    None => {
+                                        col_offsets.push((0, -1));
+                                    }
+                                }
+                            }
+                            _ => {
+                                let data = stmt.column_blob(col);
+                                if data.is_empty() {
+                                    col_offsets.push((arena.global_offset(), 0));
+                                } else {
+                                    let offset = arena.alloc_copy(data);
+                                    col_offsets.push((offset, data.len() as i32));
+                                }
+                            }
+                        }
+                    }
+                    row_count += 1;
+                }
+            }
+        }
+
+        if streaming.finished {
+            // Reset statement for reuse now that we're done
+            let stmt = self
+                .stmts
+                .get(&streaming.sql_hash)
+                .map(|c| &c.handle)
+                .expect("streaming query: statement not in cache");
+            stmt.reset()?;
+        }
+
+        Ok(QueryResult {
+            col_count,
+            row_count,
+            col_offsets,
+        })
+    }
+
+    /// Reset a streaming query's statement without stepping to completion.
+    ///
+    /// Called when a `StreamingQuery` is dropped before all rows are consumed.
+    pub fn reset_streaming(&mut self, streaming: &StreamingQuery) {
+        if let Some(cached) = self.stmts.get(&streaming.sql_hash) {
+            let _ = cached.handle.reset();
+        }
+    }
+
     /// Prepare a statement without executing it (cache warmup).
     pub fn prepare_only(&mut self, sql: &str, sql_hash: u64) -> Result<(), SqliteError> {
         self.get_or_prepare(sql, sql_hash)?;
@@ -349,6 +485,22 @@ pub struct CompileColumnInfo {
     pub origin_name: Option<String>,
     /// Whether this column can be NULL.
     pub is_nullable: bool,
+}
+
+/// State for a streaming query. Tracks position across `next_chunk()` calls.
+///
+/// Created by [`SqliteConnection::query_streaming`]. The statement remains
+/// bound and positioned between chunks — only `chunk_size` rows are stepped
+/// per call to [`SqliteConnection::streaming_next_chunk`].
+pub struct StreamingQuery {
+    /// Hash of the SQL text, used to look up the cached statement.
+    pub sql_hash: u64,
+    /// Column count per row.
+    pub col_count: usize,
+    /// Rows per chunk.
+    pub chunk_size: usize,
+    /// Whether `sqlite3_step` returned DONE.
+    pub finished: bool,
 }
 
 /// Result of a query execution. Row data lives in the associated `Arena`.
@@ -1519,5 +1671,165 @@ mod tests {
         // We verify the default state.
         let h = IdentityHasher::default();
         assert_eq!(h.finish(), 0);
+    }
+
+    // --- Streaming ---
+
+    #[test]
+    fn streaming_query_basic() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER NOT NULL, name TEXT NOT NULL)")
+            .unwrap();
+        for i in 0..10 {
+            conn.exec(&format!("INSERT INTO t VALUES ({i}, 'row_{i}')"))
+                .unwrap();
+        }
+
+        let sql = "SELECT id, name FROM t ORDER BY id";
+        let sql_hash = hash_sql(sql);
+        let mut streaming = conn.query_streaming(sql, sql_hash, &[], 3).unwrap();
+        assert!(!streaming.finished);
+        assert_eq!(streaming.chunk_size, 3);
+
+        // First chunk: 3 rows
+        let mut arena = Arena::new();
+        let chunk = conn
+            .streaming_next_chunk(&mut streaming, &mut arena)
+            .unwrap();
+        assert_eq!(chunk.row_count, 3);
+        assert_eq!(chunk.get_i64(0, 0, &arena), Some(0));
+        assert_eq!(chunk.get_str(0, 1, &arena), Some("row_0"));
+        assert_eq!(chunk.get_i64(2, 0, &arena), Some(2));
+
+        // Second chunk: 3 rows
+        let mut arena2 = Arena::new();
+        let chunk2 = conn
+            .streaming_next_chunk(&mut streaming, &mut arena2)
+            .unwrap();
+        assert_eq!(chunk2.row_count, 3);
+        assert_eq!(chunk2.get_i64(0, 0, &arena2), Some(3));
+
+        // Third chunk: 3 rows
+        let mut arena3 = Arena::new();
+        let chunk3 = conn
+            .streaming_next_chunk(&mut streaming, &mut arena3)
+            .unwrap();
+        assert_eq!(chunk3.row_count, 3);
+
+        // Fourth chunk: 1 row (final)
+        let mut arena4 = Arena::new();
+        let chunk4 = conn
+            .streaming_next_chunk(&mut streaming, &mut arena4)
+            .unwrap();
+        assert_eq!(chunk4.row_count, 1);
+        assert_eq!(chunk4.get_i64(0, 0, &arena4), Some(9));
+        assert!(streaming.finished);
+
+        // Fifth chunk: 0 rows (done)
+        let mut arena5 = Arena::new();
+        let chunk5 = conn
+            .streaming_next_chunk(&mut streaming, &mut arena5)
+            .unwrap();
+        assert_eq!(chunk5.row_count, 0);
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn streaming_query_empty_result() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER)").unwrap();
+
+        let sql = "SELECT id FROM t";
+        let sql_hash = hash_sql(sql);
+        let mut streaming = conn.query_streaming(sql, sql_hash, &[], 10).unwrap();
+
+        let mut arena = Arena::new();
+        let chunk = conn
+            .streaming_next_chunk(&mut streaming, &mut arena)
+            .unwrap();
+        assert_eq!(chunk.row_count, 0);
+        assert!(streaming.finished);
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn streaming_query_exact_chunk_boundary() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER)").unwrap();
+        for i in 0..6 {
+            conn.exec(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+        }
+
+        let sql = "SELECT id FROM t ORDER BY id";
+        let sql_hash = hash_sql(sql);
+        let mut streaming = conn.query_streaming(sql, sql_hash, &[], 3).unwrap();
+
+        let mut arena1 = Arena::new();
+        let chunk1 = conn
+            .streaming_next_chunk(&mut streaming, &mut arena1)
+            .unwrap();
+        assert_eq!(chunk1.row_count, 3);
+        assert!(!streaming.finished);
+
+        let mut arena2 = Arena::new();
+        let chunk2 = conn
+            .streaming_next_chunk(&mut streaming, &mut arena2)
+            .unwrap();
+        assert_eq!(chunk2.row_count, 3);
+        // After stepping exactly 6 rows with chunk_size=3, the last step may or may not
+        // have seen DONE yet depending on SQLite's behavior.
+
+        let mut arena3 = Arena::new();
+        let chunk3 = conn
+            .streaming_next_chunk(&mut streaming, &mut arena3)
+            .unwrap();
+        // Either 0 rows (finished) or already finished
+        assert!(chunk3.row_count == 0 || streaming.finished);
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn streaming_reset_on_drop() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER)").unwrap();
+        for i in 0..10 {
+            conn.exec(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+        }
+
+        let sql = "SELECT id FROM t ORDER BY id";
+        let sql_hash = hash_sql(sql);
+
+        // Start streaming, read one chunk, then reset
+        let mut streaming = conn.query_streaming(sql, sql_hash, &[], 3).unwrap();
+        let mut arena = Arena::new();
+        let chunk = conn
+            .streaming_next_chunk(&mut streaming, &mut arena)
+            .unwrap();
+        assert_eq!(chunk.row_count, 3);
+        assert!(!streaming.finished);
+
+        // Reset the streaming statement
+        conn.reset_streaming(&streaming);
+
+        // Should be able to start a new streaming query on the same SQL
+        let mut streaming2 = conn.query_streaming(sql, sql_hash, &[], 5).unwrap();
+        let mut arena2 = Arena::new();
+        let chunk2 = conn
+            .streaming_next_chunk(&mut streaming2, &mut arena2)
+            .unwrap();
+        assert_eq!(chunk2.row_count, 5);
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
     }
 }

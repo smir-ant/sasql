@@ -35,6 +35,49 @@ pub fn resolve_sqlite_type(declared_type: Option<&str>) -> &'static str {
         return "bool";
     }
 
+    // Feature-gated types: DATETIME/TIMESTAMP, DATE, TIME, UUID, DECIMAL/NUMERIC
+    // Check these BEFORE the affinity rules since "DATETIME" contains "INT".
+    if upper == "DATETIME" || upper == "TIMESTAMP" {
+        #[cfg(feature = "time")]
+        return "::time::PrimitiveDateTime";
+        #[cfg(feature = "chrono")]
+        return "::chrono::NaiveDateTime";
+        // Without time/chrono feature, fall through to String
+        #[cfg(not(any(feature = "time", feature = "chrono")))]
+        return "String";
+    }
+    if upper == "DATE" {
+        #[cfg(feature = "time")]
+        return "::time::Date";
+        #[cfg(feature = "chrono")]
+        return "::chrono::NaiveDate";
+        #[cfg(not(any(feature = "time", feature = "chrono")))]
+        return "String";
+    }
+    if upper == "TIME" {
+        #[cfg(feature = "time")]
+        return "::time::Time";
+        #[cfg(feature = "chrono")]
+        return "::chrono::NaiveTime";
+        #[cfg(not(any(feature = "time", feature = "chrono")))]
+        return "String";
+    }
+    if upper == "UUID" {
+        #[cfg(feature = "uuid")]
+        return "::uuid::Uuid";
+        #[cfg(not(feature = "uuid"))]
+        return "String";
+    }
+    if upper == "DECIMAL"
+        || upper.starts_with("DECIMAL(")
+        || upper == "NUMERIC"
+        || upper.starts_with("NUMERIC(")
+    {
+        #[cfg(feature = "decimal")]
+        return "::rust_decimal::Decimal";
+        // Without decimal feature, fall through to String via affinity rules
+    }
+
     // SQLite type affinity rules (in order from the docs)
     if upper.contains("INT") {
         return "i64";
@@ -143,8 +186,23 @@ mod tests {
 
     #[test]
     fn numeric_affinity_defaults_to_string() {
-        assert_eq!(resolve_sqlite_type(Some("NUMERIC")), "String");
-        assert_eq!(resolve_sqlite_type(Some("DECIMAL(10,5)")), "String");
+        // When the `decimal` feature is enabled, NUMERIC/DECIMAL map to rust_decimal
+        #[cfg(feature = "decimal")]
+        {
+            assert_eq!(
+                resolve_sqlite_type(Some("NUMERIC")),
+                "::rust_decimal::Decimal"
+            );
+            assert_eq!(
+                resolve_sqlite_type(Some("DECIMAL(10,5)")),
+                "::rust_decimal::Decimal"
+            );
+        }
+        #[cfg(not(feature = "decimal"))]
+        {
+            assert_eq!(resolve_sqlite_type(Some("NUMERIC")), "String");
+            assert_eq!(resolve_sqlite_type(Some("DECIMAL(10,5)")), "String");
+        }
     }
 
     #[test]
@@ -194,5 +252,63 @@ mod tests {
         assert!(is_sqlite_option_param_compatible("Option<&str>"));
         assert!(is_sqlite_option_param_compatible("i32"));
         assert!(!is_sqlite_option_param_compatible("Option<u32>"));
+    }
+
+    // --- Feature-gated types ---
+
+    #[test]
+    fn datetime_types() {
+        #[cfg(feature = "time")]
+        {
+            assert_eq!(
+                resolve_sqlite_type(Some("DATETIME")),
+                "::time::PrimitiveDateTime"
+            );
+            assert_eq!(
+                resolve_sqlite_type(Some("TIMESTAMP")),
+                "::time::PrimitiveDateTime"
+            );
+            assert_eq!(resolve_sqlite_type(Some("DATE")), "::time::Date");
+            assert_eq!(resolve_sqlite_type(Some("TIME")), "::time::Time");
+        }
+        #[cfg(all(feature = "chrono", not(feature = "time")))]
+        {
+            assert_eq!(
+                resolve_sqlite_type(Some("DATETIME")),
+                "::chrono::NaiveDateTime"
+            );
+            assert_eq!(
+                resolve_sqlite_type(Some("TIMESTAMP")),
+                "::chrono::NaiveDateTime"
+            );
+            assert_eq!(resolve_sqlite_type(Some("DATE")), "::chrono::NaiveDate");
+            assert_eq!(resolve_sqlite_type(Some("TIME")), "::chrono::NaiveTime");
+        }
+        #[cfg(not(any(feature = "time", feature = "chrono")))]
+        {
+            assert_eq!(resolve_sqlite_type(Some("DATETIME")), "String");
+            assert_eq!(resolve_sqlite_type(Some("TIMESTAMP")), "String");
+            assert_eq!(resolve_sqlite_type(Some("DATE")), "String");
+            assert_eq!(resolve_sqlite_type(Some("TIME")), "String");
+        }
+    }
+
+    #[test]
+    fn uuid_type() {
+        #[cfg(feature = "uuid")]
+        assert_eq!(resolve_sqlite_type(Some("UUID")), "::uuid::Uuid");
+        #[cfg(not(feature = "uuid"))]
+        assert_eq!(resolve_sqlite_type(Some("UUID")), "String");
+    }
+
+    #[test]
+    fn decimal_type() {
+        #[cfg(feature = "decimal")]
+        assert_eq!(
+            resolve_sqlite_type(Some("DECIMAL")),
+            "::rust_decimal::Decimal"
+        );
+        #[cfg(not(feature = "decimal"))]
+        assert_eq!(resolve_sqlite_type(Some("DECIMAL")), "String");
     }
 }

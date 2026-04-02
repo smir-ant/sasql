@@ -98,6 +98,79 @@ pub fn validate_query_sqlite(
     })
 }
 
+/// Validate all dynamic query variants against SQLite.
+///
+/// Each variant is prepared independently. The first variant's columns
+/// are used as the canonical result type (all variants return the same
+/// columns — the SELECT list is identical, only WHERE clauses differ).
+pub fn validate_variants_sqlite(
+    variants: &[crate::dynamic::QueryVariant],
+    _parsed: &ParsedQuery,
+    conn: &mut SqliteConnection,
+) -> Result<ValidationResult, String> {
+    if variants.is_empty() {
+        return Err("internal error: no variants to validate".to_owned());
+    }
+
+    let mut canonical: Option<ValidationResult> = None;
+
+    for (idx, variant) in variants.iter().enumerate() {
+        let sqlite_sql = pg_to_sqlite_params(&variant.sql);
+
+        let (driver_columns, param_count) = conn.compile_validate(&sqlite_sql).map_err(|e| {
+            format!(
+                "SQLite compile-time validation failed for variant {idx} (mask={:#06b}): {e}\n  SQL: {}",
+                variant.mask, sqlite_sql
+            )
+        })?;
+
+        if param_count != variant.params.len() {
+            return Err(format!(
+                "parameter count mismatch in variant {idx}: query declares {} \
+                 parameters but SQLite expects {}.",
+                variant.params.len(),
+                param_count
+            ));
+        }
+
+        if canonical.is_none() {
+            // Use first variant as canonical result
+            let columns: Vec<ColumnInfo> = driver_columns
+                .iter()
+                .map(|col| {
+                    let base_rust_type =
+                        crate::types_sqlite::resolve_sqlite_type(col.declared_type.as_deref());
+                    let rust_type = if col.is_nullable {
+                        format!("Option<{base_rust_type}>")
+                    } else {
+                        base_rust_type.to_owned()
+                    };
+                    ColumnInfo {
+                        name: col.name.clone(),
+                        pg_oid: 0,
+                        pg_type_name: col
+                            .declared_type
+                            .clone()
+                            .unwrap_or_else(|| "(none)".to_owned()),
+                        is_nullable: col.is_nullable,
+                        rust_type,
+                    }
+                })
+                .collect();
+
+            canonical = Some(ValidationResult {
+                columns,
+                param_pg_oids: SmallVec::new(),
+                param_is_pg_enum: SmallVec::new(),
+                #[cfg(feature = "explain")]
+                explain_plan: None,
+            });
+        }
+    }
+
+    canonical.ok_or_else(|| "internal error: no canonical validation result".to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +340,131 @@ mod tests {
         let result = validate_query_sqlite(&parsed, &mut conn).unwrap();
 
         assert!(result.columns.is_empty());
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- validate_variants_sqlite ---
+
+    #[test]
+    fn validate_variants_one_optional_clause() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec(
+            "CREATE TABLE tickets (id INTEGER NOT NULL, dept_id INTEGER, title TEXT NOT NULL)",
+        )
+        .unwrap();
+
+        let parsed = crate::parse::parse_query(
+            "SELECT id, title FROM tickets WHERE 1 = 1 \
+             [AND dept_id = $dept: Option<i64>]",
+        )
+        .unwrap();
+
+        let variants = crate::dynamic::expand_variants(&parsed).unwrap();
+        assert_eq!(variants.len(), 2);
+
+        let result = validate_variants_sqlite(&variants, &parsed, &mut conn).unwrap();
+        assert_eq!(result.columns.len(), 2);
+        assert_eq!(result.columns[0].name, "id");
+        assert_eq!(result.columns[1].name, "title");
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_variants_two_optional_clauses() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec(
+            "CREATE TABLE tickets (id INTEGER NOT NULL, dept_id INTEGER, assignee_id INTEGER, title TEXT NOT NULL)",
+        )
+        .unwrap();
+
+        let parsed = crate::parse::parse_query(
+            "SELECT id, title FROM tickets WHERE 1 = 1 \
+             [AND dept_id = $dept: Option<i64>] \
+             [AND assignee_id = $assignee: Option<i64>]",
+        )
+        .unwrap();
+
+        let variants = crate::dynamic::expand_variants(&parsed).unwrap();
+        assert_eq!(variants.len(), 4);
+
+        let result = validate_variants_sqlite(&variants, &parsed, &mut conn).unwrap();
+        assert_eq!(result.columns.len(), 2);
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_variants_three_optional_clauses() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER NOT NULL, a INTEGER, b INTEGER, c INTEGER)")
+            .unwrap();
+
+        let parsed = crate::parse::parse_query(
+            "SELECT id FROM t WHERE 1 = 1 \
+             [AND a = $a: Option<i64>] \
+             [AND b = $b: Option<i64>] \
+             [AND c = $c: Option<i64>]",
+        )
+        .unwrap();
+
+        let variants = crate::dynamic::expand_variants(&parsed).unwrap();
+        assert_eq!(variants.len(), 8);
+
+        let result = validate_variants_sqlite(&variants, &parsed, &mut conn).unwrap();
+        assert_eq!(result.columns.len(), 1);
+        assert_eq!(result.columns[0].name, "id");
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_variants_with_base_params() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec(
+            "CREATE TABLE tickets (id INTEGER NOT NULL, status TEXT NOT NULL, dept_id INTEGER)",
+        )
+        .unwrap();
+
+        let parsed = crate::parse::parse_query(
+            "SELECT id FROM tickets WHERE status = $status: &str \
+             [AND dept_id = $dept: Option<i64>]",
+        )
+        .unwrap();
+
+        let variants = crate::dynamic::expand_variants(&parsed).unwrap();
+        assert_eq!(variants.len(), 2);
+
+        let result = validate_variants_sqlite(&variants, &parsed, &mut conn).unwrap();
+        assert_eq!(result.columns.len(), 1);
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_variants_invalid_table() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+
+        let parsed = crate::parse::parse_query(
+            "SELECT id FROM nonexistent WHERE 1 = 1 \
+             [AND a = $a: Option<i64>]",
+        )
+        .unwrap();
+
+        let variants = crate::dynamic::expand_variants(&parsed).unwrap();
+        let result = validate_variants_sqlite(&variants, &parsed, &mut conn);
+        assert!(result.is_err());
 
         drop(conn);
         let _ = std::fs::remove_file(&path);

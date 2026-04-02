@@ -204,20 +204,28 @@ impl From<bsql_driver_postgres::DriverError> for BsqlError {
                 message,
                 detail,
                 hint,
+                position,
             } => {
-                let msg = if detail.is_some() || hint.is_some() {
-                    let mut s = String::from(&*message);
-                    if let Some(d) = &detail {
-                        s.push_str("\n  detail: ");
-                        s.push_str(d);
+                let msg = {
+                    let has_extras = position.is_some() || detail.is_some() || hint.is_some();
+                    if has_extras {
+                        let mut s = String::from(&*message);
+                        if let Some(pos) = position {
+                            use std::fmt::Write;
+                            let _ = write!(s, " (at position {pos})");
+                        }
+                        if let Some(d) = &detail {
+                            s.push_str("\n  detail: ");
+                            s.push_str(d);
+                        }
+                        if let Some(h) = &hint {
+                            s.push_str("\n  hint: ");
+                            s.push_str(h);
+                        }
+                        Cow::Owned(s)
+                    } else {
+                        Cow::Owned(String::from(message))
                     }
-                    if let Some(h) = &hint {
-                        s.push_str("\n  hint: ");
-                        s.push_str(h);
-                    }
-                    Cow::Owned(s)
-                } else {
-                    Cow::Owned(String::from(message))
                 };
                 BsqlError::Query(QueryError {
                     message: msg,
@@ -437,6 +445,7 @@ mod tests {
             message: "duplicate key".into(),
             detail: Some("Key (login)=(alice) already exists.".into()),
             hint: Some("Use ON CONFLICT to handle duplicates.".into()),
+            position: None,
         };
         let e = BsqlError::from(driver_err);
         let display = e.to_string();
@@ -466,6 +475,7 @@ mod tests {
             message: "relation does not exist".into(),
             detail: None,
             hint: None,
+            position: None,
         };
         let e = BsqlError::from(driver_err);
         let display = e.to_string();

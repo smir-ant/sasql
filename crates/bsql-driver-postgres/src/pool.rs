@@ -71,6 +71,8 @@ struct PoolInner {
     /// Uses Mutex instead of RwLock: reads are rare (only on new connection
     /// creation) and writes are rarer. Mutex has lower overhead.
     warmup_sqls: std::sync::Mutex<Arc<[Box<str>]>>,
+    /// Maximum number of cached prepared statements per connection.
+    max_stmt_cache_size: usize,
 }
 
 impl Pool {
@@ -146,6 +148,8 @@ impl Pool {
         // Open a new connection
         match Connection::connect(&self.inner.config).await {
             Ok(mut conn) => {
+                // Configure statement cache size
+                conn.set_max_stmt_cache_size(self.inner.max_stmt_cache_size);
                 // Warmup: pre-PREPARE frequently used statements
                 self.warmup_connection(&mut conn).await;
 
@@ -345,6 +349,8 @@ pub struct PoolBuilder {
     acquire_timeout: Option<Duration>,
     /// Minimum number of idle connections to maintain.
     min_idle: usize,
+    /// Maximum number of cached prepared statements per connection.
+    max_stmt_cache_size: usize,
 }
 
 impl PoolBuilder {
@@ -355,6 +361,7 @@ impl PoolBuilder {
             max_lifetime: Some(Duration::from_secs(30 * 60)), // 30 min default
             acquire_timeout: None,                            // fail-fast by default (CREDO #17)
             min_idle: 0,                                      // no minimum by default
+            max_stmt_cache_size: 256,                         // LRU eviction at 256 stmts
         }
     }
 
@@ -393,6 +400,14 @@ impl PoolBuilder {
         self
     }
 
+    /// Set the maximum number of cached prepared statements per connection.
+    /// Default: 256. When the cache exceeds this size, the least recently
+    /// used statement is evicted (Close sent to PG to free server memory).
+    pub fn max_stmt_cache_size(mut self, size: usize) -> Self {
+        self.max_stmt_cache_size = size;
+        self
+    }
+
     /// Build the pool. Validates the URL but does not open connections.
     pub async fn build(self) -> Result<Pool, DriverError> {
         let url = self
@@ -414,6 +429,7 @@ impl PoolBuilder {
                 acquire_timeout: self.acquire_timeout,
                 min_idle: self.min_idle,
                 warmup_sqls: std::sync::Mutex::new(Arc::from(Vec::<Box<str>>::new())),
+                max_stmt_cache_size: self.max_stmt_cache_size,
             }),
         };
 
@@ -508,6 +524,15 @@ impl PoolGuard {
     /// and cannot be safely reused.
     pub fn mark_discard(&mut self) {
         self.discard = true;
+    }
+
+    /// Cancel the currently running query on the underlying connection.
+    ///
+    /// Opens a new TCP connection and sends a CancelRequest to PG.
+    /// The cancel connection is closed immediately after.
+    pub async fn cancel(&self) -> Result<(), DriverError> {
+        let conn = self.conn.as_ref().expect("connection already taken");
+        conn.cancel(&self.pool.config).await
     }
 }
 
@@ -812,5 +837,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pool.open_count(), 0);
+    }
+
+    // --- Task 7: max_stmt_cache_size ---
+
+    #[tokio::test]
+    async fn pool_builder_max_stmt_cache_size_default() {
+        let pool = PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(pool.inner.max_stmt_cache_size, 256);
+    }
+
+    #[tokio::test]
+    async fn pool_builder_max_stmt_cache_size_custom() {
+        let pool = PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .max_stmt_cache_size(512)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(pool.inner.max_stmt_cache_size, 512);
     }
 }

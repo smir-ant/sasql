@@ -34,7 +34,7 @@ use smallvec::SmallVec;
 
 use crate::SqliteError;
 use crate::codec::SqliteEncode;
-use crate::conn::{QueryResult, SqliteConnection, hash_sql};
+use crate::conn::{QueryResult, SqliteConnection, StreamingQuery, hash_sql};
 use crate::ffi::StmtHandle;
 
 // --- ParamValue ---
@@ -90,8 +90,35 @@ enum Command {
         sql: String,
         sql_hash: u64,
     },
+    StreamStart {
+        sql: String,
+        sql_hash: u64,
+        params: SmallVec<[ParamValue; 8]>,
+        chunk_size: usize,
+        reply: Sender<Result<(QueryResult, Arena, StreamingState), SqliteError>>,
+    },
+    StreamNext {
+        state: StreamingState,
+        reply: Sender<Result<(QueryResult, Arena, StreamingState), SqliteError>>,
+    },
+    StreamDrop {
+        state: StreamingState,
+    },
     Shutdown,
 }
+
+/// Streaming query state passed between pool and thread.
+///
+/// Contains the `StreamingQuery` metadata needed to step the next chunk.
+/// Sent back and forth between the caller and the dedicated thread.
+pub struct StreamingState {
+    /// The streaming query metadata.
+    pub inner: StreamingQuery,
+}
+
+// StreamingState is Send because it only contains scalar values (u64, usize, bool).
+// No raw pointers or references.
+unsafe impl Send for StreamingState {}
 
 // --- DedicatedThread ---
 
@@ -206,6 +233,70 @@ impl DedicatedThread {
                 }
                 Command::PrepareOnly { sql, sql_hash } => {
                     let _ = conn.prepare_only(&sql, sql_hash);
+                }
+                Command::StreamStart {
+                    sql,
+                    sql_hash,
+                    params,
+                    chunk_size,
+                    reply,
+                } => {
+                    let param_refs: SmallVec<[&dyn SqliteEncode; 8]> =
+                        params.iter().map(|p| p as &dyn SqliteEncode).collect();
+                    let result = conn.query_streaming(&sql, sql_hash, &param_refs, chunk_size);
+                    match result {
+                        Ok(streaming) => {
+                            let mut arena = acquire_arena();
+                            let chunk = conn.streaming_next_chunk(
+                                &mut StreamingQuery {
+                                    sql_hash: streaming.sql_hash,
+                                    col_count: streaming.col_count,
+                                    chunk_size: streaming.chunk_size,
+                                    finished: streaming.finished,
+                                },
+                                &mut arena,
+                            );
+                            // We need a fresh StreamingQuery since we consumed the original
+                            match chunk {
+                                Ok(qr) => {
+                                    let state = StreamingState {
+                                        inner: StreamingQuery {
+                                            sql_hash: streaming.sql_hash,
+                                            col_count: streaming.col_count,
+                                            chunk_size: streaming.chunk_size,
+                                            finished: streaming.finished
+                                                || (qr.row_count < streaming.chunk_size),
+                                        },
+                                    };
+                                    let _ = reply.send(Ok((qr, arena, state)));
+                                }
+                                Err(e) => {
+                                    let _ = reply.send(Err(e));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = reply.send(Err(e));
+                        }
+                    }
+                }
+                Command::StreamNext { mut state, reply } => {
+                    let mut arena = acquire_arena();
+                    let result = conn.streaming_next_chunk(&mut state.inner, &mut arena);
+                    match result {
+                        Ok(qr) => {
+                            let _ = reply.send(Ok((qr, arena, state)));
+                        }
+                        Err(e) => {
+                            let _ = reply.send(Err(e));
+                        }
+                    }
+                }
+                Command::StreamDrop { state } => {
+                    // Reset the statement for reuse if not fully consumed.
+                    if !state.inner.finished {
+                        conn.reset_streaming(&state.inner);
+                    }
                 }
                 Command::Shutdown => break,
             }
@@ -375,6 +466,120 @@ impl SqlitePool {
             return Err(SqliteError::Pool("pool is closed".into()));
         }
         self.writer.simple_exec(sql)
+    }
+
+    /// Start a streaming query on a reader thread.
+    ///
+    /// Returns the first chunk of rows and a `StreamingState` to continue.
+    pub fn query_streaming(
+        &self,
+        sql: &str,
+        sql_hash: u64,
+        params: SmallVec<[ParamValue; 8]>,
+        chunk_size: usize,
+    ) -> Result<(QueryResult, Arena, StreamingState), SqliteError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SqliteError::Pool("pool is closed".into()));
+        }
+        let idx = self.reader_idx.fetch_add(1, Ordering::Relaxed) % self.readers.len();
+        let (reply_tx, reply_rx) = bounded(1);
+        self.readers[idx]
+            .cmd_tx
+            .send(Command::StreamStart {
+                sql: sql.to_owned(),
+                sql_hash,
+                params,
+                chunk_size,
+                reply: reply_tx,
+            })
+            .map_err(|_| SqliteError::Pool("reader thread disconnected".into()))?;
+        reply_rx
+            .recv()
+            .map_err(|_| SqliteError::Pool("reader thread disconnected".into()))?
+    }
+
+    /// Fetch the next chunk from a streaming query.
+    pub fn streaming_next(
+        &self,
+        state: StreamingState,
+        reader_idx: usize,
+    ) -> Result<(QueryResult, Arena, StreamingState), SqliteError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SqliteError::Pool("pool is closed".into()));
+        }
+        let idx = reader_idx % self.readers.len();
+        let (reply_tx, reply_rx) = bounded(1);
+        self.readers[idx]
+            .cmd_tx
+            .send(Command::StreamNext {
+                state,
+                reply: reply_tx,
+            })
+            .map_err(|_| SqliteError::Pool("reader thread disconnected".into()))?;
+        reply_rx
+            .recv()
+            .map_err(|_| SqliteError::Pool("reader thread disconnected".into()))?
+    }
+
+    /// Drop a streaming query, resetting the statement for reuse.
+    pub fn streaming_drop(&self, state: StreamingState, reader_idx: usize) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let idx = reader_idx % self.readers.len();
+        let _ = self.readers[idx].cmd_tx.send(Command::StreamDrop { state });
+    }
+
+    /// Begin a transaction on the writer thread.
+    ///
+    /// Sends `BEGIN` and returns a handle for executing within the transaction.
+    pub fn begin_transaction(&self) -> Result<(), SqliteError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SqliteError::Pool("pool is closed".into()));
+        }
+        self.writer.simple_exec("BEGIN")
+    }
+
+    /// Commit the current transaction on the writer thread.
+    pub fn commit_transaction(&self) -> Result<(), SqliteError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SqliteError::Pool("pool is closed".into()));
+        }
+        self.writer.simple_exec("COMMIT")
+    }
+
+    /// Rollback the current transaction on the writer thread.
+    pub fn rollback_transaction(&self) -> Result<(), SqliteError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SqliteError::Pool("pool is closed".into()));
+        }
+        self.writer.simple_exec("ROLLBACK")
+    }
+
+    /// Create a savepoint within the current transaction.
+    pub fn savepoint(&self, name: &str) -> Result<(), SqliteError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SqliteError::Pool("pool is closed".into()));
+        }
+        self.writer.simple_exec(&format!("SAVEPOINT {name}"))
+    }
+
+    /// Release a savepoint.
+    pub fn release_savepoint(&self, name: &str) -> Result<(), SqliteError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SqliteError::Pool("pool is closed".into()));
+        }
+        self.writer
+            .simple_exec(&format!("RELEASE SAVEPOINT {name}"))
+    }
+
+    /// Rollback to a savepoint.
+    pub fn rollback_to(&self, name: &str) -> Result<(), SqliteError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SqliteError::Pool("pool is closed".into()));
+        }
+        self.writer
+            .simple_exec(&format!("ROLLBACK TO SAVEPOINT {name}"))
     }
 
     /// Pre-prepare statements on all threads (warmup).
@@ -1342,6 +1547,135 @@ mod tests {
         let hash = hash_sql(sql);
         let (result, arena) = pool.query_readonly(sql, hash, SmallVec::new()).unwrap();
         assert_eq!(result.get_i64(0, 0, &arena), Some(42));
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- Transactions ---
+
+    #[test]
+    fn transaction_commit() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER)").unwrap();
+
+        pool.begin_transaction().unwrap();
+        pool.simple_exec("INSERT INTO t VALUES (1)").unwrap();
+        pool.simple_exec("INSERT INTO t VALUES (2)").unwrap();
+        pool.commit_transaction().unwrap();
+
+        let sql = "SELECT id FROM t ORDER BY id";
+        let h = hash_sql(sql);
+        let (result, arena) = pool.query_readonly(sql, h, SmallVec::new()).unwrap();
+        assert_eq!(result.row_count, 2);
+        assert_eq!(result.get_i64(0, 0, &arena), Some(1));
+        assert_eq!(result.get_i64(1, 0, &arena), Some(2));
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn transaction_rollback() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER)").unwrap();
+
+        pool.begin_transaction().unwrap();
+        pool.simple_exec("INSERT INTO t VALUES (1)").unwrap();
+        pool.rollback_transaction().unwrap();
+
+        let sql = "SELECT id FROM t";
+        let h = hash_sql(sql);
+        let (result, _arena) = pool.query_readonly(sql, h, SmallVec::new()).unwrap();
+        assert_eq!(result.row_count, 0);
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn transaction_savepoint() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER)").unwrap();
+
+        pool.begin_transaction().unwrap();
+        pool.simple_exec("INSERT INTO t VALUES (1)").unwrap();
+
+        pool.savepoint("sp1").unwrap();
+        pool.simple_exec("INSERT INTO t VALUES (2)").unwrap();
+
+        // Rollback to savepoint — should undo the second insert
+        pool.rollback_to("sp1").unwrap();
+        pool.commit_transaction().unwrap();
+
+        let sql = "SELECT id FROM t";
+        let h = hash_sql(sql);
+        let (result, arena) = pool.query_readonly(sql, h, SmallVec::new()).unwrap();
+        assert_eq!(result.row_count, 1);
+        assert_eq!(result.get_i64(0, 0, &arena), Some(1));
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn transaction_savepoint_release() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER)").unwrap();
+
+        pool.begin_transaction().unwrap();
+        pool.simple_exec("INSERT INTO t VALUES (1)").unwrap();
+
+        pool.savepoint("sp1").unwrap();
+        pool.simple_exec("INSERT INTO t VALUES (2)").unwrap();
+        pool.release_savepoint("sp1").unwrap();
+
+        pool.commit_transaction().unwrap();
+
+        let sql = "SELECT id FROM t ORDER BY id";
+        let h = hash_sql(sql);
+        let (result, arena) = pool.query_readonly(sql, h, SmallVec::new()).unwrap();
+        assert_eq!(result.row_count, 2);
+        assert_eq!(result.get_i64(0, 0, &arena), Some(1));
+        assert_eq!(result.get_i64(1, 0, &arena), Some(2));
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- Streaming ---
+
+    #[test]
+    fn pool_streaming_query() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+            .unwrap();
+        for i in 0..10 {
+            pool.simple_exec(&format!("INSERT INTO t VALUES ({i})"))
+                .unwrap();
+        }
+
+        let sql = "SELECT id FROM t ORDER BY id";
+        let h = hash_sql(sql);
+        let (first_result, first_arena, mut state) =
+            pool.query_streaming(sql, h, SmallVec::new(), 3).unwrap();
+
+        assert!(first_result.row_count > 0);
+        assert_eq!(first_result.get_i64(0, 0, &first_arena), Some(0));
+
+        // Continue fetching until done
+        let mut total_rows = first_result.row_count;
+        while !state.inner.finished {
+            let (result, _arena, new_state) = pool.streaming_next(state, 0).unwrap();
+            total_rows += result.row_count;
+            state = new_state;
+        }
+        assert_eq!(total_rows, 10);
 
         drop(pool);
         let _ = std::fs::remove_file(&path);

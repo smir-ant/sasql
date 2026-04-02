@@ -13,11 +13,16 @@ use crate::error::{BsqlError, BsqlResult};
 use crate::stream::QueryStream;
 use crate::transaction::Transaction;
 
-/// A PostgreSQL connection pool.
+/// A PostgreSQL connection pool with optional read/write splitting.
 ///
 /// Wraps `bsql_driver_postgres::Pool` with bsql error types and the `Executor` trait.
+/// When a `replica_url` is configured, `query_raw_readonly` routes to the replica
+/// pool while all writes go to the primary. When no replica is configured,
+/// `query_raw_readonly` falls back to the primary pool.
 pub struct Pool {
     pub(crate) inner: bsql_driver_postgres::Pool,
+    /// Optional read replica pool. When present, `query_raw_readonly` routes here.
+    pub(crate) read_pool: Option<bsql_driver_postgres::Pool>,
 }
 
 /// Builder for configuring a connection pool.
@@ -27,6 +32,11 @@ pub struct PoolBuilder {
     max_lifetime: Option<Option<Duration>>,
     acquire_timeout: Option<Option<Duration>>,
     min_idle: Option<usize>,
+    /// Optional URL for a read replica. When set, `query_raw_readonly`
+    /// routes to this pool instead of the primary.
+    replica_url: Option<String>,
+    /// Max pool size for the replica pool. Defaults to same as `max_size`.
+    replica_max_size: Option<usize>,
 }
 
 impl PoolBuilder {
@@ -70,6 +80,23 @@ impl PoolBuilder {
         self
     }
 
+    /// Set a read replica URL for read/write splitting.
+    ///
+    /// When configured, `query_raw_readonly` (used by SELECT queries)
+    /// routes to the replica pool. All writes go to the primary.
+    /// When no replica is configured, all queries use the primary.
+    pub fn replica_url(mut self, url: &str) -> Self {
+        self.replica_url = Some(url.into());
+        self
+    }
+
+    /// Set the max pool size for the replica pool.
+    /// Defaults to the same value as `max_size`.
+    pub fn replica_max_size(mut self, size: usize) -> Self {
+        self.replica_max_size = Some(size);
+        self
+    }
+
     pub async fn build(self) -> BsqlResult<Pool> {
         let url = self.url.ok_or_else(|| {
             BsqlError::from(bsql_driver_postgres::DriverError::Pool(
@@ -91,7 +118,25 @@ impl PoolBuilder {
         }
 
         let inner = builder.build().await.map_err(BsqlError::from)?;
-        Ok(Pool { inner })
+
+        // Build replica pool if configured
+        let read_pool = if let Some(replica_url) = &self.replica_url {
+            let replica_size = self.replica_max_size.unwrap_or(self.max_size);
+            let mut rbuilder = bsql_driver_postgres::Pool::builder()
+                .url(replica_url)
+                .max_size(replica_size);
+            if let Some(lt) = self.max_lifetime {
+                rbuilder = rbuilder.max_lifetime(lt);
+            }
+            if let Some(at) = self.acquire_timeout {
+                rbuilder = rbuilder.acquire_timeout(at);
+            }
+            Some(rbuilder.build().await.map_err(BsqlError::from)?)
+        } else {
+            None
+        };
+
+        Ok(Pool { inner, read_pool })
     }
 }
 
@@ -103,7 +148,10 @@ impl Pool {
         let inner = bsql_driver_postgres::Pool::connect(url)
             .await
             .map_err(BsqlError::from)?;
-        Ok(Pool { inner })
+        Ok(Pool {
+            inner,
+            read_pool: None,
+        })
     }
 
     /// Create a pool builder for fine-grained configuration.
@@ -114,6 +162,8 @@ impl Pool {
             max_lifetime: None,
             acquire_timeout: None,
             min_idle: None,
+            replica_url: None,
+            replica_max_size: None,
         }
     }
 
@@ -204,18 +254,26 @@ impl Pool {
         }
     }
 
-    /// Gracefully close the pool.
+    /// Gracefully close the pool (and replica pool if configured).
     ///
     /// No new connections can be acquired after this call. All idle connections
     /// are closed immediately. Active connections are closed when returned to
     /// the pool.
     pub async fn close(&self) {
         self.inner.close().await;
+        if let Some(ref rp) = self.read_pool {
+            rp.close().await;
+        }
     }
 
     /// Whether the pool has been closed.
     pub fn is_closed(&self) -> bool {
         self.inner.is_closed()
+    }
+
+    /// Whether a read replica pool is configured.
+    pub fn has_replica(&self) -> bool {
+        self.read_pool.is_some()
     }
 }
 
@@ -223,6 +281,7 @@ impl Clone for Pool {
     fn clone(&self) -> Self {
         Pool {
             inner: self.inner.clone(),
+            read_pool: self.read_pool.clone(),
         }
     }
 }
@@ -303,5 +362,34 @@ mod tests {
     fn builder_min_idle() {
         let b = Pool::builder().min_idle(5);
         assert_eq!(b.min_idle, Some(5));
+    }
+
+    // --- Task 2: Read/write splitting ---
+
+    #[test]
+    fn builder_defaults_no_replica() {
+        let b = Pool::builder();
+        assert!(b.replica_url.is_none());
+        assert!(b.replica_max_size.is_none());
+    }
+
+    #[test]
+    fn builder_replica_url() {
+        let b = Pool::builder().replica_url("postgres://replica:5432/db");
+        assert_eq!(b.replica_url.as_deref(), Some("postgres://replica:5432/db"));
+    }
+
+    #[test]
+    fn builder_replica_max_size() {
+        let b = Pool::builder().replica_max_size(20);
+        assert_eq!(b.replica_max_size, Some(20));
+    }
+
+    #[tokio::test]
+    async fn pool_connect_has_no_replica() {
+        let pool = Pool::connect("postgres://user:pass@localhost/db")
+            .await
+            .unwrap();
+        assert!(!pool.has_replica());
     }
 }

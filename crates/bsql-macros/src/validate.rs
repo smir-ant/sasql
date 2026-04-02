@@ -527,9 +527,13 @@ fn format_driver_error_base(e: &DriverError) -> String {
             message,
             detail,
             hint,
+            position,
             ..
         } => {
             let mut out = format!("PostgreSQL error: {message}");
+            if let Some(pos) = position {
+                out.push_str(&format!(" (at position {pos})"));
+            }
             if let Some(d) = detail {
                 out.push_str(&format!("\n  detail: {d}"));
             }
@@ -580,10 +584,19 @@ fn format_variant_driver_error(
 fn format_driver_error(e: &DriverError, parsed: &ParsedQuery) -> String {
     let mut out = format_driver_error_base(e);
 
-    // For Server errors, include position if extractable from the message
-    // (our driver doesn't expose position directly, but PG includes it in
-    // the error message text when relevant).
-    out.push_str(&format!("\n  SQL: {}", parsed.positional_sql));
+    out.push_str(&format!("\n         SQL: {}", parsed.positional_sql));
+
+    // Show a position indicator if the driver provides one.
+    if let DriverError::Server {
+        position: Some(pos),
+        ..
+    } = e
+    {
+        let col = (*pos as usize).saturating_sub(1); // 1-indexed -> 0-indexed
+        let prefix_len = "         SQL: ".len();
+        let marker = format!("\n{}{}", " ".repeat(prefix_len + col), "^");
+        out.push_str(&marker);
+    }
 
     out
 }

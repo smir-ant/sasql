@@ -54,7 +54,8 @@ pub use arena::Arena;
 pub use codec::Encode;
 pub use conn::hash_sql;
 pub use conn::{
-    ColumnDesc, Config, Connection, PrepareResult, QueryResult, Row, SimpleRow, SslMode,
+    ColumnDesc, Config, Connection, Notification, PrepareResult, QueryResult, Row, SimpleRow,
+    SslMode,
 };
 pub use pool::{Pool, PoolBuilder, PoolGuard, PoolStatus, Transaction};
 
@@ -75,8 +76,8 @@ pub use pool::{Pool, PoolBuilder, PoolGuard, PoolStatus, Transaction};
 ///         DriverError::Io(e) => eprintln!("network error: {e}"),
 ///         DriverError::Auth(msg) => eprintln!("auth failed: {msg}"),
 ///         DriverError::Protocol(msg) => eprintln!("protocol error: {msg}"),
-///         DriverError::Server { code, message, .. } => {
-///             eprintln!("PG error [{code}]: {message}");
+///         DriverError::Server { code, message, position, .. } => {
+///             eprintln!("PG error [{code}]: {message} (pos: {position:?})");
 ///         }
 ///         DriverError::Pool(msg) => eprintln!("pool error: {msg}"),
 ///     }
@@ -100,6 +101,8 @@ pub enum DriverError {
         detail: Option<Box<str>>,
         /// Optional hint text.
         hint: Option<Box<str>>,
+        /// Character position in the original query where the error occurred (1-indexed).
+        position: Option<u32>,
     },
     /// Connection pool error (exhaustion, misconfiguration).
     Pool(String),
@@ -116,8 +119,12 @@ impl std::fmt::Display for DriverError {
                 message,
                 detail,
                 hint,
+                position,
             } => {
                 write!(f, "server error [{code}]: {message}")?;
+                if let Some(pos) = position {
+                    write!(f, " (at position {pos})")?;
+                }
                 if let Some(d) = detail {
                     write!(f, " DETAIL: {d}")?;
                 }
@@ -179,6 +186,7 @@ mod tests {
             message: "relation does not exist".into(),
             detail: Some("table was dropped".into()),
             hint: None,
+            position: None,
         };
         let s = e.to_string();
         assert!(s.contains("42P01"));
@@ -193,8 +201,22 @@ mod tests {
             message: Box::from("duplicate key"),
             detail: None,
             hint: None,
+            position: None,
         };
         assert_eq!(e.to_string(), "server error [23505]: duplicate key");
+    }
+
+    #[test]
+    fn driver_error_display_server_with_position() {
+        let e = DriverError::Server {
+            code: Box::from("42601"),
+            message: Box::from("syntax error"),
+            detail: None,
+            hint: None,
+            position: Some(8),
+        };
+        let s = e.to_string();
+        assert!(s.contains("(at position 8)"));
     }
 
     #[test]

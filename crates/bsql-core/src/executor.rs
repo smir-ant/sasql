@@ -119,7 +119,15 @@ impl Executor for Pool {
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<OwnedResult> {
-        self.query_raw(sql, sql_hash, params).await
+        // Route to replica pool when configured; fall back to primary otherwise.
+        let pool = self.read_pool.as_ref().unwrap_or(&self.inner);
+        let mut guard = pool.acquire().await.map_err(BsqlError::from)?;
+        let mut arena = acquire_arena();
+        let result = guard
+            .query(sql, sql_hash, params, &mut arena)
+            .await
+            .map_err(BsqlError::from_driver_query)?;
+        Ok(OwnedResult::new(result, arena))
     }
 
     async fn execute_raw(

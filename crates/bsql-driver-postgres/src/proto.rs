@@ -26,6 +26,9 @@ const PROTOCOL_VERSION: i32 = 196608; // 3 << 16
 #[cfg(feature = "tls")]
 const SSL_REQUEST_CODE: i32 = 80877103;
 
+/// CancelRequest magic code.
+const CANCEL_REQUEST_CODE: i32 = 80877102;
+
 // Frontend message type bytes
 const MSG_PASSWORD: u8 = b'p';
 const MSG_QUERY: u8 = b'Q';
@@ -33,7 +36,6 @@ const MSG_PARSE: u8 = b'P';
 const MSG_BIND: u8 = b'B';
 const MSG_EXECUTE: u8 = b'E';
 const MSG_DESCRIBE: u8 = b'D';
-#[allow(dead_code)]
 const MSG_CLOSE: u8 = b'C';
 const MSG_SYNC: u8 = b'S';
 const MSG_TERMINATE: u8 = b'X';
@@ -161,6 +163,18 @@ pub fn write_startup(buf: &mut Vec<u8>, user: &str, database: &str) {
 pub fn write_ssl_request(buf: &mut Vec<u8>) {
     buf.extend_from_slice(&8i32.to_be_bytes());
     buf.extend_from_slice(&SSL_REQUEST_CODE.to_be_bytes());
+}
+
+/// CancelRequest — 16 bytes, no type byte:
+/// `[length=16: i32] [code=80877102: i32] [pid: i32] [secret: i32]`
+///
+/// Sent on a NEW TCP connection to cancel a running query.
+/// The connection is closed immediately after sending.
+pub fn write_cancel_request(buf: &mut Vec<u8>, pid: i32, secret: i32) {
+    buf.extend_from_slice(&16i32.to_be_bytes());
+    buf.extend_from_slice(&CANCEL_REQUEST_CODE.to_be_bytes());
+    buf.extend_from_slice(&pid.to_be_bytes());
+    buf.extend_from_slice(&secret.to_be_bytes());
 }
 
 /// Parse message — prepare a named statement.
@@ -315,7 +329,6 @@ pub fn write_describe(buf: &mut Vec<u8>, kind: u8, name: &str) {
 }
 
 /// Close message — close a statement ('S') or portal ('P').
-#[allow(dead_code)]
 pub fn write_close(buf: &mut Vec<u8>, kind: u8, name: &str) {
     let payload_len = 1 + name.len() + 1;
     buf.push(MSG_CLOSE);
@@ -727,11 +740,17 @@ pub struct ErrorFields {
     pub message: String,
     pub detail: Option<String>,
     pub hint: Option<String>,
+    /// Character position in the original query where the error occurred.
+    /// Field type `b'P'` in the PG wire protocol. 1-indexed.
+    pub position: Option<u32>,
 }
 
 impl fmt::Display for ErrorFields {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "[{}] {}", self.code, self.message)?;
+        if let Some(pos) = self.position {
+            write!(f, " (at position {pos})")?;
+        }
         if let Some(ref detail) = self.detail {
             write!(f, " DETAIL: {detail}")?;
         }
@@ -751,6 +770,7 @@ pub fn parse_error_response(data: &[u8]) -> ErrorFields {
     let mut message = String::new();
     let mut detail = None;
     let mut hint = None;
+    let mut position = None;
 
     let mut pos = 0;
     while pos < data.len() {
@@ -775,7 +795,8 @@ pub fn parse_error_response(data: &[u8]) -> ErrorFields {
             b'M' => message = value.to_owned(),
             b'D' => detail = Some(value.to_owned()),
             b'H' => hint = Some(value.to_owned()),
-            _ => {} // skip other fields (position, internal query, etc.)
+            b'P' => position = value.parse::<u32>().ok(),
+            _ => {} // skip other fields (internal query, where, schema, etc.)
         }
     }
 
@@ -794,6 +815,7 @@ pub fn parse_error_response(data: &[u8]) -> ErrorFields {
         message,
         detail,
         hint,
+        position,
     }
 }
 
@@ -1349,6 +1371,7 @@ mod tests {
             message: "duplicate key".to_owned(),
             detail: Some("key already exists".to_owned()),
             hint: Some("use ON CONFLICT".to_owned()),
+            position: None,
         };
         let display = fields.to_string();
         assert!(display.contains("[23505]"));
@@ -1366,6 +1389,7 @@ mod tests {
             message: "relation does not exist".to_owned(),
             detail: None,
             hint: None,
+            position: None,
         };
         let display = fields.to_string();
         assert_eq!(display, "[42P01] relation does not exist");
@@ -1433,5 +1457,87 @@ mod tests {
         payload.extend_from_slice(b"v=signature");
         let msg = parse_backend_message(b'R', &payload).unwrap();
         assert!(matches!(msg, BackendMessage::AuthSaslFinal { .. }));
+    }
+
+    // --- Task 1: CancelRequest ---
+
+    #[test]
+    fn cancel_request_format() {
+        let mut buf = Vec::new();
+        write_cancel_request(&mut buf, 1234, 5678);
+        assert_eq!(buf.len(), 16);
+        let len = i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        assert_eq!(len, 16);
+        let code = i32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        assert_eq!(code, CANCEL_REQUEST_CODE);
+        let pid = i32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        assert_eq!(pid, 1234);
+        let secret = i32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
+        assert_eq!(secret, 5678);
+    }
+
+    // --- Task 4: Position field ---
+
+    #[test]
+    fn error_response_parses_position() {
+        let mut data = Vec::new();
+        data.push(b'S');
+        data.extend_from_slice(b"ERROR\0");
+        data.push(b'C');
+        data.extend_from_slice(b"42601\0");
+        data.push(b'M');
+        data.extend_from_slice(b"syntax error at or near \"SELEC\"\0");
+        data.push(b'P');
+        data.extend_from_slice(b"8\0");
+        data.push(0);
+
+        let fields = parse_error_response(&data);
+        assert_eq!(fields.position, Some(8));
+    }
+
+    #[test]
+    fn error_response_no_position() {
+        let mut data = Vec::new();
+        data.push(b'S');
+        data.extend_from_slice(b"ERROR\0");
+        data.push(b'C');
+        data.extend_from_slice(b"42P01\0");
+        data.push(b'M');
+        data.extend_from_slice(b"table does not exist\0");
+        data.push(0);
+
+        let fields = parse_error_response(&data);
+        assert_eq!(fields.position, None);
+    }
+
+    #[test]
+    fn error_response_invalid_position_ignored() {
+        let mut data = Vec::new();
+        data.push(b'S');
+        data.extend_from_slice(b"ERROR\0");
+        data.push(b'C');
+        data.extend_from_slice(b"42601\0");
+        data.push(b'M');
+        data.extend_from_slice(b"syntax error\0");
+        data.push(b'P');
+        data.extend_from_slice(b"notanumber\0");
+        data.push(0);
+
+        let fields = parse_error_response(&data);
+        assert_eq!(fields.position, None);
+    }
+
+    #[test]
+    fn error_fields_display_with_position() {
+        let fields = ErrorFields {
+            severity: Box::from("ERROR"),
+            code: Box::from("42601"),
+            message: "syntax error".to_owned(),
+            detail: None,
+            hint: None,
+            position: Some(8),
+        };
+        let display = fields.to_string();
+        assert!(display.contains("(at position 8)"));
     }
 }

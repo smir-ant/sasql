@@ -321,6 +321,8 @@ struct StmtInfo {
     name: Box<str>,
     /// Column metadata from RowDescription.
     columns: Arc<[ColumnDesc]>,
+    /// Timestamp of last use for LRU eviction.
+    last_used: std::time::Instant,
 }
 
 /// Description of a result column.
@@ -356,6 +358,21 @@ pub type SimpleRow = Vec<Option<String>>;
 
 // --- Connection ---
 
+/// A notification received during normal query processing.
+///
+/// When the read loop encounters a NotificationResponse during queries,
+/// it is buffered here instead of being dropped. Call
+/// [`Connection::drain_notifications`] to retrieve and clear the buffer.
+#[derive(Debug, Clone)]
+pub struct Notification {
+    /// Backend process ID that sent the notification.
+    pub pid: i32,
+    /// Channel name.
+    pub channel: String,
+    /// Payload string (may be empty).
+    pub payload: String,
+}
+
 /// A PostgreSQL connection with statement cache and inline message processing.
 ///
 /// Connections are not `Send` — they must be used on one task at a time. The pool
@@ -387,6 +404,13 @@ pub struct Connection {
     streaming_active: bool,
     /// Timestamp of connection creation. Used by pool max_lifetime.
     created_at: std::time::Instant,
+    /// Notifications received during query processing. Buffered here
+    /// instead of dropped; call `drain_notifications()` to retrieve.
+    pending_notifications: Vec<Notification>,
+    /// Maximum number of cached prepared statements. When the cache exceeds
+    /// this size, the least recently used statement is evicted (Close sent to PG).
+    /// Default: 256.
+    max_stmt_cache_size: usize,
 }
 
 impl Connection {
@@ -446,9 +470,14 @@ impl Connection {
             last_used: std::time::Instant::now(),
             streaming_active: false,
             created_at: std::time::Instant::now(),
+            pending_notifications: Vec::new(),
+            max_stmt_cache_size: 256,
         };
 
         conn.startup(config).await?;
+
+        // Validate critical server parameters received during startup.
+        conn.validate_server_params()?;
 
         if config.statement_timeout_secs > 0 {
             conn.simple_query(&format!(
@@ -665,8 +694,15 @@ impl Connection {
         // ReadyForQuery
         self.expect_ready().await?;
 
-        // Cache the statement
-        self.stmts.insert(sql_hash, StmtInfo { name, columns });
+        // Cache the statement (with LRU eviction if needed)
+        self.cache_stmt(
+            sql_hash,
+            StmtInfo {
+                name,
+                columns,
+                last_used: std::time::Instant::now(),
+            },
+        );
         Ok(())
     }
 
@@ -712,8 +748,7 @@ impl Connection {
                     columns = Vec::new();
                     break;
                 }
-                BackendMessage::NoticeResponse { .. }
-                | BackendMessage::NotificationResponse { .. } => {}
+                BackendMessage::NoticeResponse { .. } => {}
                 BackendMessage::ErrorResponse { data } => {
                     let fields = proto::parse_error_response(data);
                     self.drain_to_ready().await?;
@@ -765,8 +800,7 @@ impl Connection {
                 BackendMessage::RowDescription { .. }
                 | BackendMessage::CommandComplete { .. }
                 | BackendMessage::EmptyQuery
-                | BackendMessage::NoticeResponse { .. }
-                | BackendMessage::NotificationResponse { .. } => {}
+                | BackendMessage::NoticeResponse { .. } => {}
                 BackendMessage::ErrorResponse { data } => {
                     let fields = proto::parse_error_response(data);
                     self.drain_to_ready().await?;
@@ -829,15 +863,19 @@ impl Connection {
             self.expect_message(|m| matches!(m, BackendMessage::ParseComplete))
                 .await?;
             let columns = self.read_column_description().await?;
-            self.stmts.insert(
+            self.cache_stmt(
                 sql_hash,
                 StmtInfo {
                     name: stmt_name,
                     columns: columns.clone(),
+                    last_used: std::time::Instant::now(),
                 },
             );
             columns
         } else {
+            if let Some(info) = self.stmts.get_mut(&sql_hash) {
+                info.last_used = std::time::Instant::now();
+            }
             self.stmts[&sql_hash].columns.clone()
         };
 
@@ -908,8 +946,7 @@ impl Connection {
                     self.streaming_active = false;
                     return Err(self.make_server_error(fields));
                 }
-                BackendMessage::NoticeResponse { .. }
-                | BackendMessage::NotificationResponse { .. } => {}
+                BackendMessage::NoticeResponse { .. } => {}
                 other => {
                     return Err(DriverError::Protocol(format!(
                         "unexpected message during streaming: {other:?}"
@@ -982,15 +1019,20 @@ impl Connection {
             self.expect_message(|m| matches!(m, BackendMessage::ParseComplete))
                 .await?;
             let columns = self.read_column_description().await?;
-            self.stmts.insert(
+            self.cache_stmt(
                 sql_hash,
                 StmtInfo {
                     name: stmt_name,
                     columns: columns.clone(),
+                    last_used: std::time::Instant::now(),
                 },
             );
             columns
         } else {
+            // Touch LRU timestamp on cache hit
+            if let Some(info) = self.stmts.get_mut(&sql_hash) {
+                info.last_used = std::time::Instant::now();
+            }
             self.stmts[&sql_hash].columns.clone()
         };
 
@@ -1037,8 +1079,7 @@ impl Connection {
                 BackendMessage::EmptyQuery => {
                     break;
                 }
-                BackendMessage::NoticeResponse { .. }
-                | BackendMessage::NotificationResponse { .. } => {
+                BackendMessage::NoticeResponse { .. } => {
                     // Async messages can arrive mid-query — skip them
                 }
                 BackendMessage::ErrorResponse { data } => {
@@ -1083,8 +1124,7 @@ impl Connection {
                     // ParameterDescription precedes RowDescription — continue reading
                 }
                 BackendMessage::NoData => return Ok(Arc::from(Vec::new())),
-                BackendMessage::NoticeResponse { .. }
-                | BackendMessage::NotificationResponse { .. } => {}
+                BackendMessage::NoticeResponse { .. } => {}
                 BackendMessage::ErrorResponse { data } => {
                     let fields = proto::parse_error_response(data);
                     self.drain_to_ready().await?;
@@ -1124,8 +1164,7 @@ impl Connection {
                     break;
                 }
                 BackendMessage::EmptyQuery => break,
-                BackendMessage::NoticeResponse { .. }
-                | BackendMessage::NotificationResponse { .. } => {}
+                BackendMessage::NoticeResponse { .. } => {}
                 BackendMessage::ErrorResponse { data } => {
                     let fields = proto::parse_error_response(data);
 
@@ -1168,8 +1207,7 @@ impl Connection {
                 | BackendMessage::RowDescription { .. }
                 | BackendMessage::DataRow { .. }
                 | BackendMessage::EmptyQuery
-                | BackendMessage::NoticeResponse { .. }
-                | BackendMessage::NotificationResponse { .. } => {}
+                | BackendMessage::NoticeResponse { .. } => {}
                 BackendMessage::ErrorResponse { data } => {
                     let fields = proto::parse_error_response(data);
                     self.drain_to_ready().await?;
@@ -1257,14 +1295,118 @@ impl Connection {
             .map(|(_, v)| &**v)
     }
 
+    /// All server parameters received during startup.
+    pub fn server_params(&self) -> &[(Box<str>, Box<str>)] {
+        &self.params
+    }
+
+    /// Validate critical server parameters after startup.
+    ///
+    /// Checks:
+    /// - `server_encoding` must be UTF-8 (or UTF8). Our SIMD UTF-8 validation
+    ///   and text decoding assume UTF-8 encoding.
+    /// - `integer_datetimes` must be "on". Our timestamp/date codecs assume
+    ///   integer-format timestamps (microseconds since 2000-01-01). If "off",
+    ///   PG uses float-format timestamps and our decode is wrong.
+    fn validate_server_params(&self) -> Result<(), DriverError> {
+        // Check server_encoding — must be UTF-8
+        if let Some(encoding) = self.parameter("server_encoding") {
+            let normalized = encoding.to_uppercase();
+            if normalized != "UTF8" && normalized != "UTF-8" {
+                return Err(DriverError::Protocol(format!(
+                    "server_encoding is '{encoding}', but bsql requires UTF-8. \
+                     Set server encoding to UTF-8 in postgresql.conf or \
+                     use CREATE DATABASE ... ENCODING 'UTF8'."
+                )));
+            }
+        }
+
+        // Check client_encoding — must be UTF-8
+        if let Some(encoding) = self.parameter("client_encoding") {
+            let normalized = encoding.to_uppercase();
+            if normalized != "UTF8" && normalized != "UTF-8" {
+                return Err(DriverError::Protocol(format!(
+                    "client_encoding is '{encoding}', but bsql requires UTF-8. \
+                     Check your connection or database configuration."
+                )));
+            }
+        }
+
+        // Check integer_datetimes — MUST be "on"
+        if let Some(idt) = self.parameter("integer_datetimes") {
+            if idt != "on" {
+                return Err(DriverError::Protocol(format!(
+                    "integer_datetimes is '{idt}', but bsql requires 'on'. \
+                     Our timestamp codec assumes integer-format timestamps \
+                     (microseconds since 2000-01-01). Float-format timestamps \
+                     would produce incorrect decode results."
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Backend process ID (for cancel requests).
     pub fn pid(&self) -> i32 {
         self.pid
     }
 
+    /// Backend secret key (for cancel requests).
+    pub fn secret_key(&self) -> i32 {
+        self.secret
+    }
+
+    /// Cancel the currently running query on this connection.
+    ///
+    /// Opens a NEW TCP connection to the same host:port and sends a
+    /// CancelRequest message (16 bytes: length=16, code=80877102, pid, secret).
+    /// The cancel connection is closed immediately after sending.
+    ///
+    /// The `config` is needed to get the host:port for the new TCP connection.
+    pub async fn cancel(&self, config: &Config) -> Result<(), DriverError> {
+        let addr = format!("{}:{}", config.host, config.port);
+        let mut tcp = TcpStream::connect(&addr).await.map_err(DriverError::Io)?;
+        let mut buf = Vec::with_capacity(16);
+        proto::write_cancel_request(&mut buf, self.pid, self.secret);
+        tcp.write_all(&buf).await.map_err(DriverError::Io)?;
+        tcp.flush().await.map_err(DriverError::Io)?;
+        // Close immediately — PG expects no further data
+        drop(tcp);
+        Ok(())
+    }
+
     /// Whether a streaming query is in progress.
     pub fn is_streaming(&self) -> bool {
         self.streaming_active
+    }
+
+    /// Drain all buffered notifications received during query processing.
+    ///
+    /// Returns the pending notifications and clears the buffer.
+    /// Notifications arrive asynchronously from PG (via LISTEN/NOTIFY)
+    /// and are buffered during normal query execution instead of being dropped.
+    pub fn drain_notifications(&mut self) -> Vec<Notification> {
+        std::mem::take(&mut self.pending_notifications)
+    }
+
+    /// Number of pending notifications in the buffer.
+    pub fn pending_notification_count(&self) -> usize {
+        self.pending_notifications.len()
+    }
+
+    /// Set the maximum number of cached prepared statements.
+    ///
+    /// When the cache exceeds this size, the least recently used statement
+    /// is evicted and a Close message is sent to PG to free server memory.
+    /// Default: 256.
+    pub fn set_max_stmt_cache_size(&mut self, size: usize) {
+        self.max_stmt_cache_size = size;
+    }
+
+    /// Number of currently cached prepared statements.
+    pub fn stmt_cache_len(&self) -> usize {
+        self.stmts.len()
     }
 
     /// Set TCP keepalive on a socket to detect dead connections.
@@ -1284,6 +1426,40 @@ impl Connection {
 
     // --- Internal helpers ---
 
+    /// Insert a statement into the cache, evicting the LRU entry if full.
+    ///
+    /// When the cache exceeds `max_stmt_cache_size`, the least recently used
+    /// statement is evicted. A Close(Statement) message is queued to free
+    /// server-side memory. The Close is sent lazily on the next flush.
+    ///
+    /// 256 entries = negligible linear scan cost (~1us worst case).
+    fn cache_stmt(&mut self, sql_hash: u64, info: StmtInfo) {
+        // Evict LRU if cache is full
+        if self.stmts.len() >= self.max_stmt_cache_size && !self.stmts.contains_key(&sql_hash) {
+            // Find the least recently used entry via linear scan
+            if let Some((&lru_hash, _)) = self.stmts.iter().min_by_key(|(_, info)| info.last_used) {
+                if let Some(evicted) = self.stmts.remove(&lru_hash) {
+                    // Queue Close(Statement) to free server-side memory.
+                    // This will be sent on the next write+flush.
+                    proto::write_close(&mut self.write_buf, b'S', &evicted.name);
+                }
+            }
+        }
+        self.stmts.insert(sql_hash, info);
+    }
+
+    /// Buffer a notification received during query processing.
+    fn buffer_notification(&mut self, pid: i32, channel: &str, payload: &str) {
+        // Cap at 1024 buffered notifications to prevent unbounded memory growth
+        if self.pending_notifications.len() < 1024 {
+            self.pending_notifications.push(Notification {
+                pid,
+                channel: channel.to_owned(),
+                payload: payload.to_owned(),
+            });
+        }
+    }
+
     /// Reclaim memory if buffers grew beyond normal thresholds.
     ///
     /// Called after query()/execute() to prevent a single large result from
@@ -1302,13 +1478,32 @@ impl Connection {
 
     /// Read one backend message. The returned message borrows from `self.read_buf`.
     ///
-    /// Wraps read in a timeout. If PG hangs, we return an I/O error
-    /// after `statement_timeout + 30s` (the extra 30s gives PG time to kill
-    /// the query itself via its own statement_timeout). This is a last-resort
-    /// guard for external system failure.
+    /// When a NotificationResponse is received, it is automatically buffered
+    /// in `self.pending_notifications` and the next message is read instead.
+    /// This means callers never see NotificationResponse from this method.
     async fn read_one_message(&mut self) -> Result<BackendMessage<'_>, DriverError> {
-        let (msg_type, _payload_len) = self.read_message_buffered().await?;
-        proto::parse_backend_message(msg_type, &self.read_buf)
+        loop {
+            let (msg_type, _payload_len) = self.read_message_buffered().await?;
+            // Check for NotificationResponse before parsing into BackendMessage,
+            // because we need to extract owned data while we have exclusive access.
+            if msg_type == b'A' {
+                let msg = proto::parse_backend_message(msg_type, &self.read_buf)?;
+                if let BackendMessage::NotificationResponse {
+                    pid,
+                    channel,
+                    payload,
+                } = msg
+                {
+                    // Extract owned data before releasing the borrow on self.read_buf.
+                    let pid_owned = pid;
+                    let channel_owned = channel.to_owned();
+                    let payload_owned = payload.to_owned();
+                    self.buffer_notification(pid_owned, &channel_owned, &payload_owned);
+                    continue; // read next message
+                }
+            }
+            return proto::parse_backend_message(msg_type, &self.read_buf);
+        }
     }
 
     /// Read messages until we find one matching `pred`, erroring on ErrorResponse.
@@ -1331,10 +1526,9 @@ impl Connection {
                     self.drain_to_ready().await?;
                     return Err(self.make_server_error(fields));
                 }
-                BackendMessage::NoticeResponse { .. }
-                | BackendMessage::ParameterStatus { .. }
-                | BackendMessage::NotificationResponse { .. } => {
+                BackendMessage::NoticeResponse { .. } | BackendMessage::ParameterStatus { .. } => {
                     // Asynchronous messages — skip them
+                    // (NotificationResponse is auto-buffered by read_one_message)
                 }
                 other => {
                     return Err(DriverError::Protocol(format!(
@@ -1354,9 +1548,7 @@ impl Connection {
                     self.tx_status = status;
                     return Ok(());
                 }
-                BackendMessage::NoticeResponse { .. }
-                | BackendMessage::ParameterStatus { .. }
-                | BackendMessage::NotificationResponse { .. } => {}
+                BackendMessage::NoticeResponse { .. } | BackendMessage::ParameterStatus { .. } => {}
                 BackendMessage::ErrorResponse { data } => {
                     let fields = proto::parse_error_response(data);
                     // Continue draining until ReadyForQuery
@@ -1398,6 +1590,7 @@ impl Connection {
             message: fields.message.into_boxed_str(),
             detail: fields.detail.map(String::into_boxed_str),
             hint: fields.hint.map(String::into_boxed_str),
+            position: fields.position,
         }
     }
 
@@ -2179,5 +2372,55 @@ mod tests {
     fn config_invalid_port() {
         let result = Config::from_url("postgres://user:pass@localhost:notaport/db");
         assert!(result.is_err());
+    }
+
+    // --- Task 6: Notification buffering ---
+
+    #[test]
+    fn notification_struct_fields() {
+        let n = Notification {
+            pid: 42,
+            channel: "test_chan".to_owned(),
+            payload: "hello".to_owned(),
+        };
+        assert_eq!(n.pid, 42);
+        assert_eq!(n.channel, "test_chan");
+        assert_eq!(n.payload, "hello");
+    }
+
+    #[test]
+    fn notification_clone() {
+        let n = Notification {
+            pid: 1,
+            channel: "c".to_owned(),
+            payload: "p".to_owned(),
+        };
+        let n2 = n.clone();
+        assert_eq!(n2.pid, 1);
+        assert_eq!(n2.channel, "c");
+    }
+
+    #[test]
+    fn notification_debug() {
+        let n = Notification {
+            pid: 1,
+            channel: "c".to_owned(),
+            payload: "p".to_owned(),
+        };
+        let dbg = format!("{n:?}");
+        assert!(dbg.contains("Notification"));
+    }
+
+    // --- Task 7: Statement cache size ---
+
+    #[test]
+    fn stmt_info_has_last_used() {
+        let info = StmtInfo {
+            name: "s_test".into(),
+            columns: Arc::from(Vec::new()),
+            last_used: std::time::Instant::now(),
+        };
+        // Verify last_used is recent
+        assert!(info.last_used.elapsed().as_secs() < 1);
     }
 }

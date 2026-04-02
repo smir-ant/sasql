@@ -11,6 +11,7 @@ pub mod error;
 pub mod executor;
 pub mod listener;
 pub mod pool;
+pub mod singleflight;
 #[cfg(feature = "sqlite")]
 pub mod sqlite_pool;
 pub mod stream;
@@ -57,7 +58,7 @@ pub use executor::Executor;
 pub use listener::{Listener, Notification};
 pub use pool::{Pool, PoolBuilder, PoolConnection, PoolStatus};
 #[cfg(feature = "sqlite")]
-pub use sqlite_pool::SqlitePool;
+pub use sqlite_pool::{SqlitePool, SqliteStreamingQuery, SqliteTransaction};
 pub use stream::QueryStream;
 pub use transaction::{IsolationLevel, Transaction};
 

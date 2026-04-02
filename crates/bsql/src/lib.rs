@@ -74,9 +74,9 @@ pub use bsql_core::pool::{Pool, PoolBuilder, PoolConnection, PoolStatus};
 pub use bsql_core::stream::QueryStream;
 pub use bsql_core::transaction::{IsolationLevel, Transaction};
 
-// SQLite pool
+// SQLite pool, transaction, and streaming
 #[cfg(feature = "sqlite")]
-pub use bsql_core::SqlitePool;
+pub use bsql_core::{SqlitePool, SqliteStreamingQuery, SqliteTransaction};
 
 // Re-export driver types used by generated code
 #[doc(hidden)]

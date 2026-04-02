@@ -150,6 +150,87 @@ Type-safe PG enum mapping. Only accepts the specific PostgreSQL enum type it was
 
 Migrations, admin panels, and multi-tenant dynamic tables are infrastructure — they don't belong in application business logic. bsql secures the 95% that does. For the remaining 5%, use `tokio-postgres` alongside bsql — two tools, each for its purpose.
 
+## SQLite Support
+
+bsql supports SQLite with the same compile-time validation guarantees as PostgreSQL. The same `query!` macro works for both backends -- the database URL determines which validator and codegen path is used.
+
+### Quick Start
+
+```toml
+[dependencies]
+bsql = { version = "0.14", features = ["sqlite"] }
+```
+
+```rust
+// Set the database URL (SQLite)
+// BSQL_DATABASE_URL=sqlite:./myapp.db
+
+let pool = bsql_core::SqlitePool::connect("./myapp.db")?;
+
+let user = bsql::query!(
+    "SELECT id, login, active FROM users WHERE id = $id: i64"
+).fetch_one(&pool).await?;
+// user.id: i64, user.login: String, user.active: bool
+```
+
+### URL Format
+
+- `sqlite:./relative/path` -- relative to `CARGO_MANIFEST_DIR`
+- `sqlite:///absolute/path` -- absolute path
+- `sqlite::memory:` -- in-memory database (for tests)
+
+### Feature Flags
+
+| Feature | What it enables |
+|---------|----------------|
+| `sqlite` | SQLite backend (compile-time validation, pool, codegen) |
+| `time` | `DATETIME`/`TIMESTAMP` -> `time::PrimitiveDateTime`, `DATE` -> `time::Date`, `TIME` -> `time::Time` |
+| `chrono` | Same as `time` but with `chrono::NaiveDateTime`, `chrono::NaiveDate`, `chrono::NaiveTime` |
+| `uuid` | `UUID` columns -> `uuid::Uuid` (stored as TEXT in SQLite) |
+| `decimal` | `DECIMAL`/`NUMERIC` columns -> `rust_decimal::Decimal` (stored as TEXT in SQLite) |
+
+### Dynamic Queries and Sort Enums
+
+Optional clauses and sort enums work identically to PostgreSQL:
+
+```rust
+// Dynamic query: optional WHERE clauses
+let tickets = bsql::query!(
+    "SELECT id, title FROM tickets WHERE deleted_at IS NULL
+     [AND department_id = $dept: Option<i64>]
+     [AND assignee_id = $assignee: Option<i64>]"
+).fetch_all(&pool).await?;
+
+// Sort enum
+let tickets = bsql::query!(
+    "SELECT id, title FROM tickets ORDER BY $[sort: TicketSort] LIMIT $limit: i64"
+).fetch_all(&pool).await?;
+```
+
+### Transactions
+
+```rust
+let tx = pool.begin().await?;
+// Execute queries within the transaction...
+tx.savepoint("sp1").await?;
+// More queries...
+tx.rollback_to("sp1").await?;
+tx.commit().await?;
+```
+
+### SQLite Configuration
+
+bsql automatically configures SQLite for optimal performance:
+
+- **WAL mode** -- concurrent readers, non-blocking reads
+- **256 MB mmap** -- memory-mapped I/O for fast reads
+- **64 MB cache** -- large page cache
+- **STRICT tables** -- recommended for type safety (bsql validates against declared types)
+- **`busy_timeout = 0`** -- fail-fast per CREDO #17 (no silent waiting)
+- **Foreign keys ON** -- enforced by default
+
+The pool uses a single writer thread + N reader threads (default 4), communicating via crossbeam channels. No tokio dependency in the driver layer.
+
 ## About the Development Process
 
 Built with [Claude Code](https://claude.ai/code). Specifications and 17 design principles written before the first line of code. Multiple rounds of architectural audit. Unit, integration, and compile-fail tests proving not just that the code works, but that broken code is rejected.
