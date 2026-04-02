@@ -61,7 +61,9 @@ jobs:
         run: cargo test --doc --features "time,uuid,decimal,chrono"
 
       - name: Check no warnings
-        run: cargo check --workspace --features "time,uuid,decimal,chrono" 2>&1 | grep -v "dead_code\|unused" | grep "warning" && exit 1 || true
+        run: cargo check --workspace --features "time,uuid,decimal,chrono"
+        env:
+          RUSTFLAGS: "-D warnings"
 
   clippy:
     name: Clippy

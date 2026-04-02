@@ -20,6 +20,9 @@ pub fn normalize_sql(sql: &str) -> String {
     let bytes = sql.as_bytes();
     let len = bytes.len();
     let mut i = 0;
+    // Track whether the last character pushed was a space, avoiding
+    // repeated O(n) `out.ends_with(' ')` scans.
+    let mut last_was_space = false;
 
     while i < len {
         let b = bytes[i];
@@ -50,8 +53,9 @@ pub fn normalize_sql(sql: &str) -> String {
                 }
                 i += 1;
             }
-            if !out.is_empty() && !out.ends_with(' ') {
+            if !out.is_empty() && !last_was_space {
                 out.push(' ');
+                last_was_space = true;
             }
             continue;
         }
@@ -72,6 +76,7 @@ pub fn normalize_sql(sql: &str) -> String {
                 i += 1;
             }
             out.push_str(&sql[start..i]);
+            last_was_space = false;
             continue;
         }
 
@@ -92,6 +97,7 @@ pub fn normalize_sql(sql: &str) -> String {
                 i += 1;
             }
             out.push_str(&sql[start..i]);
+            last_was_space = false;
             continue;
         }
 
@@ -100,14 +106,16 @@ pub fn normalize_sql(sql: &str) -> String {
             if let Some((_tag, end)) = find_dollar_quote(bytes, i) {
                 out.push_str(&sql[i..end]);
                 i = end;
+                last_was_space = false;
                 continue;
             }
         }
 
         // Whitespace: collapse to single space
         if b.is_ascii_whitespace() {
-            if !out.is_empty() && !out.ends_with(' ') {
+            if !out.is_empty() && !last_was_space {
                 out.push(' ');
+                last_was_space = true;
             }
             i += 1;
             while i < len && bytes[i].is_ascii_whitespace() {
@@ -118,11 +126,12 @@ pub fn normalize_sql(sql: &str) -> String {
 
         // Outside string literals, SQL is ASCII — lowercase safely
         out.push((b as char).to_ascii_lowercase());
+        last_was_space = false;
         i += 1;
     }
 
     // Trim trailing space
-    if out.ends_with(' ') {
+    if last_was_space {
         out.pop();
     }
 

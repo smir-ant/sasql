@@ -410,10 +410,16 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
     let limited_sql_lit = &limited_sql;
     let limited_sql_hash_val = bsql_core::rapid_hash_str(&limited_sql);
 
+    // Cache row decode once, reuse for all methods (F-27)
+    let row_decode = if has_columns {
+        gen_row_decode(validation)
+    } else {
+        TokenStream::new()
+    };
+
     let fetch_methods = if has_columns {
         let result_name = result_struct_name(parsed);
         let stream_name = stream_struct_name(parsed);
-        let row_decode = gen_row_decode(validation);
 
         quote! {
             pub async fn fetch_one<E: ::bsql_core::Executor>(
@@ -469,44 +475,11 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
         TokenStream::new()
     };
 
+    // Use extracted gen_stream_struct (F-26)
     let stream_struct = if has_columns {
         let result_name = result_struct_name(parsed);
         let stream_name = stream_struct_name(parsed);
-        let row_decode = gen_row_decode(validation);
-
-        quote! {
-            #[allow(non_camel_case_types)]
-            pub struct #stream_name {
-                inner: ::bsql_core::QueryStream,
-            }
-
-            #[allow(non_camel_case_types)]
-            impl #stream_name {
-                /// Get the next typed row, or `None` when all rows have been consumed.
-                ///
-                /// Fetches the next chunk from PG when the current chunk is exhausted
-                /// (true streaming via `Execute(max_rows=64)`).
-                pub async fn next(&mut self) -> ::bsql_core::BsqlResult<Option<#result_name>> {
-                    // Try the current chunk first
-                    if let Some(row) = self.inner.next_row() {
-                        return Ok(Some(#result_name { #row_decode }));
-                    }
-                    // Current chunk exhausted — fetch next from PG
-                    if !self.inner.fetch_next_chunk().await? {
-                        return Ok(None);
-                    }
-                    match self.inner.next_row() {
-                        Some(row) => Ok(Some(#result_name { #row_decode })),
-                        None => Ok(None),
-                    }
-                }
-
-                /// Number of remaining rows in the current chunk.
-                pub fn remaining(&self) -> usize {
-                    self.inner.remaining()
-                }
-            }
-        }
+        gen_stream_struct(&result_name, &stream_name, &row_decode)
     } else {
         TokenStream::new()
     };
@@ -538,22 +511,21 @@ fn gen_dynamic_executor_struct(parsed: &ParsedQuery) -> TokenStream {
     let struct_name = executor_struct_name(parsed);
 
     let mut fields: Vec<TokenStream> = Vec::new();
-    let mut seen_names: Vec<String> = Vec::new();
+    let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for p in &parsed.params {
         let name = param_ident(&p.name);
         let ty = inject_lifetime(&p.rust_type);
         fields.push(quote! { #name: #ty });
-        seen_names.push(p.name.clone());
+        seen_names.insert(p.name.clone());
     }
 
     for clause in &parsed.optional_clauses {
         for p in &clause.params {
-            if !seen_names.contains(&p.name) {
+            if seen_names.insert(p.name.clone()) {
                 let name = param_ident(&p.name);
                 let ty = inject_lifetime(&p.rust_type);
                 fields.push(quote! { #name: #ty });
-                seen_names.push(p.name.clone());
             }
         }
     }
@@ -584,10 +556,16 @@ fn gen_dynamic_executor_impls(
         quote! { query_raw }
     };
 
+    // Cache row decode once, reuse for fetch methods + stream struct (F-27)
+    let row_decode = if has_columns {
+        gen_row_decode(validation)
+    } else {
+        TokenStream::new()
+    };
+
     let fetch_methods = if has_columns {
         let result_name = result_struct_name(parsed);
         let stream_name = stream_struct_name(parsed);
-        let row_decode = gen_row_decode(validation);
 
         let needs_limit = has_columns
             && is_select
@@ -681,39 +659,11 @@ fn gen_dynamic_executor_impls(
         TokenStream::new()
     };
 
+    // Use extracted gen_stream_struct (F-26)
     let stream_struct = if has_columns {
         let result_name = result_struct_name(parsed);
         let stream_name = stream_struct_name(parsed);
-        let row_decode = gen_row_decode(validation);
-
-        quote! {
-            #[allow(non_camel_case_types)]
-            pub struct #stream_name {
-                inner: ::bsql_core::QueryStream,
-            }
-
-            #[allow(non_camel_case_types)]
-            impl #stream_name {
-                /// Get the next typed row, or `None` when all rows have been consumed.
-                pub async fn next(&mut self) -> ::bsql_core::BsqlResult<Option<#result_name>> {
-                    if let Some(row) = self.inner.next_row() {
-                        return Ok(Some(#result_name { #row_decode }));
-                    }
-                    if !self.inner.fetch_next_chunk().await? {
-                        return Ok(None);
-                    }
-                    match self.inner.next_row() {
-                        Some(row) => Ok(Some(#result_name { #row_decode })),
-                        None => Ok(None),
-                    }
-                }
-
-                /// Number of remaining rows in the current chunk.
-                pub fn remaining(&self) -> usize {
-                    self.inner.remaining()
-                }
-            }
-        }
+        gen_stream_struct(&result_name, &stream_name, &row_decode)
     } else {
         TokenStream::new()
     };
@@ -823,23 +773,62 @@ fn gen_dynamic_constructor(parsed: &ParsedQuery) -> TokenStream {
     let executor_name = executor_struct_name(parsed);
 
     let mut field_names: Vec<proc_macro2::Ident> = Vec::new();
-    let mut seen: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for p in &parsed.params {
         field_names.push(param_ident(&p.name));
-        seen.push(p.name.clone());
+        seen.insert(p.name.clone());
     }
 
     for clause in &parsed.optional_clauses {
         for p in &clause.params {
-            if !seen.contains(&p.name) {
+            if seen.insert(p.name.clone()) {
                 field_names.push(param_ident(&p.name));
-                seen.push(p.name.clone());
             }
         }
     }
 
     quote! { #executor_name { #(#field_names,)* _marker: ::std::marker::PhantomData } }
+}
+
+/// Generate the stream struct and its `next()` / `remaining()` methods.
+/// Shared by static, dynamic, and sort codegen paths.
+fn gen_stream_struct(
+    result_name: &proc_macro2::Ident,
+    stream_name: &proc_macro2::Ident,
+    row_decode: &TokenStream,
+) -> TokenStream {
+    quote! {
+        #[allow(non_camel_case_types)]
+        pub struct #stream_name {
+            inner: ::bsql_core::QueryStream,
+        }
+
+        #[allow(non_camel_case_types)]
+        impl #stream_name {
+            /// Get the next typed row, or `None` when all rows have been consumed.
+            ///
+            /// Fetches the next chunk from PG when the current chunk is exhausted
+            /// (true streaming via `Execute(max_rows=64)`).
+            pub async fn next(&mut self) -> ::bsql_core::BsqlResult<Option<#result_name>> {
+                if let Some(row) = self.inner.next_row() {
+                    return Ok(Some(#result_name { #row_decode }));
+                }
+                if !self.inner.fetch_next_chunk().await? {
+                    return Ok(None);
+                }
+                match self.inner.next_row() {
+                    Some(row) => Ok(Some(#result_name { #row_decode })),
+                    None => Ok(None),
+                }
+            }
+
+            /// Number of remaining rows in the current chunk.
+            pub fn remaining(&self) -> usize {
+                self.inner.remaining()
+            }
+        }
+    }
 }
 
 /// Generate row field decoding using typed getters from bsql_driver::Row.
@@ -907,9 +896,9 @@ fn gen_decode_match(idx: usize, type_name: &str, decode_expr: TokenStream) -> To
         match #decode_expr {
             Ok(v) => v,
             Err(_) => return Err(::bsql_core::BsqlError::Decode(::bsql_core::error::DecodeError {
-                column: #col_idx.into(),
+                column: ::std::borrow::Cow::Borrowed(#col_idx),
                 expected: #type_name,
-                actual: "undecoded bytes".into(),
+                actual: ::std::borrow::Cow::Borrowed("undecoded bytes"),
             })),
         }
     }
@@ -958,7 +947,10 @@ fn gen_feature_gated_decode(idx: usize, rust_type: &str) -> TokenStream {
                 )
             },
         ),
-        "::chrono::DateTime<chrono::Utc>" | "chrono::DateTime<chrono::Utc>" => gen_decode_match(
+        "::chrono::DateTime<::chrono::Utc>"
+        | "::chrono::DateTime<chrono::Utc>"
+        | "chrono::DateTime<chrono::Utc>"
+        | "chrono::DateTime<Utc>" => gen_decode_match(
             idx,
             "timestamptz",
             quote! {

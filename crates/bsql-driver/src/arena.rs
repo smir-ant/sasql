@@ -79,6 +79,9 @@ impl Arena {
         let new_len = start + len;
 
         // Extend the chunk's length (capacity is guaranteed by ensure_capacity)
+        // vec![0u8; N].resize(N, 0) zeroes new bytes. This is the cost of safe
+        // Rust — the kernel already zeroes mmap'd pages, so the real overhead is
+        // only on reused capacity. Cannot avoid without unsafe.
         if new_len > chunk.len() {
             chunk.resize(new_len, 0);
         }
@@ -230,7 +233,7 @@ impl Arena {
     }
 
     /// Compute the global offset for the current position.
-    fn global_offset(&self) -> usize {
+    pub fn global_offset(&self) -> usize {
         self.global_offset_at(self.current, self.offset)
     }
 
@@ -246,6 +249,7 @@ impl Arena {
         // Binary search: find the last chunk whose prefix_sum <= global_offset
         let idx = match self.prefix_sums.binary_search(&global_offset) {
             Ok(i) => i,
+            Err(0) => 0, // guard against underflow when global_offset < prefix_sums[0]
             Err(i) => i - 1,
         };
         let local = global_offset - self.prefix_sums[idx];
@@ -521,5 +525,14 @@ mod tests {
         // After reset, alloc should work correctly with rebuilt prefix_sums
         let o = arena.alloc_copy(b"after reset");
         assert_eq!(arena.get(o, 11), b"after reset");
+    }
+
+    /// T-01: resolve_offset with global_offset=0 must return (0, 0)
+    #[test]
+    fn resolve_offset_zero() {
+        let arena = Arena::new();
+        let (chunk_idx, local) = arena.resolve_offset(0);
+        assert_eq!(chunk_idx, 0);
+        assert_eq!(local, 0);
     }
 }

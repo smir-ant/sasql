@@ -21,8 +21,20 @@ pub fn levenshtein(a: &str, b: &str) -> usize {
     let a_bytes = a.as_bytes();
     let b_bytes = b.as_bytes();
 
-    // Previous row of distances
-    let mut prev: Vec<usize> = (0..=a_len).collect();
+    // Use a fixed stack array for the DP row. Column/table names are
+    // practically never >127 chars. Fall back to Vec for longer inputs.
+    const STACK_SIZE: usize = 128;
+    let mut stack_buf = [0usize; STACK_SIZE];
+    let mut heap_buf;
+    let prev: &mut [usize] = if a_len < STACK_SIZE {
+        &mut stack_buf[..=a_len]
+    } else {
+        heap_buf = vec![0usize; a_len + 1];
+        &mut heap_buf
+    };
+    for (i, slot) in prev.iter_mut().enumerate() {
+        *slot = i;
+    }
 
     for j in 1..=b_len {
         let mut prev_diag = prev[0];

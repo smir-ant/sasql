@@ -118,7 +118,7 @@ impl Pool {
             .map_err(BsqlError::from)?;
 
         let num_cols = columns.len();
-        let mut all_col_offsets: Vec<(usize, i32)> =
+        let mut all_col_offsets: Vec<(u32, i32)> =
             Vec::with_capacity(num_cols * CHUNK_SIZE as usize);
 
         let more = guard
@@ -148,6 +148,14 @@ impl Pool {
         PoolStatus {
             size: self.inner.open_count(),
             max_size: self.inner.max_size(),
+        }
+    }
+}
+
+impl Clone for Pool {
+    fn clone(&self) -> Self {
+        Pool {
+            inner: self.inner.clone(),
         }
     }
 }

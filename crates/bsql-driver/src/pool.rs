@@ -55,7 +55,10 @@ struct PoolInner {
     /// When a new connection is created, these are pre-prepared via the
     /// extended query protocol before the connection is returned. This
     /// eliminates Parse overhead on first use.
-    warmup_sqls: std::sync::RwLock<Arc<[Box<str>]>>,
+    ///
+    /// Uses Mutex instead of RwLock: reads are rare (only on new connection
+    /// creation) and writes are rarer. Mutex has lower overhead.
+    warmup_sqls: std::sync::Mutex<Arc<[Box<str>]>>,
 }
 
 impl Pool {
@@ -173,7 +176,7 @@ impl Pool {
         let sqls = self
             .inner
             .warmup_sqls
-            .read()
+            .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
 
@@ -219,7 +222,7 @@ impl Pool {
         *self
             .inner
             .warmup_sqls
-            .write()
+            .lock()
             .unwrap_or_else(|e| e.into_inner()) = boxed;
     }
 }
@@ -277,7 +280,7 @@ impl PoolBuilder {
                 open_count: AtomicUsize::new(0),
                 config,
                 connecting: Notify::new(),
-                warmup_sqls: std::sync::RwLock::new(Arc::from(Vec::<Box<str>>::new())),
+                warmup_sqls: std::sync::Mutex::new(Arc::from(Vec::<Box<str>>::new())),
             }),
         })
     }

@@ -6,10 +6,33 @@
 //! only Bind+Execute+Sync are sent.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
 use rapidhash::quality::RapidHasher;
-use std::hash::Hasher;
+
+/// Identity hasher for pre-hashed u64 keys. Avoids SipHash overhead
+/// on keys that are already well-distributed rapidhash values.
+#[derive(Default)]
+struct IdentityHasher(u64);
+
+impl Hasher for IdentityHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = i;
+    }
+    #[inline]
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("IdentityHasher only supports u64 keys")
+    }
+}
+
+type IdentityBuildHasher = BuildHasherDefault<IdentityHasher>;
+type StmtCache = HashMap<u64, StmtInfo, IdentityBuildHasher>;
 
 use tokio::io::{AsyncRead, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -241,6 +264,12 @@ enum StartupAction {
 
 // --- Statement cache ---
 
+/// Format a statement name from a hash: `"s_{hash:016x}"`.
+#[inline]
+fn make_stmt_name(hash: u64) -> Box<str> {
+    format!("s_{hash:016x}").into_boxed_str()
+}
+
 /// Cached information about a prepared statement.
 ///
 /// The statement name is a 64-bit rapidhash formatted as `"s_{hash:016x}"`.
@@ -285,8 +314,8 @@ pub struct Connection {
     /// One past the last valid byte in `stream_buf`.
     stream_buf_end: usize,
     write_buf: Vec<u8>,
-    stmts: HashMap<u64, StmtInfo>,
-    params: HashMap<Box<str>, Box<str>>,
+    stmts: StmtCache,
+    params: Vec<(Box<str>, Box<str>)>,
     pid: i32,
     secret: i32,
     tx_status: u8,
@@ -299,8 +328,8 @@ pub struct Connection {
 impl Connection {
     /// Connect to PostgreSQL and complete the startup/auth handshake.
     pub async fn connect(config: &Config) -> Result<Self, DriverError> {
-        config.validate()?;
-
+        // Config::from_url() already validates. Manual Config construction
+        // should call validate() explicitly before passing to connect().
         let addr = format!("{}:{}", config.host, config.port);
         let tcp = TcpStream::connect(&addr).await.map_err(DriverError::Io)?;
 
@@ -339,8 +368,8 @@ impl Connection {
             stream_buf_pos: 0,
             stream_buf_end: 0,
             write_buf: Vec::with_capacity(4096),
-            stmts: HashMap::new(),
-            params: HashMap::new(),
+            stmts: StmtCache::default(),
+            params: Vec::new(),
             pid: 0,
             secret: 0,
             tx_status: b'I',
@@ -393,7 +422,12 @@ impl Connection {
                     self.handle_scram(config, &mechanisms_data).await?;
                 }
                 StartupAction::ParameterStatus(name, value) => {
-                    self.params.insert(name, value);
+                    // Linear scan on ~10 entries is faster than HashMap
+                    if let Some(entry) = self.params.iter_mut().find(|(k, _)| *k == name) {
+                        entry.1 = value;
+                    } else {
+                        self.params.push((name, value));
+                    }
                 }
                 StartupAction::BackendKeyData(pid, secret) => {
                     self.pid = pid;
@@ -542,7 +576,7 @@ impl Connection {
         if self.stmts.contains_key(&sql_hash) {
             return Ok(());
         }
-        let name = format!("s_{sql_hash:016x}").into_boxed_str();
+        let name = make_stmt_name(sql_hash);
         self.write_buf.clear();
         proto::write_parse(&mut self.write_buf, &name, sql, &[]);
         proto::write_describe(&mut self.write_buf, b'S', &name);
@@ -588,8 +622,9 @@ impl Connection {
         self.write_buf.clear();
 
         let new_name = if !cached {
-            let name = format!("s_{sql_hash:016x}").into_boxed_str();
-            let param_oids: Vec<u32> = params.iter().map(|p| p.type_oid()).collect();
+            let name = make_stmt_name(sql_hash);
+            let param_oids: smallvec::SmallVec<[u32; 8]> =
+                params.iter().map(|p| p.type_oid()).collect();
             proto::write_parse(&mut self.write_buf, &name, sql, &param_oids);
             proto::write_describe(&mut self.write_buf, b'S', &name);
             proto::write_bind_params(&mut self.write_buf, "", &name, params);
@@ -639,7 +674,7 @@ impl Connection {
     pub async fn streaming_next_chunk(
         &mut self,
         arena: &mut Arena,
-        all_col_offsets: &mut Vec<(usize, i32)>,
+        all_col_offsets: &mut Vec<(u32, i32)>,
     ) -> Result<bool, DriverError> {
         all_col_offsets.clear();
 
@@ -724,8 +759,9 @@ impl Connection {
 
         // Compute statement name once, reuse for write + cache insert.
         let new_name = if !cached {
-            let name = format!("s_{sql_hash:016x}").into_boxed_str();
-            let param_oids: Vec<u32> = params.iter().map(|p| p.type_oid()).collect();
+            let name = make_stmt_name(sql_hash);
+            let param_oids: smallvec::SmallVec<[u32; 8]> =
+                params.iter().map(|p| p.type_oid()).collect();
             proto::write_parse(&mut self.write_buf, &name, sql, &param_oids);
             proto::write_describe(&mut self.write_buf, b'S', &name);
             proto::write_bind_params(&mut self.write_buf, "", &name, params);
@@ -767,7 +803,7 @@ impl Connection {
         // Flat column offsets: all rows' columns are stored contiguously in
         // `all_col_offsets`. Row N starts at index `N * num_cols`.
         let num_cols = columns.len();
-        let mut all_col_offsets: Vec<(usize, i32)> = Vec::with_capacity(num_cols * 64);
+        let mut all_col_offsets: Vec<(u32, i32)> = Vec::with_capacity(num_cols * 64);
         let mut affected_rows: u64 = 0;
 
         loop {
@@ -820,16 +856,8 @@ impl Connection {
             let msg = self.read_one_message().await?;
             match msg {
                 BackendMessage::RowDescription { data } => {
-                    let col_infos = proto::parse_row_description(data)?;
-                    return Ok(col_infos
-                        .into_iter()
-                        .map(|c| ColumnDesc {
-                            name: c.name,
-                            type_oid: c.type_oid,
-                            type_size: c.type_size,
-                        })
-                        .collect::<Vec<_>>()
-                        .into());
+                    let cols = proto::parse_row_description(data)?;
+                    return Ok(cols.into());
                 }
                 BackendMessage::ParameterDescription { .. } => {
                     // ParameterDescription precedes RowDescription — continue reading
@@ -867,8 +895,9 @@ impl Connection {
         self.write_buf.clear();
 
         let new_name = if !cached {
-            let name = format!("s_{sql_hash:016x}").into_boxed_str();
-            let param_oids: Vec<u32> = params.iter().map(|p| p.type_oid()).collect();
+            let name = make_stmt_name(sql_hash);
+            let param_oids: smallvec::SmallVec<[u32; 8]> =
+                params.iter().map(|p| p.type_oid()).collect();
             proto::write_parse(&mut self.write_buf, &name, sql, &param_oids);
             proto::write_describe(&mut self.write_buf, b'S', &name);
             proto::write_bind_params(&mut self.write_buf, "", &name, params);
@@ -1029,7 +1058,10 @@ impl Connection {
 
     /// Get a server parameter value (set during startup or via SET).
     pub fn parameter(&self, name: &str) -> Option<&str> {
-        self.params.get(name).map(|s| &**s)
+        self.params
+            .iter()
+            .find(|(k, _)| &**k == name)
+            .map(|(_, v)| &**v)
     }
 
     /// Backend process ID (for cancel requests).
@@ -1048,7 +1080,7 @@ impl Connection {
             self.read_buf = Vec::with_capacity(8192);
         }
         if self.write_buf.capacity() > 16 * 1024 {
-            self.write_buf = Vec::with_capacity(4096);
+            self.write_buf = Vec::with_capacity(8192);
         }
     }
 
@@ -1133,7 +1165,7 @@ impl Connection {
     /// Convert parsed ErrorFields into a DriverError::Server.
     fn make_server_error(&self, fields: proto::ErrorFields) -> DriverError {
         DriverError::Server {
-            code: fields.code.into_boxed_str(),
+            code: fields.code,
             message: fields.message.into_boxed_str(),
             detail: fields.detail.map(String::into_boxed_str),
             hint: fields.hint.map(String::into_boxed_str),
@@ -1278,7 +1310,7 @@ async fn buffered_read_exact(
 pub struct QueryResult {
     /// All rows' column (arena_offset, length) pairs, contiguous.
     /// length = -1 means NULL.
-    all_col_offsets: Vec<(usize, i32)>,
+    all_col_offsets: Vec<(u32, i32)>,
     /// Number of columns per row.
     num_cols: usize,
     columns: Arc<[ColumnDesc]>,
@@ -1290,7 +1322,7 @@ impl QueryResult {
     ///
     /// Used by `bsql-core`'s streaming layer to assemble per-chunk results.
     pub fn from_parts(
-        all_col_offsets: Vec<(usize, i32)>,
+        all_col_offsets: Vec<(u32, i32)>,
         num_cols: usize,
         columns: Arc<[ColumnDesc]>,
         affected_rows: u64,
@@ -1341,7 +1373,7 @@ impl QueryResult {
     ///
     /// Used by `QueryStream` to reclaim and reuse the allocation between chunks
     /// instead of allocating a new `Vec` per chunk.
-    pub fn take_col_offsets(&mut self) -> Vec<(usize, i32)> {
+    pub fn take_col_offsets(&mut self) -> Vec<(u32, i32)> {
         std::mem::take(&mut self.all_col_offsets)
     }
 
@@ -1369,7 +1401,7 @@ impl QueryResult {
 /// sends correctly-sized data for the declared type.
 pub struct Row<'a> {
     arena: &'a Arena,
-    col_offsets: &'a [(usize, i32)],
+    col_offsets: &'a [(u32, i32)],
     columns: &'a [ColumnDesc],
 }
 
@@ -1380,7 +1412,7 @@ impl<'a> Row<'a> {
         if len < 0 {
             None
         } else {
-            Some(self.arena.get(offset, len as usize))
+            Some(self.arena.get(offset as usize, len as usize))
         }
     }
 
@@ -1463,7 +1495,7 @@ impl<'a> Row<'a> {
 fn parse_data_row_flat(
     data: &[u8],
     arena: &mut Arena,
-    out: &mut Vec<(usize, i32)>,
+    out: &mut Vec<(u32, i32)>,
 ) -> Result<(), DriverError> {
     if data.len() < 2 {
         return Err(DriverError::Protocol("DataRow too short".into()));
@@ -1493,7 +1525,7 @@ fn parse_data_row_flat(
             }
 
             let offset = arena.alloc_copy(&data[pos..pos + len]);
-            out.push((offset, col_len));
+            out.push((offset as u32, col_len));
             pos += len;
         }
     }
@@ -1659,5 +1691,12 @@ mod tests {
         // %2Z — 'Z' is not a valid hex digit
         let result = url_decode("abc%2Z");
         assert!(result.is_err(), "%2Z should error");
+    }
+
+    /// T-02: url_decode with multi-byte UTF-8 (%C3%A9 -> e with acute)
+    #[test]
+    fn url_decode_multibyte_utf8() {
+        let result = url_decode("caf%C3%A9").unwrap();
+        assert_eq!(result, "caf\u{00e9}"); // cafe with accent
     }
 }

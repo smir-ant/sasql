@@ -19,6 +19,7 @@ decimal = ["dep:rust_decimal"]
 tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "time"] }
 rapidhash = { workspace = true }
 simdutf8 = { version = "0.1", default-features = false, features = ["std"] }
+smallvec = { workspace = true }
 
 # Auth
 sha2 = { version = "0.10", default-features = false }

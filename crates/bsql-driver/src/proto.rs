@@ -528,21 +528,13 @@ fn read_cstring(data: &[u8], offset: usize) -> Result<&str, DriverError> {
 
 // --- RowDescription parsing ---
 
-/// A single column descriptor parsed from a RowDescription message.
-#[derive(Debug, Clone)]
-pub struct ColumnInfo {
-    pub name: Box<str>,
-    pub type_oid: u32,
-    pub type_size: i16,
-    #[allow(dead_code)]
-    pub format: i16,
-}
-
 /// Parse a RowDescription payload into column descriptors.
+///
+/// Returns `Vec<ColumnDesc>` directly — no intermediate `ColumnInfo` type.
 ///
 /// Format: `[num_fields: i16] ([name\0] [table_oid: i32] [col_attr: i16]
 ///           [type_oid: i32] [type_size: i16] [type_mod: i32] [format: i16])...`
-pub fn parse_row_description(data: &[u8]) -> Result<Vec<ColumnInfo>, DriverError> {
+pub fn parse_row_description(data: &[u8]) -> Result<Vec<crate::conn::ColumnDesc>, DriverError> {
     if data.len() < 2 {
         return Err(DriverError::Protocol("RowDescription too short".into()));
     }
@@ -570,17 +562,13 @@ pub fn parse_row_description(data: &[u8]) -> Result<Vec<ColumnInfo>, DriverError
         let type_size = i16::from_be_bytes([data[pos], data[pos + 1]]);
         pos += 2;
 
-        // type_mod (4), skip
-        pos += 4;
+        // type_mod (4) + format (2) = 6 bytes, skip
+        pos += 6;
 
-        let format = i16::from_be_bytes([data[pos], data[pos + 1]]);
-        pos += 2;
-
-        columns.push(ColumnInfo {
+        columns.push(crate::conn::ColumnDesc {
             name: name.into(),
             type_oid,
             type_size,
-            format,
         });
     }
 
@@ -593,8 +581,8 @@ pub fn parse_row_description(data: &[u8]) -> Result<Vec<ColumnInfo>, DriverError
 #[derive(Debug)]
 pub struct ErrorFields {
     #[allow(dead_code)]
-    pub severity: String,
-    pub code: String,
+    pub severity: Box<str>,
+    pub code: Box<str>,
     pub message: String,
     pub detail: Option<String>,
     pub hint: Option<String>,
@@ -617,8 +605,8 @@ impl fmt::Display for ErrorFields {
 ///
 /// Format: `([field_type: u8] [value\0])... [0x00]`
 pub fn parse_error_response(data: &[u8]) -> ErrorFields {
-    let mut severity = String::new();
-    let mut code = String::new();
+    let mut severity: Box<str> = Box::from("");
+    let mut code: Box<str> = Box::from("");
     let mut message = String::new();
     let mut detail = None;
     let mut hint = None;
@@ -641,8 +629,8 @@ pub fn parse_error_response(data: &[u8]) -> ErrorFields {
         };
 
         match field_type {
-            b'S' => severity = value.to_owned(),
-            b'C' => code = value.to_owned(),
+            b'S' => severity = Box::from(value),
+            b'C' => code = Box::from(value),
             b'M' => message = value.to_owned(),
             b'D' => detail = Some(value.to_owned()),
             b'H' => hint = Some(value.to_owned()),
@@ -885,8 +873,8 @@ mod tests {
         data.push(0);
 
         let fields = parse_error_response(&data);
-        assert_eq!(fields.severity, "ERROR");
-        assert_eq!(fields.code, "42P01");
+        assert_eq!(&*fields.severity, "ERROR");
+        assert_eq!(&*fields.code, "42P01");
         assert_eq!(fields.message, "relation does not exist");
         assert_eq!(fields.detail.as_deref(), Some("some detail"));
         assert_eq!(fields.hint.as_deref(), Some("some hint"));
@@ -912,7 +900,6 @@ mod tests {
         assert_eq!(&*cols[0].name, "id");
         assert_eq!(cols[0].type_oid, 23);
         assert_eq!(cols[0].type_size, 4);
-        assert_eq!(cols[0].format, 1);
     }
 
     #[test]

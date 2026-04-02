@@ -313,8 +313,8 @@ impl Encode for rust_decimal::Decimal {
         let abs = self.abs();
         let mut mantissa = abs.mantissa().unsigned_abs();
 
-        // Collect decimal digits
-        let mut decimal_digits = Vec::new();
+        // Collect decimal digits (max ~39 for u128, SmallVec caps at 32 inline)
+        let mut decimal_digits: smallvec::SmallVec<[i16; 32]> = smallvec::SmallVec::new();
         while mantissa > 0 {
             decimal_digits.push((mantissa % 10) as i16);
             mantissa /= 10;
@@ -341,12 +341,13 @@ impl Encode for rust_decimal::Decimal {
         let frac_len = total_digits - int_len;
         let frac_pad = (4 - (frac_len % 4)) % 4;
 
-        let mut padded = vec![0i16; int_pad];
+        let mut padded: smallvec::SmallVec<[i16; 32]> = smallvec::SmallVec::new();
+        padded.extend(std::iter::repeat(0i16).take(int_pad));
         padded.extend_from_slice(&decimal_digits);
         padded.extend(std::iter::repeat(0i16).take(frac_pad));
 
         // Group into base-10000 digits
-        let mut pg_digits = Vec::new();
+        let mut pg_digits: smallvec::SmallVec<[i16; 12]> = smallvec::SmallVec::new();
         for chunk in padded.chunks(4) {
             let d = chunk[0] * 1000 + chunk[1] * 100 + chunk[2] * 10 + chunk[3];
             pg_digits.push(d);
@@ -747,70 +748,68 @@ pub fn decode_numeric_decimal(data: &[u8]) -> Result<rust_decimal::Decimal, Driv
     }
 
     // Read digit values
-    let mut digits = Vec::with_capacity(ndigits);
+    let mut digits: smallvec::SmallVec<[i64; 16]> = smallvec::SmallVec::with_capacity(ndigits);
     for i in 0..ndigits {
         let off = 8 + i * 2;
         digits.push(i16::from_be_bytes([data[off], data[off + 1]]) as i64);
     }
 
-    // Build the string representation: integer part . fractional part
-    // The first digit has weight `weight` (units of 10^4).
-    // Digits with index <= weight contribute to the integer part.
-    // Digits with index > weight contribute to the fractional part.
-    let mut int_part = String::new();
-    let mut frac_part = String::new();
+    // Compute the value arithmetically: sum(digit[i] * 10^(4*(weight-i)))
+    // Build a u128 mantissa and track the scale (fractional digits).
+    let mut mantissa: u128 = 0;
+    for &d in &digits {
+        mantissa = mantissa
+            .checked_mul(10_000)
+            .and_then(|m| m.checked_add(d as u128))
+            .ok_or_else(|| DriverError::Protocol("numeric value too large for Decimal".into()))?;
+    }
 
-    for (i, &d) in digits.iter().enumerate() {
-        let idx = i as i32;
-        if idx <= weight {
-            // Integer part digit
-            if int_part.is_empty() {
-                // First group: no leading zeros
-                int_part.push_str(&d.to_string());
-            } else {
-                // Subsequent groups: always 4 digits (pad with leading zeros)
-                int_part.push_str(&format!("{d:04}"));
-            }
+    // The value with all digits is: mantissa * 10^(4 * (weight - ndigits + 1))
+    // If weight >= ndigits-1, we need to multiply by 10^(4*(weight - ndigits + 1))
+    // If weight < ndigits-1, we have fractional digits
+    let exponent = 4 * (weight - ndigits as i32 + 1);
+    let result = if exponent >= 0 {
+        // All integer: multiply mantissa by 10^exponent
+        let factor = 10u128
+            .checked_pow(exponent as u32)
+            .ok_or_else(|| DriverError::Protocol("numeric exponent too large".into()))?;
+        let m = mantissa
+            .checked_mul(factor)
+            .ok_or_else(|| DriverError::Protocol("numeric value too large for Decimal".into()))?;
+        if m > u128::from(u64::MAX) {
+            // Decimal max mantissa is 96 bits, fall back to string for huge values
+            let s = m.to_string();
+            s.parse::<rust_decimal::Decimal>()
+                .map_err(|e| DriverError::Protocol(format!("numeric parse error: {e}")))?
         } else {
-            // Fractional part digit: always 4 digits
-            frac_part.push_str(&format!("{d:04}"));
+            rust_decimal::Decimal::from_i128_with_scale(m as i128, 0)
         }
-    }
-
-    // If weight >= ndigits, the integer part needs trailing zeros
-    // (e.g., weight=2 with 1 digit means digit * 10^8)
-    for _ in ndigits as i32..=weight {
-        int_part.push_str("0000");
-    }
-
-    if int_part.is_empty() {
-        int_part.push('0');
-        // If weight < 0, we need leading fractional zeros
-        // weight=-1 means first digit is at 10^-4 position (no extra zeros needed)
-        // weight=-2 means first digit is at 10^-8 (4 leading fractional zeros)
-        for _ in 0..(-1 - weight) {
-            frac_part.insert_str(0, "0000");
-        }
-    }
-
-    // Trim trailing fractional zeros
-    let frac_trimmed = frac_part.trim_end_matches('0');
-
-    let s = if frac_trimmed.is_empty() {
-        int_part
     } else {
-        format!("{int_part}.{frac_trimmed}")
+        // Has fractional part: scale = -exponent
+        let scale = (-exponent) as u32;
+        // rust_decimal stores mantissa as 96-bit integer with scale
+        if mantissa <= u128::from(u64::MAX) {
+            rust_decimal::Decimal::from_i128_with_scale(mantissa as i128, scale)
+        } else {
+            // Large mantissa — use string fallback
+            let mut s = mantissa.to_string();
+            if scale as usize >= s.len() {
+                let zeros = scale as usize - s.len() + 1;
+                s = format!("0.{}{s}", "0".repeat(zeros));
+            } else {
+                let dot_pos = s.len() - scale as usize;
+                s.insert(dot_pos, '.');
+            }
+            s.parse::<rust_decimal::Decimal>()
+                .map_err(|e| DriverError::Protocol(format!("numeric parse error: {e}")))?
+        }
     };
 
-    let mut result: rust_decimal::Decimal = s
-        .parse()
-        .map_err(|e| DriverError::Protocol(format!("numeric parse error: {e} (from \"{s}\")")))?;
-
     if sign == 0x4000 {
-        result.set_sign_negative(true);
+        Ok(-result)
+    } else {
+        Ok(result)
     }
-
-    Ok(result)
 }
 
 #[cfg(test)]

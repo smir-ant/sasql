@@ -37,16 +37,16 @@ pub struct PoolError {
 pub struct QueryError {
     pub message: Cow<'static, str>,
     /// The five-character SQLSTATE code (e.g. `"23505"` for unique violation).
-    pub pg_code: Option<String>,
+    pub pg_code: Option<Box<str>>,
     pub(crate) source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
 /// Row/column decoding failure.
 #[derive(Debug)]
 pub struct DecodeError {
-    pub column: String,
+    pub column: Cow<'static, str>,
     pub expected: &'static str,
-    pub actual: String,
+    pub actual: Cow<'static, str>,
 }
 
 /// Initial connection failure.
@@ -81,7 +81,7 @@ impl fmt::Display for PoolError {
 impl fmt::Display for QueryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.pg_code {
-            Some(code) => write!(f, "[{code}] {}", self.message),
+            Some(code) => write!(f, "[{}] {}", &**code, self.message),
             None => f.write_str(&self.message),
         }
     }
@@ -165,18 +165,23 @@ impl From<bsql_driver::DriverError> for BsqlError {
                 detail,
                 hint,
             } => {
-                let mut msg = message.to_string();
-                if let Some(d) = &detail {
-                    msg.push_str("\n  detail: ");
-                    msg.push_str(d);
-                }
-                if let Some(h) = &hint {
-                    msg.push_str("\n  hint: ");
-                    msg.push_str(h);
-                }
+                let msg = if detail.is_some() || hint.is_some() {
+                    let mut s = String::from(&*message);
+                    if let Some(d) = &detail {
+                        s.push_str("\n  detail: ");
+                        s.push_str(d);
+                    }
+                    if let Some(h) = &hint {
+                        s.push_str("\n  hint: ");
+                        s.push_str(h);
+                    }
+                    Cow::Owned(s)
+                } else {
+                    Cow::Owned(String::from(message))
+                };
                 BsqlError::Query(QueryError {
-                    message: Cow::Owned(msg),
-                    pg_code: Some(code.to_string()),
+                    message: msg,
+                    pg_code: Some(code.into()),
                     source: None,
                 })
             }
@@ -246,7 +251,7 @@ mod tests {
     fn query_error_with_code_display() {
         let e = BsqlError::Query(QueryError {
             message: Cow::Borrowed("duplicate key"),
-            pg_code: Some("23505".into()),
+            pg_code: Some(Box::from("23505")),
             source: None,
         });
         assert_eq!(e.to_string(), "query error: [23505] duplicate key");
@@ -264,9 +269,9 @@ mod tests {
     #[test]
     fn decode_error_display() {
         let e = BsqlError::Decode(DecodeError {
-            column: "age".into(),
+            column: Cow::Borrowed("age"),
             expected: "i32",
-            actual: "text".into(),
+            actual: Cow::Borrowed("text"),
         });
         assert_eq!(
             e.to_string(),
@@ -392,9 +397,9 @@ mod tests {
     #[test]
     fn decode_error_has_no_source() {
         let e = BsqlError::Decode(DecodeError {
-            column: "col".into(),
+            column: Cow::Borrowed("col"),
             expected: "i32",
-            actual: "text".into(),
+            actual: Cow::Borrowed("text"),
         });
         assert!(e.source().is_none());
     }

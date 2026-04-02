@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 use crate::error::{BsqlError, BsqlResult, ConnectError};
 
 /// Buffer capacity for the notification channel.
-const NOTIFICATION_BUFFER_SIZE: usize = 10_000;
+const NOTIFICATION_BUFFER_SIZE: usize = 1024;
 
 /// A notification received from PostgreSQL via LISTEN/NOTIFY.
 #[derive(Debug, Clone)]

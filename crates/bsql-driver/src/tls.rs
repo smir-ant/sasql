@@ -3,13 +3,24 @@
 //! Sends SSLRequest to PostgreSQL, reads the single-byte response ('S' = upgrade,
 //! 'N' = no TLS), and upgrades the TCP stream to TLS if accepted.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::DriverError;
 use crate::proto;
+
+/// Cached TLS client config. Built once, reused for all connections.
+static TLS_CONFIG: LazyLock<Arc<rustls::ClientConfig>> = LazyLock::new(|| {
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth(),
+    )
+});
 
 /// Attempt TLS upgrade on a TCP connection.
 ///
@@ -40,8 +51,7 @@ pub async fn try_upgrade(
     match response[0] {
         b'S' => {
             // Server accepts TLS — perform handshake
-            let tls_config = build_tls_config()?;
-            let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+            let connector = tokio_rustls::TlsConnector::from(TLS_CONFIG.clone());
 
             let server_name =
                 rustls::pki_types::ServerName::try_from(host.to_owned()).map_err(|e| {
@@ -72,25 +82,15 @@ pub async fn try_upgrade(
     }
 }
 
-/// Build a rustls ClientConfig with WebPKI root certificates.
-fn build_tls_config() -> Result<rustls::ClientConfig, DriverError> {
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    let config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-
-    Ok(config)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn tls_config_builds() {
-        let config = build_tls_config();
-        assert!(config.is_ok());
+    fn tls_config_cached() {
+        // Verify the LazyLock TLS config is accessible and reusable
+        let c1 = TLS_CONFIG.clone();
+        let c2 = TLS_CONFIG.clone();
+        assert!(Arc::ptr_eq(&c1, &c2));
     }
 }
