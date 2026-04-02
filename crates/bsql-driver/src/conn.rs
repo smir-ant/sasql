@@ -764,6 +764,32 @@ impl Connection {
         }
     }
 
+    /// Block until a NotificationResponse arrives on this connection.
+    ///
+    /// Reads raw messages from the stream and skips everything except
+    /// `NotificationResponse`. Returns the `(channel, payload)` pair.
+    /// Used by the listener's background task to receive LISTEN/NOTIFY events.
+    ///
+    /// This method never returns `Ok` for non-notification messages -- it loops
+    /// internally, discarding `ParameterStatus`, `NoticeResponse`, etc.
+    pub async fn wait_for_notification(&mut self) -> Result<(String, String), DriverError> {
+        loop {
+            let (msg_type, _payload_len) = self.read_message_buffered().await?;
+            let msg = proto::parse_backend_message(msg_type, &self.read_buf)?;
+            match msg {
+                BackendMessage::NotificationResponse {
+                    channel, payload, ..
+                } => {
+                    return Ok((channel.to_owned(), payload.to_owned()));
+                }
+                BackendMessage::ParameterStatus { .. } | BackendMessage::NoticeResponse { .. } => {
+                    continue;
+                }
+                _ => continue,
+            }
+        }
+    }
+
     /// Send Terminate and close the connection.
     pub async fn close(mut self) -> Result<(), DriverError> {
         self.write_buf.clear();

@@ -180,6 +180,7 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
 
     let fetch_methods = if has_columns {
         let result_name = result_struct_name(parsed);
+        let stream_name = stream_struct_name(parsed);
         let row_decode = gen_row_decode(validation);
 
         quote! {
@@ -223,6 +224,43 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
                     )),
                 }
             }
+
+            pub async fn fetch_stream(
+                self,
+                pool: &::bsql_core::Pool,
+            ) -> ::bsql_core::BsqlResult<#stream_name> {
+                let inner = pool.query_stream(#sql_lit, #sql_hash_val, #params_slice).await?;
+                Ok(#stream_name { inner })
+            }
+        }
+    } else {
+        TokenStream::new()
+    };
+
+    let stream_struct = if has_columns {
+        let result_name = result_struct_name(parsed);
+        let stream_name = stream_struct_name(parsed);
+        let row_decode = gen_row_decode(validation);
+
+        quote! {
+            #[allow(non_camel_case_types)]
+            pub struct #stream_name {
+                inner: ::bsql_core::QueryStream,
+            }
+
+            #[allow(non_camel_case_types)]
+            impl #stream_name {
+                /// Get the next typed row, or `None` when all rows have been consumed.
+                pub fn next(&mut self) -> Option<#result_name> {
+                    let row = self.inner.next_row()?;
+                    Some(#result_name { #row_decode })
+                }
+
+                /// Number of remaining rows.
+                pub fn remaining(&self) -> usize {
+                    self.inner.remaining()
+                }
+            }
         }
     } else {
         TokenStream::new()
@@ -238,6 +276,8 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
     };
 
     quote! {
+        #stream_struct
+
         #[allow(non_camel_case_types)]
         impl<'_bsql> #executor_name<'_bsql> {
             #fetch_methods
@@ -301,6 +341,7 @@ fn gen_dynamic_executor_impls(
 
     let fetch_methods = if has_columns {
         let result_name = result_struct_name(parsed);
+        let stream_name = stream_struct_name(parsed);
         let row_decode = gen_row_decode(validation);
 
         let needs_limit = has_columns
@@ -350,6 +391,14 @@ fn gen_dynamic_executor_impls(
                 }
             });
 
+        let fetch_stream_dispatcher =
+            gen_variant_dispatcher(parsed, variants, false, |sql_lit, sql_hash| {
+                quote! {
+                    let inner = pool.query_stream(#sql_lit, #sql_hash, &params_slice[..]).await?;
+                    Ok(#stream_name { inner })
+                }
+            });
+
         quote! {
             pub async fn fetch_one<E: ::bsql_core::Executor>(
                 self,
@@ -370,6 +419,42 @@ fn gen_dynamic_executor_impls(
                 executor: &E,
             ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
                 #fetch_optional_dispatcher
+            }
+
+            pub async fn fetch_stream(
+                self,
+                pool: &::bsql_core::Pool,
+            ) -> ::bsql_core::BsqlResult<#stream_name> {
+                #fetch_stream_dispatcher
+            }
+        }
+    } else {
+        TokenStream::new()
+    };
+
+    let stream_struct = if has_columns {
+        let result_name = result_struct_name(parsed);
+        let stream_name = stream_struct_name(parsed);
+        let row_decode = gen_row_decode(validation);
+
+        quote! {
+            #[allow(non_camel_case_types)]
+            pub struct #stream_name {
+                inner: ::bsql_core::QueryStream,
+            }
+
+            #[allow(non_camel_case_types)]
+            impl #stream_name {
+                /// Get the next typed row, or `None` when all rows have been consumed.
+                pub fn next(&mut self) -> Option<#result_name> {
+                    let row = self.inner.next_row()?;
+                    Some(#result_name { #row_decode })
+                }
+
+                /// Number of remaining rows.
+                pub fn remaining(&self) -> usize {
+                    self.inner.remaining()
+                }
             }
         }
     } else {
@@ -393,6 +478,8 @@ fn gen_dynamic_executor_impls(
     };
 
     quote! {
+        #stream_struct
+
         #[allow(non_camel_case_types)]
         impl<'_bsql> #executor_name<'_bsql> {
             #fetch_methods
@@ -768,6 +855,10 @@ fn result_struct_name(parsed: &ParsedQuery) -> proc_macro2::Ident {
 
 fn executor_struct_name(parsed: &ParsedQuery) -> proc_macro2::Ident {
     format_ident!("BsqlExecutor_{}", &parsed.statement_name)
+}
+
+fn stream_struct_name(parsed: &ParsedQuery) -> proc_macro2::Ident {
+    format_ident!("BsqlStream_{}", &parsed.statement_name)
 }
 
 /// Rust keywords (2021 edition) that cannot be used as bare identifiers.

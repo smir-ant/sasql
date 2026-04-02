@@ -7,14 +7,19 @@
 //! # Design
 //!
 //! The listener uses a dedicated connection because LISTEN requires a
-//! persistent session — the subscription is tied to the backend process.
+//! persistent session -- the subscription is tied to the backend process.
 //! Pooled connections cycle between callers, so LISTEN on a pooled
 //! connection would silently lose the subscription on return-to-pool.
 //!
-//! The current implementation uses the bsql-driver's `Connection` for sending
-//! LISTEN/UNLISTEN/NOTIFY commands via `simple_query`. For receiving notifications,
-//! a background task periodically queries to trigger PostgreSQL to deliver
-//! pending notifications (they arrive as async messages during any query).
+//! A background task owns the `Connection` exclusively. It uses
+//! `tokio::select!` to multiplex between:
+//!
+//! 1. **Commands** from the caller (listen/unlisten/notify) delivered via
+//!    an unbounded mpsc channel.
+//! 2. **Notifications** from PostgreSQL read via `Connection::wait_for_notification()`,
+//!    forwarded to the caller through a bounded mpsc channel.
+//!
+//! This avoids splitting `&mut Connection` between two tasks.
 
 use tokio::sync::mpsc;
 
@@ -42,9 +47,25 @@ impl Notification {
     }
 }
 
+/// Commands sent from the `Listener` API to the background task.
+enum Command {
+    Listen(
+        String,
+        tokio::sync::oneshot::Sender<Result<(), bsql_driver::DriverError>>,
+    ),
+    Unlisten(
+        String,
+        tokio::sync::oneshot::Sender<Result<(), bsql_driver::DriverError>>,
+    ),
+    Notify(
+        String,
+        tokio::sync::oneshot::Sender<Result<(), bsql_driver::DriverError>>,
+    ),
+}
+
 /// A dedicated LISTEN/NOTIFY connection to PostgreSQL.
 ///
-/// Created via [`Listener::connect`]. This is NOT a pooled connection —
+/// Created via [`Listener::connect`]. This is NOT a pooled connection --
 /// it opens a fresh TCP connection that persists for the listener's lifetime.
 ///
 /// # Example
@@ -61,53 +82,51 @@ impl Notification {
 /// }
 /// ```
 pub struct Listener {
-    conn: tokio::sync::Mutex<bsql_driver::Connection>,
+    cmd_tx: mpsc::UnboundedSender<Command>,
     rx: mpsc::Receiver<Notification>,
-    _poll_handle: tokio::task::JoinHandle<()>,
+    _task_handle: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        self._poll_handle.abort();
+        self._task_handle.abort();
     }
 }
 
 impl std::fmt::Debug for Listener {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Listener")
-            .field("active", &!self._poll_handle.is_finished())
+            .field("active", &!self._task_handle.is_finished())
             .finish()
     }
 }
 
 impl Listener {
-    /// Connect to PostgreSQL and start listening for notifications.
+    /// Connect to PostgreSQL and start the background notification reader.
     ///
     /// Opens a dedicated connection (not from any pool).
     pub async fn connect(url: &str) -> BsqlResult<Self> {
         let config = bsql_driver::Config::from_url(url)
             .map_err(|e| ConnectError::create(format!("listener connect failed: {e}")))?;
-        let conn = bsql_driver::Connection::connect(&config)
+
+        // Disable statement_timeout on the listener connection -- it only runs
+        // LISTEN/UNLISTEN/NOTIFY, and the notification wait is unbounded by design.
+        let mut listener_config = config;
+        listener_config.statement_timeout_secs = 0;
+
+        let conn = bsql_driver::Connection::connect(&listener_config)
             .await
             .map_err(|e| ConnectError::create(format!("listener connect failed: {e}")))?;
 
-        let (tx, rx) = mpsc::channel(NOTIFICATION_BUFFER_SIZE);
+        let (notif_tx, rx) = mpsc::channel(NOTIFICATION_BUFFER_SIZE);
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
-        // The driver's Connection doesn't expose a way to receive async notifications
-        // passively. We use a second connection for polling. For now, notifications
-        // are received as a side effect of any query on the connection. The poll task
-        // periodically executes "" (empty query) to trigger notification delivery.
-        //
-        // TODO: Add a dedicated notification reading API to bsql-driver.
-        let poll_config = config.clone();
-        let handle = tokio::spawn(async move {
-            poll_notifications(poll_config, tx).await;
-        });
+        let handle = tokio::spawn(drive_listener(conn, cmd_rx, notif_tx));
 
         Ok(Listener {
-            conn: tokio::sync::Mutex::new(conn),
+            cmd_tx,
             rx,
-            _poll_handle: handle,
+            _task_handle: handle,
         })
     }
 
@@ -122,10 +141,8 @@ impl Listener {
             ));
         }
         let quoted = quote_ident(channel)?;
-        let mut conn = self.conn.lock().await;
-        conn.simple_query(&format!("LISTEN {quoted}"))
-            .await
-            .map_err(BsqlError::from)
+        let sql = format!("LISTEN {quoted}");
+        self.send_command_listen(sql).await
     }
 
     /// Unsubscribe from a named notification channel.
@@ -136,18 +153,13 @@ impl Listener {
             ));
         }
         let quoted = quote_ident(channel)?;
-        let mut conn = self.conn.lock().await;
-        conn.simple_query(&format!("UNLISTEN {quoted}"))
-            .await
-            .map_err(BsqlError::from)
+        let sql = format!("UNLISTEN {quoted}");
+        self.send_command_unlisten(sql).await
     }
 
     /// Unsubscribe from all channels.
     pub async fn unlisten_all(&self) -> BsqlResult<()> {
-        let mut conn = self.conn.lock().await;
-        conn.simple_query("UNLISTEN *")
-            .await
-            .map_err(BsqlError::from)
+        self.send_command_unlisten("UNLISTEN *".to_owned()).await
     }
 
     /// Receive the next notification.
@@ -175,9 +187,39 @@ impl Listener {
         }
         let quoted_channel = quote_ident(channel)?;
         let escaped_payload = payload.replace('\'', "''");
-        let mut conn = self.conn.lock().await;
-        conn.simple_query(&format!("NOTIFY {quoted_channel}, '{escaped_payload}'"))
+        let sql = format!("NOTIFY {quoted_channel}, '{escaped_payload}'");
+
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(Command::Notify(sql, resp_tx))
+            .map_err(|_| ConnectError::create("listener background task exited"))?;
+        resp_rx
             .await
+            .map_err(|_| ConnectError::create("listener background task exited"))?
+            .map_err(BsqlError::from)
+    }
+
+    /// Send a LISTEN command to the background task and wait for the response.
+    async fn send_command_listen(&self, sql: String) -> BsqlResult<()> {
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(Command::Listen(sql, resp_tx))
+            .map_err(|_| ConnectError::create("listener background task exited"))?;
+        resp_rx
+            .await
+            .map_err(|_| ConnectError::create("listener background task exited"))?
+            .map_err(BsqlError::from)
+    }
+
+    /// Send an UNLISTEN command to the background task and wait for the response.
+    async fn send_command_unlisten(&self, sql: String) -> BsqlResult<()> {
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(Command::Unlisten(sql, resp_tx))
+            .map_err(|_| ConnectError::create("listener background task exited"))?;
+        resp_rx
+            .await
+            .map_err(|_| ConnectError::create("listener background task exited"))?
             .map_err(BsqlError::from)
     }
 }
@@ -201,23 +243,46 @@ fn quote_ident(name: &str) -> BsqlResult<String> {
     Ok(quoted)
 }
 
-/// Background task that polls for notifications by running empty queries.
-///
-/// PostgreSQL delivers notifications as async messages during any query.
-/// This task runs `SELECT 1` every 100ms to trigger delivery.
-async fn poll_notifications(_config: bsql_driver::Config, _tx: mpsc::Sender<Notification>) {
-    // TODO: Implement notification polling once bsql-driver exposes a
-    // notification reading API. For now, notifications are received as
-    // side effects of queries on the main connection.
-    //
-    // The old tokio-postgres implementation used Connection::poll_message()
-    // which isn't available in bsql-driver. This requires adding a
-    // wait_for_notification() method to the driver.
-    //
-    // For v0.10, the listener is a stub that compiles but does not
-    // deliver notifications via the background task. LISTEN/NOTIFY
-    // commands still work — notifications are just not forwarded to recv().
-    std::future::pending::<()>().await;
+/// Background task that owns the Connection and multiplexes between
+/// reading commands from the API and waiting for PostgreSQL notifications.
+async fn drive_listener(
+    mut conn: bsql_driver::Connection,
+    mut cmd_rx: mpsc::UnboundedReceiver<Command>,
+    notif_tx: mpsc::Sender<Notification>,
+) {
+    loop {
+        tokio::select! {
+            // Branch 1: Commands from the Listener API
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    Some(Command::Listen(sql, resp)) => {
+                        let result = conn.simple_query(&sql).await;
+                        let _ = resp.send(result);
+                    }
+                    Some(Command::Unlisten(sql, resp)) => {
+                        let result = conn.simple_query(&sql).await;
+                        let _ = resp.send(result);
+                    }
+                    Some(Command::Notify(sql, resp)) => {
+                        let result = conn.simple_query(&sql).await;
+                        let _ = resp.send(result);
+                    }
+                    None => break, // Listener dropped, all senders gone
+                }
+            }
+            // Branch 2: Notifications from PostgreSQL
+            notif = conn.wait_for_notification() => {
+                match notif {
+                    Ok((channel, payload)) => {
+                        // try_send: drop notification if buffer is full rather than
+                        // blocking the reader (which would prevent processing commands)
+                        let _ = notif_tx.try_send(Notification { channel, payload });
+                    }
+                    Err(_) => break, // Connection error, exit task
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
