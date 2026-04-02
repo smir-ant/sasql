@@ -1,12 +1,9 @@
-//! SQLite connection pool — async wrapper over `bsql_driver_sqlite::pool::SqlitePool`.
+//! SQLite connection pool — synchronous wrapper over `bsql_driver_sqlite::pool::SqlitePool`.
 //!
-//! The driver pool uses dedicated OS threads and crossbeam channels. This
-//! wrapper provides an async-compatible API using `block_in_place` to avoid
-//! the overhead of spawning a new blocking task for each query. The crossbeam
-//! recv blocks for only microseconds (the dedicated thread processes the
-//! query and replies), so `block_in_place` is ideal here.
+//! The driver pool uses `Mutex<SqliteConnection>` for direct synchronous access.
+//! This wrapper provides bsql error types and a clean public API.
 //!
-//! Requires a multi-threaded tokio runtime.
+//! No tokio. No async. No block_in_place. Just direct sync calls.
 
 use std::sync::Arc;
 
@@ -14,12 +11,8 @@ use crate::error::{BsqlError, BsqlResult};
 
 /// A SQLite connection pool.
 ///
-/// Wraps `bsql_driver_sqlite::pool::SqlitePool` with bsql error types
-/// and an async-compatible API.
-///
-/// The driver pool is `Send + Sync` (asserted in bsql-driver-sqlite)
-/// because it communicates with its threads via crossbeam channels and
-/// atomic flags only.
+/// Wraps `bsql_driver_sqlite::pool::SqlitePool` with bsql error types.
+/// All operations are synchronous — no async runtime required.
 pub struct SqlitePool {
     inner: Arc<bsql_driver_sqlite::pool::SqlitePool>,
 }
@@ -37,7 +30,7 @@ impl SqlitePoolBuilder {
         self
     }
 
-    /// Set the number of reader threads. Default: 4.
+    /// Set the number of reader connections. Default: 4.
     pub fn reader_count(mut self, count: usize) -> Self {
         self.reader_count = count;
         self
@@ -65,7 +58,7 @@ impl SqlitePoolBuilder {
 }
 
 impl SqlitePool {
-    /// Open a SQLite pool with default settings (4 reader threads).
+    /// Open a SQLite pool with default settings (4 reader connections).
     pub fn connect(path: &str) -> BsqlResult<Self> {
         let inner =
             bsql_driver_sqlite::pool::SqlitePool::connect(path).map_err(BsqlError::from_sqlite)?;
@@ -82,74 +75,95 @@ impl SqlitePool {
         }
     }
 
-    /// Execute a read-only query via the async wrapper.
-    ///
-    /// Routes to a reader thread in the pool. Returns the `QueryResult`
-    /// and its associated `Arena`.
-    ///
-    /// Uses `block_in_place` instead of `spawn_blocking` to avoid task
-    /// creation overhead (~2-5us). The crossbeam channel recv blocks for
-    /// only microseconds while the dedicated thread processes the query.
-    pub async fn query_readonly(
+    /// Execute a read-only query, returning the `QueryResult` and its `Arena`.
+    pub fn query_readonly(
         &self,
         sql: &str,
         sql_hash: u64,
         params: smallvec::SmallVec<[bsql_driver_sqlite::pool::ParamValue; 8]>,
     ) -> BsqlResult<(bsql_driver_sqlite::conn::QueryResult, bsql_arena::Arena)> {
-        let pool = Arc::clone(&self.inner);
-        let sql = sql.to_owned();
-        tokio::task::block_in_place(move || {
-            pool.query_readonly(&sql, sql_hash, params)
-                .map_err(BsqlError::from_sqlite)
-        })
+        self.inner
+            .query_readonly(sql, sql_hash, params)
+            .map_err(BsqlError::from_sqlite)
     }
 
-    /// Execute a read-write query via the async wrapper.
-    pub async fn query_readwrite(
+    /// Execute a read-write query, returning the `QueryResult` and its `Arena`.
+    pub fn query_readwrite(
         &self,
         sql: &str,
         sql_hash: u64,
         params: smallvec::SmallVec<[bsql_driver_sqlite::pool::ParamValue; 8]>,
     ) -> BsqlResult<(bsql_driver_sqlite::conn::QueryResult, bsql_arena::Arena)> {
-        let pool = Arc::clone(&self.inner);
-        let sql = sql.to_owned();
-        tokio::task::block_in_place(move || {
-            pool.query_readwrite(&sql, sql_hash, params)
-                .map_err(BsqlError::from_sqlite)
-        })
+        self.inner
+            .query_readwrite(sql, sql_hash, params)
+            .map_err(BsqlError::from_sqlite)
     }
 
     /// Execute a write statement (INSERT/UPDATE/DELETE), return affected row count.
-    pub async fn execute_sql(
+    pub fn execute_sql(
         &self,
         sql: &str,
         sql_hash: u64,
         params: smallvec::SmallVec<[bsql_driver_sqlite::pool::ParamValue; 8]>,
     ) -> BsqlResult<u64> {
-        let pool = Arc::clone(&self.inner);
-        let sql = sql.to_owned();
-        tokio::task::block_in_place(move || {
-            pool.execute(&sql, sql_hash, params)
-                .map_err(BsqlError::from_sqlite)
-        })
+        self.inner
+            .execute(sql, sql_hash, params)
+            .map_err(BsqlError::from_sqlite)
+    }
+
+    /// Fetch exactly one row via direct decode — zero arena overhead.
+    ///
+    /// The `decode` closure reads columns directly from the stepped statement.
+    pub fn fetch_one_direct<F, T>(
+        &self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&dyn bsql_driver_sqlite::codec::SqliteEncode],
+        is_write: bool,
+        decode: F,
+    ) -> BsqlResult<T>
+    where
+        F: FnOnce(
+            &bsql_driver_sqlite::ffi::StmtHandle,
+        ) -> Result<T, bsql_driver_sqlite::SqliteError>,
+    {
+        self.inner
+            .fetch_one_direct(sql, sql_hash, params, is_write, decode)
+            .map_err(BsqlError::from_sqlite)
+    }
+
+    /// Fetch zero or one row via direct decode — zero arena overhead.
+    pub fn fetch_optional_direct<F, T>(
+        &self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&dyn bsql_driver_sqlite::codec::SqliteEncode],
+        is_write: bool,
+        decode: F,
+    ) -> BsqlResult<Option<T>>
+    where
+        F: FnOnce(
+            &bsql_driver_sqlite::ffi::StmtHandle,
+        ) -> Result<T, bsql_driver_sqlite::SqliteError>,
+    {
+        self.inner
+            .fetch_optional_direct(sql, sql_hash, params, is_write, decode)
+            .map_err(BsqlError::from_sqlite)
     }
 
     /// Execute a simple SQL statement on the writer (PRAGMA, DDL).
-    pub async fn simple_exec(&self, sql: &str) -> BsqlResult<()> {
-        let pool = Arc::clone(&self.inner);
-        let sql = sql.to_owned();
-        tokio::task::block_in_place(move || pool.simple_exec(&sql).map_err(BsqlError::from_sqlite))
+    pub fn simple_exec(&self, sql: &str) -> BsqlResult<()> {
+        self.inner.simple_exec(sql).map_err(BsqlError::from_sqlite)
     }
 
     /// Begin a transaction on the writer connection.
     ///
     /// Returns a `SqliteTransaction` that must be committed or rolled back.
     /// If dropped without committing, the transaction is automatically rolled back.
-    pub async fn begin(&self) -> BsqlResult<SqliteTransaction> {
-        let pool = Arc::clone(&self.inner);
-        tokio::task::block_in_place(move || {
-            pool.begin_transaction().map_err(BsqlError::from_sqlite)
-        })?;
+    pub fn begin(&self) -> BsqlResult<SqliteTransaction> {
+        self.inner
+            .begin_transaction()
+            .map_err(BsqlError::from_sqlite)?;
 
         Ok(SqliteTransaction {
             pool: Arc::clone(&self.inner),
@@ -160,22 +174,17 @@ impl SqlitePool {
     /// Execute a read-only streaming query.
     ///
     /// Returns the first chunk and a `SqliteStreamingQuery` to continue.
-    pub async fn query_streaming(
+    pub fn query_streaming(
         &self,
         sql: &str,
         sql_hash: u64,
         params: smallvec::SmallVec<[bsql_driver_sqlite::pool::ParamValue; 8]>,
         chunk_size: usize,
     ) -> BsqlResult<SqliteStreamingQuery> {
-        let pool = Arc::clone(&self.inner);
-        let sql = sql.to_owned();
-        let (first_result, first_arena, state, reader_idx) =
-            tokio::task::block_in_place(move || {
-                let (result, arena, state, idx) = pool
-                    .query_streaming(&sql, sql_hash, params, chunk_size)
-                    .map_err(BsqlError::from_sqlite)?;
-                Ok::<_, BsqlError>((result, arena, state, idx))
-            })?;
+        let (first_result, first_arena, state, reader_idx) = self
+            .inner
+            .query_streaming(sql, sql_hash, params, chunk_size)
+            .map_err(BsqlError::from_sqlite)?;
 
         Ok(SqliteStreamingQuery {
             pool: Arc::clone(&self.inner),
@@ -187,12 +196,12 @@ impl SqlitePool {
         })
     }
 
-    /// Pre-prepare statements on all threads (warmup).
+    /// Pre-prepare statements on all connections (warmup).
     pub fn warmup(&self, sqls: &[&str]) {
         self.inner.warmup(sqls);
     }
 
-    /// Number of reader threads.
+    /// Number of reader connections.
     pub fn reader_count(&self) -> usize {
         self.inner.reader_count()
     }
@@ -219,7 +228,7 @@ impl SqlitePool {
 /// the transaction is automatically rolled back.
 ///
 /// All write operations during a transaction are routed to the pool's
-/// single writer thread.
+/// single writer connection.
 pub struct SqliteTransaction {
     pool: Arc<bsql_driver_sqlite::pool::SqlitePool>,
     finished: bool,
@@ -227,84 +236,63 @@ pub struct SqliteTransaction {
 
 impl SqliteTransaction {
     /// Commit the transaction.
-    ///
-    /// Consumes `self` — the transaction cannot be used after commit.
-    pub async fn commit(mut self) -> BsqlResult<()> {
+    pub fn commit(mut self) -> BsqlResult<()> {
         self.finished = true;
-        let pool = Arc::clone(&self.pool);
-        tokio::task::block_in_place(move || {
-            pool.commit_transaction().map_err(BsqlError::from_sqlite)
-        })
+        self.pool
+            .commit_transaction()
+            .map_err(BsqlError::from_sqlite)
     }
 
     /// Explicitly roll back the transaction.
-    ///
-    /// Consumes `self` — the transaction cannot be used after rollback.
-    pub async fn rollback(mut self) -> BsqlResult<()> {
+    pub fn rollback(mut self) -> BsqlResult<()> {
         self.finished = true;
-        let pool = Arc::clone(&self.pool);
-        tokio::task::block_in_place(move || {
-            pool.rollback_transaction().map_err(BsqlError::from_sqlite)
-        })
+        self.pool
+            .rollback_transaction()
+            .map_err(BsqlError::from_sqlite)
     }
 
     /// Create a savepoint within the transaction.
-    ///
-    /// The `name` must be a valid SQL identifier.
-    pub async fn savepoint(&self, name: &str) -> BsqlResult<()> {
+    pub fn savepoint(&self, name: &str) -> BsqlResult<()> {
         validate_savepoint_name(name)?;
-        let pool = Arc::clone(&self.pool);
-        let name = name.to_owned();
-        tokio::task::block_in_place(move || pool.savepoint(&name).map_err(BsqlError::from_sqlite))
+        self.pool.savepoint(name).map_err(BsqlError::from_sqlite)
     }
 
     /// Release (destroy) a savepoint, keeping its effects.
-    pub async fn release_savepoint(&self, name: &str) -> BsqlResult<()> {
+    pub fn release_savepoint(&self, name: &str) -> BsqlResult<()> {
         validate_savepoint_name(name)?;
-        let pool = Arc::clone(&self.pool);
-        let name = name.to_owned();
-        tokio::task::block_in_place(move || {
-            pool.release_savepoint(&name)
-                .map_err(BsqlError::from_sqlite)
-        })
+        self.pool
+            .release_savepoint(name)
+            .map_err(BsqlError::from_sqlite)
     }
 
     /// Roll back to a savepoint.
-    pub async fn rollback_to(&self, name: &str) -> BsqlResult<()> {
+    pub fn rollback_to(&self, name: &str) -> BsqlResult<()> {
         validate_savepoint_name(name)?;
-        let pool = Arc::clone(&self.pool);
-        let name = name.to_owned();
-        tokio::task::block_in_place(move || pool.rollback_to(&name).map_err(BsqlError::from_sqlite))
+        self.pool.rollback_to(name).map_err(BsqlError::from_sqlite)
     }
 
     /// Execute a write query within the transaction.
-    pub async fn execute_sql(
+    pub fn execute_sql(
         &self,
         sql: &str,
         sql_hash: u64,
         params: smallvec::SmallVec<[bsql_driver_sqlite::pool::ParamValue; 8]>,
     ) -> BsqlResult<u64> {
-        let pool = Arc::clone(&self.pool);
-        let sql = sql.to_owned();
-        tokio::task::block_in_place(move || {
-            pool.execute(&sql, sql_hash, params)
-                .map_err(BsqlError::from_sqlite)
-        })
+        self.pool
+            .execute(sql, sql_hash, params)
+            .map_err(BsqlError::from_sqlite)
     }
 
-    /// Execute a query within the transaction (writer thread).
-    pub async fn query_readwrite(
+    /// Execute a query within the transaction (writer connection).
+    pub fn query_readwrite(
         &self,
         sql: &str,
         sql_hash: u64,
         params: smallvec::SmallVec<[bsql_driver_sqlite::pool::ParamValue; 8]>,
     ) -> BsqlResult<(bsql_driver_sqlite::conn::QueryResult, bsql_arena::Arena)> {
-        let pool = Arc::clone(&self.pool);
-        let sql = sql.to_owned();
-        tokio::task::block_in_place(move || {
-            pool.query_readwrite(&sql, sql_hash, params)
-                .map_err(BsqlError::from_sqlite)
-        })
+        self.pool
+            .query_readwrite(sql, sql_hash, params)
+            .map_err(BsqlError::from_sqlite)
     }
 }
 
@@ -323,8 +311,6 @@ impl Drop for SqliteTransaction {
                 "bsql: SqliteTransaction dropped without commit() or rollback() — \
                  rolling back automatically."
             );
-            // Best-effort rollback. Cannot block in Drop, so use a blocking
-            // call directly on the pool (which goes to the writer thread).
             let _ = self.pool.rollback_transaction();
         }
     }
@@ -352,7 +338,7 @@ impl SqliteStreamingQuery {
     ///
     /// Returns `true` if a new chunk was fetched, `false` if all rows
     /// have been consumed.
-    pub async fn fetch_next_chunk(&mut self) -> BsqlResult<bool> {
+    pub fn fetch_next_chunk(&mut self) -> BsqlResult<bool> {
         let state = match self.state.take() {
             Some(s) if !s.inner.finished => s,
             Some(s) => {
@@ -362,12 +348,10 @@ impl SqliteStreamingQuery {
             None => return Ok(false),
         };
 
-        let pool = Arc::clone(&self.pool);
-        let reader_idx = self.reader_idx;
-        let (result, arena, new_state) = tokio::task::block_in_place(move || {
-            pool.streaming_next(state, reader_idx)
-                .map_err(BsqlError::from_sqlite)
-        })?;
+        let (result, arena, new_state) = self
+            .pool
+            .streaming_next(state, self.reader_idx)
+            .map_err(BsqlError::from_sqlite)?;
 
         let has_rows = result.row_count > 0;
         self.current_result = Some(result);
@@ -378,9 +362,6 @@ impl SqliteStreamingQuery {
     }
 
     /// Get the current result and arena for row decoding.
-    ///
-    /// Returns `None` if no chunk is loaded or all rows in the current chunk
-    /// have been consumed.
     pub fn current(
         &self,
     ) -> Option<(
@@ -461,36 +442,32 @@ mod tests {
 
     // --- Transaction tests ---
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn transaction_commit() {
+    #[test]
+    fn transaction_commit() {
         let path = temp_db_path();
         let pool = SqlitePool::connect(&path).unwrap();
         pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
-            .await
             .unwrap();
 
-        let tx = pool.begin().await.unwrap();
+        let tx = pool.begin().unwrap();
         tx.execute_sql(
             "INSERT INTO t VALUES (?1)",
             crate::rapid_hash_str("INSERT INTO t VALUES (?1)"),
             smallvec::smallvec![bsql_driver_sqlite::pool::ParamValue::Int(1)],
         )
-        .await
         .unwrap();
         tx.execute_sql(
             "INSERT INTO t VALUES (?1)",
             crate::rapid_hash_str("INSERT INTO t VALUES (?1)"),
             smallvec::smallvec![bsql_driver_sqlite::pool::ParamValue::Int(2)],
         )
-        .await
         .unwrap();
-        tx.commit().await.unwrap();
+        tx.commit().unwrap();
 
         let sql = "SELECT id FROM t ORDER BY id";
         let hash = crate::rapid_hash_str(sql);
         let (result, arena) = pool
             .query_readonly(sql, hash, smallvec::SmallVec::new())
-            .await
             .unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result.get_i64(0, 0, &arena), Some(1));
@@ -500,29 +477,26 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn transaction_rollback() {
+    #[test]
+    fn transaction_rollback() {
         let path = temp_db_path();
         let pool = SqlitePool::connect(&path).unwrap();
         pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
-            .await
             .unwrap();
 
-        let tx = pool.begin().await.unwrap();
+        let tx = pool.begin().unwrap();
         tx.execute_sql(
             "INSERT INTO t VALUES (?1)",
             crate::rapid_hash_str("INSERT INTO t VALUES (?1)"),
             smallvec::smallvec![bsql_driver_sqlite::pool::ParamValue::Int(1)],
         )
-        .await
         .unwrap();
-        tx.rollback().await.unwrap();
+        tx.rollback().unwrap();
 
         let sql = "SELECT id FROM t";
         let hash = crate::rapid_hash_str(sql);
         let (result, _arena) = pool
             .query_readonly(sql, hash, smallvec::SmallVec::new())
-            .await
             .unwrap();
         assert_eq!(result.len(), 0);
 
@@ -530,40 +504,36 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn transaction_savepoint() {
+    #[test]
+    fn transaction_savepoint() {
         let path = temp_db_path();
         let pool = SqlitePool::connect(&path).unwrap();
         pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
-            .await
             .unwrap();
 
-        let tx = pool.begin().await.unwrap();
+        let tx = pool.begin().unwrap();
         tx.execute_sql(
             "INSERT INTO t VALUES (?1)",
             crate::rapid_hash_str("INSERT INTO t VALUES (?1)"),
             smallvec::smallvec![bsql_driver_sqlite::pool::ParamValue::Int(1)],
         )
-        .await
         .unwrap();
 
-        tx.savepoint("sp1").await.unwrap();
+        tx.savepoint("sp1").unwrap();
         tx.execute_sql(
             "INSERT INTO t VALUES (?1)",
             crate::rapid_hash_str("INSERT INTO t VALUES (?1)"),
             smallvec::smallvec![bsql_driver_sqlite::pool::ParamValue::Int(2)],
         )
-        .await
         .unwrap();
 
-        tx.rollback_to("sp1").await.unwrap();
-        tx.commit().await.unwrap();
+        tx.rollback_to("sp1").unwrap();
+        tx.commit().unwrap();
 
         let sql = "SELECT id FROM t";
         let hash = crate::rapid_hash_str(sql);
         let (result, arena) = pool
             .query_readonly(sql, hash, smallvec::SmallVec::new())
-            .await
             .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result.get_i64(0, 0, &arena), Some(1));
@@ -572,22 +542,20 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn transaction_drop_auto_rollback() {
+    #[test]
+    fn transaction_drop_auto_rollback() {
         let path = temp_db_path();
         let pool = SqlitePool::connect(&path).unwrap();
         pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
-            .await
             .unwrap();
 
         {
-            let tx = pool.begin().await.unwrap();
+            let tx = pool.begin().unwrap();
             tx.execute_sql(
                 "INSERT INTO t VALUES (?1)",
                 crate::rapid_hash_str("INSERT INTO t VALUES (?1)"),
                 smallvec::smallvec![bsql_driver_sqlite::pool::ParamValue::Int(1)],
             )
-            .await
             .unwrap();
             // Drop without commit or rollback
             drop(tx);
@@ -597,7 +565,6 @@ mod tests {
         let hash = crate::rapid_hash_str(sql);
         let (result, _arena) = pool
             .query_readonly(sql, hash, smallvec::SmallVec::new())
-            .await
             .unwrap();
         assert_eq!(result.len(), 0);
 
@@ -607,16 +574,14 @@ mod tests {
 
     // --- Streaming tests ---
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn streaming_query() {
+    #[test]
+    fn streaming_query() {
         let path = temp_db_path();
         let pool = SqlitePool::connect(&path).unwrap();
         pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
-            .await
             .unwrap();
         for i in 0..10 {
             pool.simple_exec(&format!("INSERT INTO t VALUES ({i})"))
-                .await
                 .unwrap();
         }
 
@@ -624,7 +589,6 @@ mod tests {
         let hash = crate::rapid_hash_str(sql);
         let mut stream = pool
             .query_streaming(sql, hash, smallvec::SmallVec::new(), 3)
-            .await
             .unwrap();
 
         // Should have initial rows
@@ -640,7 +604,7 @@ mod tests {
                 stream.advance();
                 total += 1;
             } else if !stream.is_finished() {
-                let fetched = stream.fetch_next_chunk().await.unwrap();
+                let fetched = stream.fetch_next_chunk().unwrap();
                 if !fetched {
                     break;
                 }

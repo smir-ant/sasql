@@ -50,8 +50,15 @@ pub mod driver {
 /// Re-export bsql_driver_sqlite types used by generated SQLite code.
 #[cfg(feature = "sqlite")]
 pub mod driver_sqlite {
+    pub use bsql_driver_sqlite::SqliteError;
+    pub use bsql_driver_sqlite::codec::SqliteEncode;
+    pub use bsql_driver_sqlite::ffi::StmtHandle;
     pub use bsql_driver_sqlite::pool::ParamValue;
     pub use smallvec::{SmallVec, smallvec};
+
+    /// SQLite NULL type indicator (matches `SQLITE_NULL` = 5).
+    /// Re-exported here so generated code does not need a direct libsqlite3-sys dep.
+    pub const SQLITE_NULL: i32 = 5;
 }
 
 pub use error::{BsqlError, BsqlResult};

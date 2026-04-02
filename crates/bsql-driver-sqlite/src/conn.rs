@@ -72,10 +72,9 @@ pub fn hash_sql(sql: &str) -> u64 {
 
 /// A single SQLite database connection with a statement cache.
 ///
-/// `SqliteConnection` is **not** `Send` or `Sync` — the underlying `DbHandle`
-/// wraps a raw `sqlite3*` handle opened with `SQLITE_OPEN_NOMUTEX` (no internal
-/// mutexing). The pool module handles thread affinity by opening connections on
-/// dedicated threads.
+/// `SqliteConnection` is `Send` because the underlying `DbHandle` is opened
+/// with `SQLITE_OPEN_FULLMUTEX` (serialized mode). The sync pool wraps each
+/// connection in `Mutex<SqliteConnection>` to prevent interleaved step() calls.
 pub struct SqliteConnection {
     db: DbHandle,
     stmts: StmtCache,
@@ -86,8 +85,12 @@ impl SqliteConnection {
     ///
     /// Sets WAL mode, synchronous=NORMAL, 256MB mmap, 64MB cache, and
     /// busy_timeout=0 (fail-fast per CREDO #17).
+    ///
+    /// Connections are opened with `SQLITE_OPEN_FULLMUTEX` (serialized mode)
+    /// making the handle safe to move between threads.
     pub fn open(path: &str) -> Result<Self, SqliteError> {
-        let flags = raw::SQLITE_OPEN_READWRITE | raw::SQLITE_OPEN_CREATE | raw::SQLITE_OPEN_NOMUTEX;
+        let flags =
+            raw::SQLITE_OPEN_READWRITE | raw::SQLITE_OPEN_CREATE | raw::SQLITE_OPEN_FULLMUTEX;
         let db = DbHandle::open(path, flags)?;
 
         db.exec("PRAGMA journal_mode = WAL")?;
@@ -106,10 +109,13 @@ impl SqliteConnection {
 
     /// Open a read-only database connection.
     ///
-    /// Used by reader threads in the pool. Does not set journal_mode (only
+    /// Used by readers in the pool. Does not set journal_mode (only
     /// the writer sets that).
+    ///
+    /// Connections are opened with `SQLITE_OPEN_FULLMUTEX` (serialized mode)
+    /// making the handle safe to move between threads.
     pub fn open_readonly(path: &str) -> Result<Self, SqliteError> {
-        let flags = raw::SQLITE_OPEN_READONLY | raw::SQLITE_OPEN_NOMUTEX;
+        let flags = raw::SQLITE_OPEN_READONLY | raw::SQLITE_OPEN_FULLMUTEX;
         let db = DbHandle::open(path, flags)?;
 
         db.exec("PRAGMA synchronous = NORMAL")?;
@@ -227,6 +233,75 @@ impl SqliteConnection {
         stmt.step()?;
         stmt.reset()?;
         Ok(self.db.changes())
+    }
+
+    /// Fetch exactly one row, decoding directly from the statement handle.
+    ///
+    /// This is the zero-overhead path for single-row queries: no arena
+    /// allocation, no QueryResult construction, no column copying. The
+    /// `decode` closure reads columns directly from the stepped statement.
+    ///
+    /// Returns an error if the query produces 0 rows.
+    #[inline]
+    pub fn fetch_one_direct<F, T>(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&dyn SqliteEncode],
+        decode: F,
+    ) -> Result<T, SqliteError>
+    where
+        F: FnOnce(&StmtHandle) -> Result<T, SqliteError>,
+    {
+        let stmt = self.get_or_prepare(sql, sql_hash)?;
+        stmt.clear_bindings();
+        for (i, param) in params.iter().enumerate() {
+            param.bind(stmt, (i + 1) as i32)?;
+        }
+        match stmt.step()? {
+            StepResult::Row => {
+                let result = decode(stmt)?;
+                stmt.reset()?;
+                Ok(result)
+            }
+            StepResult::Done => {
+                stmt.reset()?;
+                Err(SqliteError::Internal("expected 1 row, got 0".into()))
+            }
+        }
+    }
+
+    /// Fetch zero or one row, decoding directly from the statement handle.
+    ///
+    /// Same zero-overhead path as `fetch_one_direct`, but returns `None`
+    /// instead of an error when the query produces 0 rows.
+    #[inline]
+    pub fn fetch_optional_direct<F, T>(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&dyn SqliteEncode],
+        decode: F,
+    ) -> Result<Option<T>, SqliteError>
+    where
+        F: FnOnce(&StmtHandle) -> Result<T, SqliteError>,
+    {
+        let stmt = self.get_or_prepare(sql, sql_hash)?;
+        stmt.clear_bindings();
+        for (i, param) in params.iter().enumerate() {
+            param.bind(stmt, (i + 1) as i32)?;
+        }
+        match stmt.step()? {
+            StepResult::Row => {
+                let result = decode(stmt)?;
+                stmt.reset()?;
+                Ok(Some(result))
+            }
+            StepResult::Done => {
+                stmt.reset()?;
+                Ok(None)
+            }
+        }
     }
 
     /// Execute a query and return a streaming iterator.

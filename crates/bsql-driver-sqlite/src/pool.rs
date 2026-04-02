@@ -1,35 +1,35 @@
-//! Connection pool — dedicated threads + crossbeam channels, WAL reader/writer split.
+//! Synchronous connection pool — Mutex-guarded connections, WAL reader/writer split.
 //!
-//! SQLite connections are single-threaded (opened with `SQLITE_OPEN_NOMUTEX`).
-//! The pool runs each connection on a dedicated OS thread, communicating via
-//! crossbeam channels. No tokio dependency — async wrapping happens in bsql-core.
+//! SQLite connections are opened with `SQLITE_OPEN_FULLMUTEX` (serialized mode),
+//! making them safe to move between threads. The pool wraps each connection in
+//! a `std::sync::Mutex` to prevent interleaved `step()` calls.
 //!
 //! # Architecture
 //!
-//! - **Writer thread**: one dedicated thread with a read-write connection.
+//! - **Writer**: one `Mutex<SqliteConnection>` with a read-write connection.
 //!   All INSERT/UPDATE/DELETE/DDL goes here.
-//! - **Reader threads**: N dedicated threads with read-only connections.
+//! - **Readers**: N `Mutex<SqliteConnection>` with read-only connections.
 //!   SELECT queries are round-robin distributed across readers.
-//! - **Channel transport**: commands are sent as `Command` enums with pre-serialized
-//!   parameters (`ParamValue`). Replies come back via `crossbeam_channel::bounded(1)`.
+//! - **No threads**: connections are accessed directly via mutex lock.
+//!   No crossbeam channels, no dedicated threads, no async runtime.
 //!
 //! # Fail-fast
 //!
 //! Per CREDO #17, `busy_timeout = 0` on all connections. If the writer is busy,
 //! SQLite returns SQLITE_BUSY immediately. The pool does not queue or retry.
 //!
-//! # Safety
+//! # Performance
 //!
-//! This module contains **zero** `unsafe` code. The pool communicates with its
-//! dedicated threads exclusively via crossbeam channels and atomic flags. No raw
-//! SQLite pointers ever leave the dedicated threads.
+//! For single-row queries (`fetch_one_direct`), the entire path is:
+//! ```text
+//! lock mutex → cache lookup → bind → step → read columns directly → reset → unlock
+//! ```
+//! Zero arena allocation, zero channel overhead, zero thread switching.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::thread;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use bsql_arena::{Arena, acquire_arena};
-use crossbeam_channel::{Receiver, Sender, bounded};
 use smallvec::SmallVec;
 
 use crate::SqliteError;
@@ -39,10 +39,10 @@ use crate::ffi::StmtHandle;
 
 // --- ParamValue ---
 
-/// Pre-serialized parameter for channel transport.
+/// Pre-serialized parameter for pool API compatibility.
 ///
-/// Avoids `Box<dyn SqliteEncode>` per parameter. Typical queries (<=8 params)
-/// fit in `SmallVec<[ParamValue; 8]>` with zero heap allocation for the array.
+/// Typical queries (<=8 params) fit in `SmallVec<[ParamValue; 8]>` with
+/// zero heap allocation for the array.
 #[derive(Debug, Clone)]
 pub enum ParamValue {
     Null,
@@ -66,324 +66,32 @@ impl SqliteEncode for ParamValue {
     }
 }
 
-// --- Command ---
+// --- StreamingState ---
 
-/// A command sent to a dedicated SQLite thread.
-enum Command {
-    Query {
-        sql: String,
-        sql_hash: u64,
-        params: SmallVec<[ParamValue; 8]>,
-        reply: Sender<Result<(QueryResult, Arena), SqliteError>>,
-    },
-    Execute {
-        sql: String,
-        sql_hash: u64,
-        params: SmallVec<[ParamValue; 8]>,
-        reply: Sender<Result<u64, SqliteError>>,
-    },
-    SimpleExec {
-        sql: String,
-        reply: Sender<Result<(), SqliteError>>,
-    },
-    PrepareOnly {
-        sql: String,
-        sql_hash: u64,
-    },
-    StreamStart {
-        sql: String,
-        sql_hash: u64,
-        params: SmallVec<[ParamValue; 8]>,
-        chunk_size: usize,
-        reply: Sender<Result<(QueryResult, Arena, StreamingState), SqliteError>>,
-    },
-    StreamNext {
-        state: StreamingState,
-        reply: Sender<Result<(QueryResult, Arena, StreamingState), SqliteError>>,
-    },
-    StreamDrop {
-        state: StreamingState,
-    },
-    Shutdown,
-}
-
-/// Streaming query state passed between pool and thread.
+/// Streaming query state passed between pool and caller.
 ///
-/// Contains the `StreamingQuery` metadata needed to step the next chunk.
-/// Sent back and forth between the caller and the dedicated thread.
+/// Contains the `StreamingQuery` metadata needed to step the next chunk,
+/// plus the reader index so subsequent chunks go to the same connection.
 pub struct StreamingState {
     /// The streaming query metadata.
     pub inner: StreamingQuery,
 }
 
 // SAFETY: StreamingState is Send because StreamingQuery contains only scalar
-// values (u64, usize, bool) — no raw pointers, references, or Rc. The struct
-// is passed between the caller task and the dedicated SQLite thread via crossbeam
-// channels, which require Send.
+// values (u64, usize, bool) — no raw pointers, references, or Rc.
 unsafe impl Send for StreamingState {}
-
-// --- DedicatedThread ---
-
-/// A dedicated OS thread running a single SQLite connection.
-struct DedicatedThread {
-    cmd_tx: Sender<Command>,
-    handle: Option<thread::JoinHandle<()>>,
-}
-
-impl DedicatedThread {
-    /// Spawn a dedicated thread with a writer (read-write) connection.
-    fn spawn_writer(path: &str) -> Result<Self, SqliteError> {
-        let path = path.to_owned();
-        let (cmd_tx, cmd_rx) = bounded::<Command>(256);
-
-        // Open the connection on the dedicated thread to ensure thread affinity.
-        let (init_tx, init_rx) = bounded::<Result<(), SqliteError>>(1);
-
-        let handle = thread::Builder::new()
-            .name("bsql-sqlite-writer".into())
-            .spawn(move || {
-                let conn = match SqliteConnection::open(&path) {
-                    Ok(c) => {
-                        let _ = init_tx.send(Ok(()));
-                        c
-                    }
-                    Err(e) => {
-                        let _ = init_tx.send(Err(e));
-                        return;
-                    }
-                };
-                Self::run_loop(conn, cmd_rx);
-            })
-            .map_err(|e| SqliteError::Internal(format!("failed to spawn writer thread: {e}")))?;
-
-        // Wait for the connection to be opened (or fail).
-        init_rx
-            .recv()
-            .map_err(|_| SqliteError::Internal("writer thread exited during init".into()))??;
-
-        Ok(Self {
-            cmd_tx,
-            handle: Some(handle),
-        })
-    }
-
-    /// Spawn a dedicated thread with a reader (read-only) connection.
-    fn spawn_reader(path: &str, idx: usize) -> Result<Self, SqliteError> {
-        let path = path.to_owned();
-        let (cmd_tx, cmd_rx) = bounded::<Command>(256);
-        let (init_tx, init_rx) = bounded::<Result<(), SqliteError>>(1);
-
-        let handle = thread::Builder::new()
-            .name(format!("bsql-sqlite-reader-{idx}"))
-            .spawn(move || {
-                let conn = match SqliteConnection::open_readonly(&path) {
-                    Ok(c) => {
-                        let _ = init_tx.send(Ok(()));
-                        c
-                    }
-                    Err(e) => {
-                        let _ = init_tx.send(Err(e));
-                        return;
-                    }
-                };
-                Self::run_loop(conn, cmd_rx);
-            })
-            .map_err(|e| {
-                SqliteError::Internal(format!("failed to spawn reader thread {idx}: {e}"))
-            })?;
-
-        init_rx.recv().map_err(|_| {
-            SqliteError::Internal(format!("reader thread {idx} exited during init"))
-        })??;
-
-        Ok(Self {
-            cmd_tx,
-            handle: Some(handle),
-        })
-    }
-
-    /// Command processing loop. Runs until Shutdown or channel disconnect.
-    fn run_loop(mut conn: SqliteConnection, cmd_rx: Receiver<Command>) {
-        while let Ok(cmd) = cmd_rx.recv() {
-            match cmd {
-                Command::Query {
-                    sql,
-                    sql_hash,
-                    params,
-                    reply,
-                } => {
-                    let mut arena = acquire_arena();
-                    let param_refs: SmallVec<[&dyn SqliteEncode; 8]> =
-                        params.iter().map(|p| p as &dyn SqliteEncode).collect();
-                    let result = conn.query(&sql, sql_hash, &param_refs, &mut arena);
-                    let _ = reply.send(result.map(|r| (r, arena)));
-                }
-                Command::Execute {
-                    sql,
-                    sql_hash,
-                    params,
-                    reply,
-                } => {
-                    let param_refs: SmallVec<[&dyn SqliteEncode; 8]> =
-                        params.iter().map(|p| p as &dyn SqliteEncode).collect();
-                    let result = conn.execute(&sql, sql_hash, &param_refs);
-                    let _ = reply.send(result);
-                }
-                Command::SimpleExec { sql, reply } => {
-                    let result = conn.exec(&sql);
-                    let _ = reply.send(result);
-                }
-                Command::PrepareOnly { sql, sql_hash } => {
-                    let _ = conn.prepare_only(&sql, sql_hash);
-                }
-                Command::StreamStart {
-                    sql,
-                    sql_hash,
-                    params,
-                    chunk_size,
-                    reply,
-                } => {
-                    let param_refs: SmallVec<[&dyn SqliteEncode; 8]> =
-                        params.iter().map(|p| p as &dyn SqliteEncode).collect();
-                    let result = conn.query_streaming(&sql, sql_hash, &param_refs, chunk_size);
-                    match result {
-                        Ok(streaming) => {
-                            let mut arena = acquire_arena();
-                            let chunk = conn.streaming_next_chunk(
-                                &mut StreamingQuery {
-                                    sql_hash: streaming.sql_hash,
-                                    col_count: streaming.col_count,
-                                    chunk_size: streaming.chunk_size,
-                                    finished: streaming.finished,
-                                },
-                                &mut arena,
-                            );
-                            // We need a fresh StreamingQuery since we consumed the original
-                            match chunk {
-                                Ok(qr) => {
-                                    let state = StreamingState {
-                                        inner: StreamingQuery {
-                                            sql_hash: streaming.sql_hash,
-                                            col_count: streaming.col_count,
-                                            chunk_size: streaming.chunk_size,
-                                            finished: streaming.finished
-                                                || (qr.row_count < streaming.chunk_size),
-                                        },
-                                    };
-                                    let _ = reply.send(Ok((qr, arena, state)));
-                                }
-                                Err(e) => {
-                                    let _ = reply.send(Err(e));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            let _ = reply.send(Err(e));
-                        }
-                    }
-                }
-                Command::StreamNext { mut state, reply } => {
-                    let mut arena = acquire_arena();
-                    let result = conn.streaming_next_chunk(&mut state.inner, &mut arena);
-                    match result {
-                        Ok(qr) => {
-                            let _ = reply.send(Ok((qr, arena, state)));
-                        }
-                        Err(e) => {
-                            let _ = reply.send(Err(e));
-                        }
-                    }
-                }
-                Command::StreamDrop { state } => {
-                    // Reset the statement for reuse if not fully consumed.
-                    if !state.inner.finished {
-                        conn.reset_streaming(&state.inner);
-                    }
-                }
-                Command::Shutdown => break,
-            }
-        }
-        // conn is dropped here — finalizes all statements and closes the database.
-    }
-
-    /// Send a query command and wait for the reply.
-    fn query(
-        &self,
-        sql: &str,
-        sql_hash: u64,
-        params: SmallVec<[ParamValue; 8]>,
-    ) -> Result<(QueryResult, Arena), SqliteError> {
-        let (reply_tx, reply_rx) = bounded(1);
-        self.cmd_tx
-            .send(Command::Query {
-                sql: sql.to_owned(),
-                sql_hash,
-                params,
-                reply: reply_tx,
-            })
-            .map_err(|_| SqliteError::Pool("pool thread disconnected".into()))?;
-        reply_rx
-            .recv()
-            .map_err(|_| SqliteError::Pool("pool thread disconnected".into()))?
-    }
-
-    /// Send an execute command and wait for the reply.
-    fn execute(
-        &self,
-        sql: &str,
-        sql_hash: u64,
-        params: SmallVec<[ParamValue; 8]>,
-    ) -> Result<u64, SqliteError> {
-        let (reply_tx, reply_rx) = bounded(1);
-        self.cmd_tx
-            .send(Command::Execute {
-                sql: sql.to_owned(),
-                sql_hash,
-                params,
-                reply: reply_tx,
-            })
-            .map_err(|_| SqliteError::Pool("pool thread disconnected".into()))?;
-        reply_rx
-            .recv()
-            .map_err(|_| SqliteError::Pool("pool thread disconnected".into()))?
-    }
-
-    /// Send a simple exec command and wait for the reply.
-    fn simple_exec(&self, sql: &str) -> Result<(), SqliteError> {
-        let (reply_tx, reply_rx) = bounded(1);
-        self.cmd_tx
-            .send(Command::SimpleExec {
-                sql: sql.to_owned(),
-                reply: reply_tx,
-            })
-            .map_err(|_| SqliteError::Pool("pool thread disconnected".into()))?;
-        reply_rx
-            .recv()
-            .map_err(|_| SqliteError::Pool("pool thread disconnected".into()))?
-    }
-
-    /// Send a shutdown command and wait for the thread to exit.
-    fn shutdown(&mut self) {
-        let _ = self.cmd_tx.send(Command::Shutdown);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
 
 // --- SqlitePool ---
 
-/// Connection pool with dedicated threads — one writer + N readers.
+/// Synchronous connection pool — one writer + N readers, mutex-guarded.
 ///
-/// Read queries are round-robin distributed across reader threads.
-/// Write queries (INSERT/UPDATE/DELETE/DDL) go to the single writer thread.
+/// Read queries are round-robin distributed across reader connections.
+/// Write queries (INSERT/UPDATE/DELETE/DDL) go to the single writer.
 ///
 /// # Thread safety
 ///
-/// `SqlitePool` communicates with its dedicated threads exclusively via
-/// crossbeam channels (`Sender<Command>`, which is `Send + Sync`) and atomic
-/// flags (`Arc<AtomicBool>`, `AtomicUsize`). It does not hold any raw sqlite3
-/// pointers — those live only on the dedicated threads.
+/// `SqlitePool` is `Send + Sync`. Each connection is wrapped in a
+/// `Mutex<SqliteConnection>` and opened with `SQLITE_OPEN_FULLMUTEX`.
 ///
 /// # Example
 ///
@@ -391,32 +99,20 @@ impl DedicatedThread {
 /// use bsql_driver_sqlite::pool::SqlitePool;
 ///
 /// let pool = SqlitePool::connect("/tmp/test.db").unwrap();
-/// // Read queries go to reader threads
-/// // Write queries go to the writer thread
+/// // Read queries go to reader connections
+/// // Write queries go to the writer connection
 /// pool.close();
 /// ```
 pub struct SqlitePool {
-    readers: Vec<DedicatedThread>,
-    writer: DedicatedThread,
+    writer: Mutex<SqliteConnection>,
+    readers: Vec<Mutex<SqliteConnection>>,
     closed: Arc<AtomicBool>,
-    /// Round-robin counter for distributing read queries across reader threads.
-    /// Tracked separately from StreamingState because it is pool-level state (shared
-    /// across all callers), whereas StreamingState is per-query state passed between
-    /// the caller and a specific reader thread.
+    /// Round-robin counter for distributing read queries across readers.
     reader_idx: AtomicUsize,
 }
 
-// SqlitePool auto-derives Send+Sync because all its fields are Send+Sync:
-// - `DedicatedThread` contains `Sender<Command>` (Send+Sync) and
-//   `Option<JoinHandle<()>>` (Send, not Sync — but the pool only accesses
-//   JoinHandle from &mut self in Drop, so Sync is derived from Sender).
-// - `Arc<AtomicBool>` (Send+Sync)
-// - `AtomicUsize` (Send+Sync)
-//
-// No raw pointers, no SQLite handles — those live only on dedicated threads.
-
 impl SqlitePool {
-    /// Open a pool with default settings (4 reader threads).
+    /// Open a pool with default settings (4 readers).
     pub fn connect(path: &str) -> Result<Self, SqliteError> {
         SqlitePoolBuilder::new().path(path).build()
     }
@@ -426,31 +122,55 @@ impl SqlitePool {
         SqlitePoolBuilder::new()
     }
 
-    /// Route a read query to a reader thread (round-robin).
+    /// Acquire the next reader connection (round-robin).
+    fn acquire_reader(&self) -> Result<MutexGuard<'_, SqliteConnection>, SqliteError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SqliteError::Pool("pool is closed".into()));
+        }
+        let idx = self.reader_idx.fetch_add(1, Ordering::Relaxed) % self.readers.len();
+        self.readers[idx]
+            .lock()
+            .map_err(|_| SqliteError::Pool("reader mutex poisoned".into()))
+    }
+
+    /// Acquire the writer connection.
+    fn acquire_writer(&self) -> Result<MutexGuard<'_, SqliteConnection>, SqliteError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SqliteError::Pool("pool is closed".into()));
+        }
+        self.writer
+            .lock()
+            .map_err(|_| SqliteError::Pool("writer mutex poisoned".into()))
+    }
+
+    /// Route a read query to a reader (round-robin), returning results in an arena.
     pub fn query_readonly(
         &self,
         sql: &str,
         sql_hash: u64,
         params: SmallVec<[ParamValue; 8]>,
     ) -> Result<(QueryResult, Arena), SqliteError> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(SqliteError::Pool("pool is closed".into()));
-        }
-        let idx = self.reader_idx.fetch_add(1, Ordering::Relaxed) % self.readers.len();
-        self.readers[idx].query(sql, sql_hash, params)
+        let mut conn = self.acquire_reader()?;
+        let mut arena = acquire_arena();
+        let param_refs: SmallVec<[&dyn SqliteEncode; 8]> =
+            params.iter().map(|p| p as &dyn SqliteEncode).collect();
+        let result = conn.query(sql, sql_hash, &param_refs, &mut arena)?;
+        Ok((result, arena))
     }
 
-    /// Route a write query to the writer thread.
+    /// Route a write query to the writer, returning results in an arena.
     pub fn query_readwrite(
         &self,
         sql: &str,
         sql_hash: u64,
         params: SmallVec<[ParamValue; 8]>,
     ) -> Result<(QueryResult, Arena), SqliteError> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(SqliteError::Pool("pool is closed".into()));
-        }
-        self.writer.query(sql, sql_hash, params)
+        let mut conn = self.acquire_writer()?;
+        let mut arena = acquire_arena();
+        let param_refs: SmallVec<[&dyn SqliteEncode; 8]> =
+            params.iter().map(|p| p as &dyn SqliteEncode).collect();
+        let result = conn.query(sql, sql_hash, &param_refs, &mut arena)?;
+        Ok((result, arena))
     }
 
     /// Execute a write statement (INSERT/UPDATE/DELETE), return affected row count.
@@ -460,21 +180,64 @@ impl SqlitePool {
         sql_hash: u64,
         params: SmallVec<[ParamValue; 8]>,
     ) -> Result<u64, SqliteError> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(SqliteError::Pool("pool is closed".into()));
-        }
-        self.writer.execute(sql, sql_hash, params)
+        let mut conn = self.acquire_writer()?;
+        let param_refs: SmallVec<[&dyn SqliteEncode; 8]> =
+            params.iter().map(|p| p as &dyn SqliteEncode).collect();
+        conn.execute(sql, sql_hash, &param_refs)
     }
 
     /// Execute a simple SQL statement on the writer (PRAGMA, DDL).
     pub fn simple_exec(&self, sql: &str) -> Result<(), SqliteError> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(SqliteError::Pool("pool is closed".into()));
-        }
-        self.writer.simple_exec(sql)
+        let conn = self.acquire_writer()?;
+        conn.exec(sql)
     }
 
-    /// Start a streaming query on a reader thread.
+    /// Fetch exactly one row via direct decode — zero arena overhead.
+    ///
+    /// The `decode` closure reads columns directly from the stepped statement.
+    /// This is the fastest path for single-row queries.
+    pub fn fetch_one_direct<F, T>(
+        &self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&dyn SqliteEncode],
+        is_write: bool,
+        decode: F,
+    ) -> Result<T, SqliteError>
+    where
+        F: FnOnce(&StmtHandle) -> Result<T, SqliteError>,
+    {
+        if is_write {
+            let mut conn = self.acquire_writer()?;
+            conn.fetch_one_direct(sql, sql_hash, params, decode)
+        } else {
+            let mut conn = self.acquire_reader()?;
+            conn.fetch_one_direct(sql, sql_hash, params, decode)
+        }
+    }
+
+    /// Fetch zero or one row via direct decode — zero arena overhead.
+    pub fn fetch_optional_direct<F, T>(
+        &self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&dyn SqliteEncode],
+        is_write: bool,
+        decode: F,
+    ) -> Result<Option<T>, SqliteError>
+    where
+        F: FnOnce(&StmtHandle) -> Result<T, SqliteError>,
+    {
+        if is_write {
+            let mut conn = self.acquire_writer()?;
+            conn.fetch_optional_direct(sql, sql_hash, params, decode)
+        } else {
+            let mut conn = self.acquire_reader()?;
+            conn.fetch_optional_direct(sql, sql_hash, params, decode)
+        }
+    }
+
+    /// Start a streaming query on a reader connection.
     ///
     /// Returns `(result, arena, state, reader_idx)`. The `reader_idx` must be
     /// passed to `streaming_next` / `streaming_drop` so subsequent chunks are
@@ -490,44 +253,49 @@ impl SqlitePool {
             return Err(SqliteError::Pool("pool is closed".into()));
         }
         let idx = self.reader_idx.fetch_add(1, Ordering::Relaxed) % self.readers.len();
-        let (reply_tx, reply_rx) = bounded(1);
-        self.readers[idx]
-            .cmd_tx
-            .send(Command::StreamStart {
-                sql: sql.to_owned(),
-                sql_hash,
-                params,
-                chunk_size,
-                reply: reply_tx,
-            })
-            .map_err(|_| SqliteError::Pool("reader thread disconnected".into()))?;
-        let (result, arena, state) = reply_rx
-            .recv()
-            .map_err(|_| SqliteError::Pool("reader thread disconnected".into()))??;
-        Ok((result, arena, state, idx))
+        let mut conn = self.readers[idx]
+            .lock()
+            .map_err(|_| SqliteError::Pool("reader mutex poisoned".into()))?;
+
+        let param_refs: SmallVec<[&dyn SqliteEncode; 8]> =
+            params.iter().map(|p| p as &dyn SqliteEncode).collect();
+        let streaming = conn.query_streaming(sql, sql_hash, &param_refs, chunk_size)?;
+
+        let mut arena = acquire_arena();
+        let mut sq = StreamingQuery {
+            sql_hash: streaming.sql_hash,
+            col_count: streaming.col_count,
+            chunk_size: streaming.chunk_size,
+            finished: streaming.finished,
+        };
+        let qr = conn.streaming_next_chunk(&mut sq, &mut arena)?;
+        let state = StreamingState {
+            inner: StreamingQuery {
+                sql_hash: sq.sql_hash,
+                col_count: sq.col_count,
+                chunk_size: sq.chunk_size,
+                finished: sq.finished || (qr.row_count < sq.chunk_size),
+            },
+        };
+        Ok((qr, arena, state, idx))
     }
 
     /// Fetch the next chunk from a streaming query.
     pub fn streaming_next(
         &self,
-        state: StreamingState,
+        mut state: StreamingState,
         reader_idx: usize,
     ) -> Result<(QueryResult, Arena, StreamingState), SqliteError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(SqliteError::Pool("pool is closed".into()));
         }
         let idx = reader_idx % self.readers.len();
-        let (reply_tx, reply_rx) = bounded(1);
-        self.readers[idx]
-            .cmd_tx
-            .send(Command::StreamNext {
-                state,
-                reply: reply_tx,
-            })
-            .map_err(|_| SqliteError::Pool("reader thread disconnected".into()))?;
-        reply_rx
-            .recv()
-            .map_err(|_| SqliteError::Pool("reader thread disconnected".into()))?
+        let mut conn = self.readers[idx]
+            .lock()
+            .map_err(|_| SqliteError::Pool("reader mutex poisoned".into()))?;
+        let mut arena = acquire_arena();
+        let result = conn.streaming_next_chunk(&mut state.inner, &mut arena)?;
+        Ok((result, arena, state))
     }
 
     /// Drop a streaming query, resetting the statement for reuse.
@@ -536,81 +304,67 @@ impl SqlitePool {
             return;
         }
         let idx = reader_idx % self.readers.len();
-        let _ = self.readers[idx].cmd_tx.send(Command::StreamDrop { state });
-    }
-
-    /// Begin a transaction on the writer thread.
-    ///
-    /// Sends `BEGIN` and returns a handle for executing within the transaction.
-    pub fn begin_transaction(&self) -> Result<(), SqliteError> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(SqliteError::Pool("pool is closed".into()));
-        }
-        self.writer.simple_exec("BEGIN")
-    }
-
-    /// Commit the current transaction on the writer thread.
-    pub fn commit_transaction(&self) -> Result<(), SqliteError> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(SqliteError::Pool("pool is closed".into()));
-        }
-        self.writer.simple_exec("COMMIT")
-    }
-
-    /// Rollback the current transaction on the writer thread.
-    pub fn rollback_transaction(&self) -> Result<(), SqliteError> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(SqliteError::Pool("pool is closed".into()));
-        }
-        self.writer.simple_exec("ROLLBACK")
-    }
-
-    /// Create a savepoint within the current transaction.
-    pub fn savepoint(&self, name: &str) -> Result<(), SqliteError> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(SqliteError::Pool("pool is closed".into()));
-        }
-        self.writer.simple_exec(&format!("SAVEPOINT {name}"))
-    }
-
-    /// Release a savepoint.
-    pub fn release_savepoint(&self, name: &str) -> Result<(), SqliteError> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(SqliteError::Pool("pool is closed".into()));
-        }
-        self.writer
-            .simple_exec(&format!("RELEASE SAVEPOINT {name}"))
-    }
-
-    /// Rollback to a savepoint.
-    pub fn rollback_to(&self, name: &str) -> Result<(), SqliteError> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(SqliteError::Pool("pool is closed".into()));
-        }
-        self.writer
-            .simple_exec(&format!("ROLLBACK TO SAVEPOINT {name}"))
-    }
-
-    /// Pre-prepare statements on all threads (warmup).
-    pub fn warmup(&self, sqls: &[&str]) {
-        for sql in sqls {
-            let sql_hash = hash_sql(sql);
-            // Warmup on writer
-            let _ = self.writer.cmd_tx.send(Command::PrepareOnly {
-                sql: (*sql).to_owned(),
-                sql_hash,
-            });
-            // Warmup on all readers
-            for reader in &self.readers {
-                let _ = reader.cmd_tx.send(Command::PrepareOnly {
-                    sql: (*sql).to_owned(),
-                    sql_hash,
-                });
+        if let Ok(mut conn) = self.readers[idx].lock() {
+            if !state.inner.finished {
+                conn.reset_streaming(&state.inner);
             }
         }
     }
 
-    /// Number of reader threads.
+    /// Begin a transaction on the writer connection.
+    pub fn begin_transaction(&self) -> Result<(), SqliteError> {
+        let conn = self.acquire_writer()?;
+        conn.exec("BEGIN")
+    }
+
+    /// Commit the current transaction on the writer connection.
+    pub fn commit_transaction(&self) -> Result<(), SqliteError> {
+        let conn = self.acquire_writer()?;
+        conn.exec("COMMIT")
+    }
+
+    /// Rollback the current transaction on the writer connection.
+    pub fn rollback_transaction(&self) -> Result<(), SqliteError> {
+        let conn = self.acquire_writer()?;
+        conn.exec("ROLLBACK")
+    }
+
+    /// Create a savepoint within the current transaction.
+    pub fn savepoint(&self, name: &str) -> Result<(), SqliteError> {
+        let conn = self.acquire_writer()?;
+        conn.exec(&format!("SAVEPOINT {name}"))
+    }
+
+    /// Release a savepoint.
+    pub fn release_savepoint(&self, name: &str) -> Result<(), SqliteError> {
+        let conn = self.acquire_writer()?;
+        conn.exec(&format!("RELEASE SAVEPOINT {name}"))
+    }
+
+    /// Rollback to a savepoint.
+    pub fn rollback_to(&self, name: &str) -> Result<(), SqliteError> {
+        let conn = self.acquire_writer()?;
+        conn.exec(&format!("ROLLBACK TO SAVEPOINT {name}"))
+    }
+
+    /// Pre-prepare statements on all connections (warmup).
+    pub fn warmup(&self, sqls: &[&str]) {
+        for sql in sqls {
+            let sql_hash = hash_sql(sql);
+            // Warmup on writer
+            if let Ok(mut conn) = self.writer.lock() {
+                let _ = conn.prepare_only(sql, sql_hash);
+            }
+            // Warmup on all readers
+            for reader in &self.readers {
+                if let Ok(mut conn) = reader.lock() {
+                    let _ = conn.prepare_only(sql, sql_hash);
+                }
+            }
+        }
+    }
+
+    /// Number of reader connections.
     pub fn reader_count(&self) -> usize {
         self.readers.len()
     }
@@ -620,19 +374,9 @@ impl SqlitePool {
         self.closed.load(Ordering::Acquire)
     }
 
-    /// Close the pool. Shuts down all threads.
+    /// Close the pool.
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
-    }
-}
-
-impl Drop for SqlitePool {
-    fn drop(&mut self) {
-        self.closed.store(true, Ordering::Release);
-        self.writer.shutdown();
-        for reader in &mut self.readers {
-            reader.shutdown();
-        }
     }
 }
 
@@ -658,13 +402,13 @@ impl SqlitePoolBuilder {
         self
     }
 
-    /// Set the number of reader threads. Default: 4.
+    /// Set the number of reader connections. Default: 4.
     pub fn reader_count(mut self, count: usize) -> Self {
         self.reader_count = count;
         self
     }
 
-    /// Build and open the pool. Spawns dedicated threads and opens connections.
+    /// Build and open the pool. Opens connections directly (no thread spawning).
     pub fn build(self) -> Result<SqlitePool, SqliteError> {
         let path = self
             .path
@@ -676,28 +420,18 @@ impl SqlitePoolBuilder {
             self.reader_count
         };
 
-        // Spawn writer first (creates the database if needed, sets WAL mode)
-        let writer = DedicatedThread::spawn_writer(&path)?;
+        // Open writer first (creates the database if needed, sets WAL mode)
+        let writer = SqliteConnection::open(&path)?;
 
-        // Spawn readers
+        // Open readers
         let mut readers = Vec::with_capacity(reader_count);
-        for i in 0..reader_count {
-            match DedicatedThread::spawn_reader(&path, i) {
-                Ok(reader) => readers.push(reader),
-                Err(e) => {
-                    // Clean up already-spawned threads on failure
-                    for mut r in readers {
-                        r.shutdown();
-                    }
-                    // writer is dropped here — thread will exit when channel disconnects
-                    return Err(e);
-                }
-            }
+        for _ in 0..reader_count {
+            readers.push(Mutex::new(SqliteConnection::open_readonly(&path)?));
         }
 
         Ok(SqlitePool {
+            writer: Mutex::new(writer),
             readers,
-            writer,
             closed: Arc::new(AtomicBool::new(false)),
             reader_idx: AtomicUsize::new(0),
         })
@@ -1685,6 +1419,93 @@ mod tests {
             state = new_state;
         }
         assert_eq!(total_rows, 10);
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- fetch_one_direct ---
+
+    #[test]
+    fn pool_fetch_one_direct() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER, name TEXT)")
+            .unwrap();
+        pool.simple_exec("INSERT INTO t VALUES (42, 'hello')")
+            .unwrap();
+
+        let sql = "SELECT id, name FROM t WHERE id = ?1";
+        let sql_hash = hash_sql(sql);
+        let id: i64 = 42;
+        let result: (i64, String) = pool
+            .fetch_one_direct(sql, sql_hash, &[&id], false, |stmt| {
+                let id = stmt.column_int64(0);
+                let name = stmt
+                    .column_text(1)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .map(|s| s.to_owned())
+                    .ok_or_else(|| SqliteError::Internal("decode error".into()))?;
+                Ok((id, name))
+            })
+            .unwrap();
+        assert_eq!(result.0, 42);
+        assert_eq!(result.1, "hello");
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pool_fetch_one_direct_no_rows() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER)").unwrap();
+
+        let sql = "SELECT id FROM t WHERE id = ?1";
+        let sql_hash = hash_sql(sql);
+        let id: i64 = 999;
+        let result =
+            pool.fetch_one_direct(
+                sql,
+                sql_hash,
+                &[&id],
+                false,
+                |stmt| Ok(stmt.column_int64(0)),
+            );
+        assert!(result.is_err());
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pool_fetch_optional_direct() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER)").unwrap();
+        pool.simple_exec("INSERT INTO t VALUES (7)").unwrap();
+
+        let sql = "SELECT id FROM t WHERE id = ?1";
+        let sql_hash = hash_sql(sql);
+
+        // Found
+        let id: i64 = 7;
+        let result =
+            pool.fetch_optional_direct(sql, sql_hash, &[&id], false, |stmt| {
+                Ok(stmt.column_int64(0))
+            })
+            .unwrap();
+        assert_eq!(result, Some(7));
+
+        // Not found
+        let id: i64 = 999;
+        let result =
+            pool.fetch_optional_direct(sql, sql_hash, &[&id], false, |stmt| {
+                Ok(stmt.column_int64(0))
+            })
+            .unwrap();
+        assert_eq!(result, None);
 
         drop(pool);
         let _ = std::fs::remove_file(&path);

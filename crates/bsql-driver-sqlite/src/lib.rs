@@ -1,19 +1,21 @@
-//! SQLite driver for bsql — direct FFI, arena allocation, dedicated-thread pool.
+//! SQLite driver for bsql — direct FFI, arena allocation, synchronous pool.
 //!
 //! `bsql-driver-sqlite` is a purpose-built SQLite driver optimized for bsql's
-//! architecture: direct FFI to libsqlite3, arena allocation for row data,
-//! statement caching with identity-hashed rapidhash keys, and a dedicated-thread
-//! pool with WAL mode and reader/writer split.
+//! architecture: direct FFI to libsqlite3, arena allocation for multi-row results,
+//! statement caching with identity-hashed rapidhash keys, and a synchronous
+//! mutex-based pool with WAL mode and reader/writer split.
 //!
 //! # Design
 //!
 //! - **Direct FFI** — thin safe wrappers over `libsqlite3-sys`, no ORM overhead.
-//! - **Arena allocation** — all row data from one query shares a single bump allocator.
+//! - **Zero-copy single-row** — `fetch_one_direct` reads columns directly from the
+//!   stepped statement, bypassing arena allocation entirely.
+//! - **Arena allocation** — multi-row results share a single bump allocator.
 //! - **Statement cache** — keyed by rapidhash of SQL text. Second query skips prepare.
-//! - **Dedicated-thread pool** — one writer thread + N reader threads, crossbeam channels.
+//! - **Sync pool** — one writer + N readers, `Mutex<SqliteConnection>`, no threads/channels.
 //! - **WAL mode** — concurrent readers, single writer, no blocking on reads.
 //! - **Fail-fast** — `busy_timeout = 0`, pool exhaustion returns error immediately.
-//! - **No tokio dependency** — std threads + crossbeam channels. Async wrapping in bsql-core.
+//! - **No tokio dependency** — fully synchronous. No async runtime required.
 
 #![deny(clippy::all)]
 

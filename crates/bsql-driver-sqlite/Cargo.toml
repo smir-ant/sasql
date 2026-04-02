@@ -11,5 +11,4 @@ description = "SQLite driver for bsql — direct FFI, arena allocation, dedicate
 bsql-arena = { workspace = true }
 libsqlite3-sys = { workspace = true }
 rapidhash = { workspace = true }
-crossbeam-channel = { workspace = true }
 smallvec = { workspace = true }

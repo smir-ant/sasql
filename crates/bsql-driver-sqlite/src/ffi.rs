@@ -6,7 +6,6 @@
 //! other modules in the crate use these safe types exclusively.
 
 use std::ffi::{CStr, CString};
-use std::marker::PhantomData;
 use std::ptr;
 
 use libsqlite3_sys as raw;
@@ -95,10 +94,11 @@ pub enum StepResult {
 ///
 /// # Thread safety
 ///
-/// `DbHandle` is intentionally **not** `Send` or `Sync`. The underlying
-/// connection is opened with `SQLITE_OPEN_NOMUTEX` (no internal mutexing),
-/// so it must only be used from the thread that created it. The pool module
-/// enforces this by running each connection on a dedicated OS thread.
+/// `DbHandle` is `Send` but not `Sync`. When opened with
+/// `SQLITE_OPEN_FULLMUTEX`, the underlying SQLite handle serializes all
+/// API calls internally, making it safe to move between threads. The pool
+/// wraps each connection in a `Mutex<SqliteConnection>` which prevents
+/// concurrent access to the same handle (interleaved step() calls).
 ///
 /// # Lifecycle
 ///
@@ -112,16 +112,20 @@ pub enum StepResult {
 /// use bsql_driver_sqlite::ffi::DbHandle;
 /// use libsqlite3_sys as raw;
 ///
-/// let flags = raw::SQLITE_OPEN_READWRITE | raw::SQLITE_OPEN_CREATE | raw::SQLITE_OPEN_NOMUTEX;
+/// let flags = raw::SQLITE_OPEN_READWRITE | raw::SQLITE_OPEN_CREATE | raw::SQLITE_OPEN_FULLMUTEX;
 /// let db = DbHandle::open("/tmp/test.db", flags).unwrap();
 /// db.exec("CREATE TABLE t (id INTEGER)").unwrap();
 /// // db is closed when dropped
 /// ```
 pub struct DbHandle {
     ptr: *mut raw::sqlite3,
-    /// Prevent Send+Sync auto-derivation.
-    _marker: PhantomData<*mut ()>,
 }
+
+// SAFETY: DbHandle is opened with SQLITE_OPEN_FULLMUTEX which makes the
+// sqlite3 handle safe to use from any thread — SQLite serializes all API
+// calls internally. We further serialize access via Mutex<SqliteConnection>
+// in the pool to prevent interleaved step() calls on the same connection.
+unsafe impl Send for DbHandle {}
 
 impl DbHandle {
     /// Open a database.
@@ -145,10 +149,7 @@ impl DbHandle {
                 message: msg,
             });
         }
-        Ok(Self {
-            ptr: db,
-            _marker: PhantomData,
-        })
+        Ok(Self { ptr: db })
     }
 
     /// Prepare a SQL statement.
@@ -172,10 +173,7 @@ impl DbHandle {
                 message: msg,
             });
         }
-        Ok(StmtHandle {
-            ptr: stmt,
-            _marker: PhantomData,
-        })
+        Ok(StmtHandle { ptr: stmt })
     }
 
     /// Execute a simple SQL string (PRAGMA, DDL). No parameters, no results.
@@ -253,18 +251,23 @@ impl Drop for DbHandle {
 ///
 /// # Thread safety
 ///
-/// Not `Send` or `Sync` -- must be used on the same thread as the parent
-/// `DbHandle`.
+/// `StmtHandle` is `Send` because the parent `DbHandle` is opened with
+/// `SQLITE_OPEN_FULLMUTEX`. Prepared statements are tied to a connection,
+/// and we serialize access via `Mutex<SqliteConnection>`.
 pub struct StmtHandle {
     ptr: *mut raw::sqlite3_stmt,
-    /// Prevent Send+Sync auto-derivation.
-    _marker: PhantomData<*mut ()>,
 }
+
+// SAFETY: StmtHandle is tied to a DbHandle opened with SQLITE_OPEN_FULLMUTEX.
+// Access is serialized via Mutex<SqliteConnection> in the pool. The statement
+// is only used while the connection mutex is held.
+unsafe impl Send for StmtHandle {}
 
 impl StmtHandle {
     // --- Binding (safe methods) ---
 
     /// Bind an i64 parameter at 1-based index.
+    #[inline]
     pub fn bind_int64(&self, idx: i32, val: i64) -> Result<(), SqliteError> {
         // SAFETY: self.ptr is a valid prepared statement handle.
         let rc = unsafe { raw::sqlite3_bind_int64(self.ptr, idx, val) };
@@ -279,6 +282,7 @@ impl StmtHandle {
     }
 
     /// Bind a f64 parameter at 1-based index.
+    #[inline]
     pub fn bind_double(&self, idx: i32, val: f64) -> Result<(), SqliteError> {
         // SAFETY: self.ptr is a valid prepared statement handle.
         let rc = unsafe { raw::sqlite3_bind_double(self.ptr, idx, val) };
@@ -295,6 +299,7 @@ impl StmtHandle {
     /// Bind a text parameter at 1-based index.
     ///
     /// Uses `SQLITE_TRANSIENT` — SQLite copies the data immediately.
+    #[inline]
     pub fn bind_text(&self, idx: i32, val: &str) -> Result<(), SqliteError> {
         // SAFETY: self.ptr is a valid prepared statement handle. SQLITE_TRANSIENT
         // tells SQLite to copy the data, so the Rust reference need not outlive this call.
@@ -320,6 +325,7 @@ impl StmtHandle {
     /// Bind a blob parameter at 1-based index.
     ///
     /// Uses `SQLITE_TRANSIENT` — SQLite copies the data immediately.
+    #[inline]
     pub fn bind_blob(&self, idx: i32, val: &[u8]) -> Result<(), SqliteError> {
         // SAFETY: self.ptr is a valid prepared statement handle. SQLITE_TRANSIENT
         // tells SQLite to copy the data.
@@ -343,6 +349,7 @@ impl StmtHandle {
     }
 
     /// Bind NULL at 1-based index.
+    #[inline]
     pub fn bind_null(&self, idx: i32) -> Result<(), SqliteError> {
         // SAFETY: self.ptr is a valid prepared statement handle.
         let rc = unsafe { raw::sqlite3_bind_null(self.ptr, idx) };
@@ -357,6 +364,7 @@ impl StmtHandle {
     }
 
     /// Clear all bindings on this statement.
+    #[inline]
     pub fn clear_bindings(&self) {
         // SAFETY: self.ptr is a valid prepared statement handle.
         // sqlite3_clear_bindings always returns SQLITE_OK.
@@ -368,6 +376,7 @@ impl StmtHandle {
     // --- Stepping ---
 
     /// Step the statement. Returns `StepResult::Row` or `StepResult::Done`.
+    #[inline]
     pub fn step(&self) -> Result<StepResult, SqliteError> {
         // SAFETY: self.ptr is a valid prepared statement handle.
         let rc = unsafe { raw::sqlite3_step(self.ptr) };
@@ -386,6 +395,7 @@ impl StmtHandle {
     }
 
     /// Reset the statement for reuse (clears the step state, keeps bindings).
+    #[inline]
     pub fn reset(&self) -> Result<(), SqliteError> {
         // SAFETY: self.ptr is a valid prepared statement handle.
         let rc = unsafe { raw::sqlite3_reset(self.ptr) };
@@ -402,6 +412,7 @@ impl StmtHandle {
     // --- Column reading ---
 
     /// Get the number of columns in the result set.
+    #[inline]
     pub fn column_count(&self) -> i32 {
         // SAFETY: self.ptr is a valid prepared statement handle.
         unsafe { raw::sqlite3_column_count(self.ptr) }
@@ -409,18 +420,21 @@ impl StmtHandle {
 
     /// Get the storage type of a column (SQLITE_INTEGER, SQLITE_FLOAT,
     /// SQLITE_TEXT, SQLITE_BLOB, or SQLITE_NULL).
+    #[inline]
     pub fn column_type(&self, idx: i32) -> i32 {
         // SAFETY: self.ptr is a valid statement that has been stepped to SQLITE_ROW.
         unsafe { raw::sqlite3_column_type(self.ptr, idx) }
     }
 
     /// Get a column value as i64.
+    #[inline]
     pub fn column_int64(&self, idx: i32) -> i64 {
         // SAFETY: self.ptr is a valid statement that has been stepped to SQLITE_ROW.
         unsafe { raw::sqlite3_column_int64(self.ptr, idx) }
     }
 
     /// Get a column value as f64.
+    #[inline]
     pub fn column_double(&self, idx: i32) -> f64 {
         // SAFETY: self.ptr is a valid statement that has been stepped to SQLITE_ROW.
         unsafe { raw::sqlite3_column_double(self.ptr, idx) }
@@ -430,6 +444,7 @@ impl StmtHandle {
     ///
     /// Returns `None` if the column is NULL. The returned slice is valid until
     /// the next `step`, `reset`, or the statement is dropped.
+    #[inline]
     pub fn column_text(&self, idx: i32) -> Option<&[u8]> {
         // SAFETY: self.ptr is a valid statement that has been stepped to SQLITE_ROW.
         // The returned pointer is valid until the next step/reset/finalize.
@@ -446,6 +461,7 @@ impl StmtHandle {
     /// Returns an empty slice if the column is NULL or has zero length.
     /// The returned slice is valid until the next `step`, `reset`, or the
     /// statement is dropped.
+    #[inline]
     pub fn column_blob(&self, idx: i32) -> &[u8] {
         // SAFETY: self.ptr is a valid statement that has been stepped to SQLITE_ROW.
         let len = unsafe { raw::sqlite3_column_bytes(self.ptr, idx) } as usize;
@@ -460,6 +476,7 @@ impl StmtHandle {
     }
 
     /// Get the byte length of a column value.
+    #[inline]
     pub fn column_bytes(&self, idx: i32) -> i32 {
         // SAFETY: self.ptr is a valid statement that has been stepped to SQLITE_ROW.
         unsafe { raw::sqlite3_column_bytes(self.ptr, idx) }
@@ -549,7 +566,7 @@ mod tests {
     }
 
     fn rw_flags() -> i32 {
-        raw::SQLITE_OPEN_READWRITE | raw::SQLITE_OPEN_CREATE | raw::SQLITE_OPEN_NOMUTEX
+        raw::SQLITE_OPEN_READWRITE | raw::SQLITE_OPEN_CREATE | raw::SQLITE_OPEN_FULLMUTEX
     }
 
     // ---- open ----
@@ -575,14 +592,15 @@ mod tests {
 
     #[test]
     fn open_nonexistent_directory() {
-        let flags = raw::SQLITE_OPEN_READWRITE | raw::SQLITE_OPEN_CREATE | raw::SQLITE_OPEN_NOMUTEX;
+        let flags =
+            raw::SQLITE_OPEN_READWRITE | raw::SQLITE_OPEN_CREATE | raw::SQLITE_OPEN_FULLMUTEX;
         let result = DbHandle::open("/no/such/directory/db.sqlite", flags);
         assert!(result.is_err());
     }
 
     #[test]
     fn open_readonly_nonexistent_file() {
-        let flags = raw::SQLITE_OPEN_READONLY | raw::SQLITE_OPEN_NOMUTEX;
+        let flags = raw::SQLITE_OPEN_READONLY | raw::SQLITE_OPEN_FULLMUTEX;
         let result = DbHandle::open("/tmp/bsql_does_not_exist_ever.db", flags);
         assert!(result.is_err());
     }

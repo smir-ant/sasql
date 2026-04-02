@@ -98,8 +98,9 @@ fn gen_executor_impls(
     let sql_lit = sqlite_sql;
 
     let is_select = parsed.kind == crate::parse::QueryKind::Select;
+    let is_write = !is_select;
 
-    // Build the params slice for SQLite: convert to ParamValue for channel transport
+    // Build the params SmallVec for arena-based methods (fetch_all, execute, streaming)
     let param_conversions: Vec<TokenStream> = parsed
         .params
         .iter()
@@ -119,12 +120,32 @@ fn gen_executor_impls(
         }
     };
 
+    // Build direct param refs for fetch_one_direct/fetch_optional_direct
+    let direct_param_binds: Vec<TokenStream> = parsed
+        .params
+        .iter()
+        .map(|p| {
+            let name = param_ident(&p.name);
+            gen_direct_param_ref(&name, &p.rust_type)
+        })
+        .collect();
+
+    let direct_params_build = if direct_param_binds.is_empty() {
+        quote! { let _bsql_params: &[&dyn ::bsql_core::driver_sqlite::SqliteEncode] = &[]; }
+    } else {
+        quote! {
+            let _bsql_params: &[&dyn ::bsql_core::driver_sqlite::SqliteEncode] = &[
+                #(#direct_param_binds),*
+            ];
+        }
+    };
+
     // Compute sql_hash at compile time
     let sql_hash_val = bsql_core::rapid_hash_str(sqlite_sql);
 
     let has_columns = !validation.columns.is_empty();
 
-    // Generate LIMIT 2 variant for fetch_one/fetch_optional
+    // Generate LIMIT 2 variant for fetch_one/fetch_optional (arena path)
     let needs_limit = has_columns && is_select && !parsed.normalized_sql.contains(" limit ");
 
     let limited_sql = if needs_limit {
@@ -141,7 +162,13 @@ fn gen_executor_impls(
         TokenStream::new()
     };
 
-    // Determine which pool method to call
+    let direct_decode = if has_columns {
+        gen_sqlite_direct_decode(validation)
+    } else {
+        TokenStream::new()
+    };
+
+    // Determine which pool method to call for arena-based queries
     let query_method = if is_select {
         quote! { query_readonly }
     } else {
@@ -153,28 +180,30 @@ fn gen_executor_impls(
         let qm = &query_method;
 
         quote! {
-            pub async fn fetch_one(
+            /// Fetch exactly one row. Zero-copy direct decode — no arena allocation.
+            pub fn fetch_one(
                 self,
                 pool: &::bsql_core::SqlitePool,
             ) -> ::bsql_core::BsqlResult<#result_name> {
-                #params_build
-                let (result, arena) = pool.#qm(#limited_sql_lit, #limited_sql_hash_val, params).await?;
-                if result.len() != 1 {
-                    return Err(::bsql_core::error::QueryError::row_count(
-                        "exactly 1 row",
-                        result.len() as u64,
-                    ));
-                }
-                let _bsql_row_idx: usize = 0;
-                Ok(#result_name { #row_decode })
+                #direct_params_build
+                pool.fetch_one_direct(
+                    #limited_sql_lit,
+                    #limited_sql_hash_val,
+                    _bsql_params,
+                    #is_write,
+                    |_bsql_stmt| {
+                        Ok(#result_name { #direct_decode })
+                    },
+                )
             }
 
-            pub async fn fetch_all(
+            /// Fetch all rows. Uses arena for multi-row storage.
+            pub fn fetch_all(
                 self,
                 pool: &::bsql_core::SqlitePool,
             ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
                 #params_build
-                let (result, arena) = pool.#qm(#sql_lit, #sql_hash_val, params).await?;
+                let (result, arena) = pool.#qm(#sql_lit, #sql_hash_val, params)?;
                 let mut out = Vec::with_capacity(result.len());
                 for _bsql_row_idx in 0..result.len() {
                     out.push(#result_name { #row_decode });
@@ -182,31 +211,30 @@ fn gen_executor_impls(
                 Ok(out)
             }
 
-            pub async fn fetch_optional(
+            /// Fetch zero or one row. Zero-copy direct decode — no arena allocation.
+            pub fn fetch_optional(
                 self,
                 pool: &::bsql_core::SqlitePool,
             ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
-                #params_build
-                let (result, arena) = pool.#qm(#limited_sql_lit, #limited_sql_hash_val, params).await?;
-                match result.len() {
-                    0 => Ok(None),
-                    1 => {
-                        let _bsql_row_idx: usize = 0;
-                        Ok(Some(#result_name { #row_decode }))
-                    }
-                    n => Err(::bsql_core::error::QueryError::row_count(
-                        "0 or 1 rows",
-                        n as u64,
-                    )),
-                }
+                #direct_params_build
+                pool.fetch_optional_direct(
+                    #limited_sql_lit,
+                    #limited_sql_hash_val,
+                    _bsql_params,
+                    #is_write,
+                    |_bsql_stmt| {
+                        Ok(#result_name { #direct_decode })
+                    },
+                )
             }
 
-            pub async fn fetch_stream(
+            /// Stream rows in chunks.
+            pub fn fetch_stream(
                 self,
                 pool: &::bsql_core::SqlitePool,
             ) -> ::bsql_core::BsqlResult<::bsql_core::SqliteStreamingQuery> {
                 #params_build
-                pool.query_streaming(#sql_lit, #sql_hash_val, params, 64).await
+                pool.query_streaming(#sql_lit, #sql_hash_val, params, 64)
             }
         }
     } else {
@@ -214,12 +242,13 @@ fn gen_executor_impls(
     };
 
     let execute_method = quote! {
-        pub async fn execute(
+        /// Execute the statement (INSERT/UPDATE/DELETE), return affected rows.
+        pub fn execute(
             self,
             pool: &::bsql_core::SqlitePool,
         ) -> ::bsql_core::BsqlResult<u64> {
             #params_build
-            pool.execute_sql(#sql_lit, #sql_hash_val, params).await
+            pool.execute_sql(#sql_lit, #sql_hash_val, params)
         }
     };
 
@@ -228,6 +257,349 @@ fn gen_executor_impls(
         impl<'_bsql> #executor_name<'_bsql> {
             #fetch_methods
             #execute_method
+        }
+    }
+}
+
+// --- Direct param ref for zero-copy path ---
+
+/// Generate a reference to a param for direct bind (no ParamValue allocation).
+fn gen_direct_param_ref(name: &proc_macro2::Ident, rust_type: &str) -> TokenStream {
+    // For Option<T>, we need special handling to bind NULL or the inner value
+    if let Some(inner) = rust_type
+        .strip_prefix("Option<")
+        .and_then(|s| s.strip_suffix('>'))
+    {
+        let inner_ref = direct_param_ref_inner(quote! { v }, inner);
+        return quote! {
+            match &self.#name {
+                Some(v) => #inner_ref,
+                None => &::bsql_core::driver_sqlite::ParamValue::Null as &dyn ::bsql_core::driver_sqlite::SqliteEncode,
+            }
+        };
+    }
+    direct_param_ref_inner(quote! { self.#name }, rust_type)
+}
+
+fn direct_param_ref_inner(val_expr: TokenStream, rust_type: &str) -> TokenStream {
+    match rust_type {
+        "bool" | "i8" | "i16" | "i32" | "i64" | "f32" | "f64" => {
+            // These types implement SqliteEncode directly (or via ParamValue)
+            // Use ParamValue for type coercion (i8->i64, f32->f64, bool->i64)
+            let conv = param_value_conversion(val_expr, rust_type);
+            quote! { &(#conv) as &dyn ::bsql_core::driver_sqlite::SqliteEncode }
+        }
+        "&str" => {
+            quote! { &::bsql_core::driver_sqlite::ParamValue::Text(#val_expr.to_owned()) as &dyn ::bsql_core::driver_sqlite::SqliteEncode }
+        }
+        "String" => {
+            quote! { &::bsql_core::driver_sqlite::ParamValue::Text(#val_expr.clone()) as &dyn ::bsql_core::driver_sqlite::SqliteEncode }
+        }
+        "&[u8]" => {
+            quote! { &::bsql_core::driver_sqlite::ParamValue::Blob(#val_expr.to_vec()) as &dyn ::bsql_core::driver_sqlite::SqliteEncode }
+        }
+        "Vec<u8>" => {
+            quote! { &::bsql_core::driver_sqlite::ParamValue::Blob(#val_expr.clone()) as &dyn ::bsql_core::driver_sqlite::SqliteEncode }
+        }
+        _ => {
+            // Feature-gated or unknown type: convert via ToString -> ParamValue::Text
+            quote! { &::bsql_core::driver_sqlite::ParamValue::Text(::std::string::ToString::to_string(&#val_expr)) as &dyn ::bsql_core::driver_sqlite::SqliteEncode }
+        }
+    }
+}
+
+// --- Direct decode from StmtHandle (zero-copy for fetch_one/fetch_optional) ---
+
+/// Generate field decoding that reads directly from the StmtHandle.
+fn gen_sqlite_direct_decode(validation: &ValidationResult) -> TokenStream {
+    let deduped_names = deduplicate_column_names(&validation.columns);
+    let fields = deduped_names.iter().enumerate().map(|(i, name)| {
+        let field_name = format_ident!("{}", name);
+        let col_idx = i as i32;
+        let col = &validation.columns[i];
+        let decode_expr = gen_sqlite_direct_column_decode(col_idx, &col.rust_type);
+        quote! { #field_name: #decode_expr }
+    });
+
+    quote! { #(#fields),* }
+}
+
+fn gen_sqlite_direct_column_decode(idx: i32, rust_type: &str) -> TokenStream {
+    if let Some(inner) = rust_type
+        .strip_prefix("Option<")
+        .and_then(|s| s.strip_suffix('>'))
+    {
+        gen_sqlite_direct_nullable_decode(idx, inner)
+    } else {
+        gen_sqlite_direct_not_null_decode(idx, rust_type)
+    }
+}
+
+fn gen_sqlite_direct_not_null_decode(idx: i32, rust_type: &str) -> TokenStream {
+    let col_idx_str = idx.to_string();
+    match rust_type {
+        "bool" => {
+            let err = gen_direct_decode_error(&col_idx_str, "bool");
+            quote! {
+                {
+                    if _bsql_stmt.column_type(#idx) == ::bsql_core::driver_sqlite::SQLITE_NULL {
+                        return Err(#err);
+                    }
+                    _bsql_stmt.column_int64(#idx) != 0
+                }
+            }
+        }
+        "i64" => {
+            let err = gen_direct_decode_error(&col_idx_str, "i64");
+            quote! {
+                {
+                    if _bsql_stmt.column_type(#idx) == ::bsql_core::driver_sqlite::SQLITE_NULL {
+                        return Err(#err);
+                    }
+                    _bsql_stmt.column_int64(#idx)
+                }
+            }
+        }
+        "f64" => {
+            let err = gen_direct_decode_error(&col_idx_str, "f64");
+            quote! {
+                {
+                    if _bsql_stmt.column_type(#idx) == ::bsql_core::driver_sqlite::SQLITE_NULL {
+                        return Err(#err);
+                    }
+                    _bsql_stmt.column_double(#idx)
+                }
+            }
+        }
+        "String" => {
+            let err = gen_direct_decode_error(&col_idx_str, "String");
+            quote! {
+                {
+                    let _bsql_bytes = _bsql_stmt.column_text(#idx)
+                        .ok_or_else(|| #err)?;
+                    ::std::str::from_utf8(_bsql_bytes)
+                        .map_err(|_| ::bsql_core::driver_sqlite::SqliteError::Internal(
+                            format!("invalid UTF-8 in column {}", #col_idx_str),
+                        ))?
+                        .to_owned()
+                }
+            }
+        }
+        "Vec<u8>" => {
+            let err = gen_direct_decode_error(&col_idx_str, "Vec<u8>");
+            quote! {
+                {
+                    if _bsql_stmt.column_type(#idx) == ::bsql_core::driver_sqlite::SQLITE_NULL {
+                        return Err(#err);
+                    }
+                    _bsql_stmt.column_blob(#idx).to_vec()
+                }
+            }
+        }
+        _ => gen_sqlite_direct_feature_gated_decode(idx, rust_type),
+    }
+}
+
+fn gen_sqlite_direct_nullable_decode(idx: i32, inner_type: &str) -> TokenStream {
+    match inner_type {
+        "bool" => quote! {
+            if _bsql_stmt.column_type(#idx) == ::bsql_core::driver_sqlite::SQLITE_NULL {
+                None
+            } else {
+                Some(_bsql_stmt.column_int64(#idx) != 0)
+            }
+        },
+        "i64" => quote! {
+            if _bsql_stmt.column_type(#idx) == ::bsql_core::driver_sqlite::SQLITE_NULL {
+                None
+            } else {
+                Some(_bsql_stmt.column_int64(#idx))
+            }
+        },
+        "f64" => quote! {
+            if _bsql_stmt.column_type(#idx) == ::bsql_core::driver_sqlite::SQLITE_NULL {
+                None
+            } else {
+                Some(_bsql_stmt.column_double(#idx))
+            }
+        },
+        "String" => quote! {
+            _bsql_stmt.column_text(#idx)
+                .and_then(|b| ::std::str::from_utf8(b).ok())
+                .map(|s| s.to_owned())
+        },
+        "Vec<u8>" => quote! {
+            if _bsql_stmt.column_type(#idx) == ::bsql_core::driver_sqlite::SQLITE_NULL {
+                None
+            } else {
+                Some(_bsql_stmt.column_blob(#idx).to_vec())
+            }
+        },
+        _ => {
+            let not_null_decode = gen_sqlite_direct_feature_gated_decode(idx, inner_type);
+            quote! {
+                if _bsql_stmt.column_type(#idx) == ::bsql_core::driver_sqlite::SQLITE_NULL {
+                    None
+                } else {
+                    Some(#not_null_decode)
+                }
+            }
+        }
+    }
+}
+
+fn gen_direct_decode_error(col_idx: &str, type_name: &str) -> TokenStream {
+    quote! {
+        ::bsql_core::driver_sqlite::SqliteError::Internal(
+            format!("NULL or invalid data at column {} (expected {})", #col_idx, #type_name),
+        )
+    }
+}
+
+fn gen_sqlite_direct_feature_gated_decode(idx: i32, rust_type: &str) -> TokenStream {
+    let col_idx_str = idx.to_string();
+    let err = gen_direct_decode_error(&col_idx_str, rust_type);
+
+    match rust_type {
+        "::uuid::Uuid" | "uuid::Uuid" => {
+            quote! {
+                {
+                    let _bsql_bytes = _bsql_stmt.column_text(#idx)
+                        .ok_or_else(|| #err)?;
+                    let s = ::std::str::from_utf8(_bsql_bytes)
+                        .map_err(|_| ::bsql_core::driver_sqlite::SqliteError::Internal(
+                            format!("invalid UTF-8 in column {}", #col_idx_str),
+                        ))?;
+                    s.parse::<::uuid::Uuid>().map_err(|e| ::bsql_core::driver_sqlite::SqliteError::Internal(
+                        format!("invalid UUID in column {}: {}", #col_idx_str, e),
+                    ))?
+                }
+            }
+        }
+        "::time::PrimitiveDateTime" | "time::PrimitiveDateTime" => {
+            quote! {
+                {
+                    let _bsql_bytes = _bsql_stmt.column_text(#idx)
+                        .ok_or_else(|| #err)?;
+                    let s = ::std::str::from_utf8(_bsql_bytes)
+                        .map_err(|_| ::bsql_core::driver_sqlite::SqliteError::Internal(
+                            format!("invalid UTF-8 in column {}", #col_idx_str),
+                        ))?;
+                    ::time::PrimitiveDateTime::parse(s, &::time::format_description::well_known::iso8601::Iso8601::DEFAULT)
+                        .or_else(|_| {
+                            ::time::PrimitiveDateTime::parse(s, &::time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]:[second]"))
+                        })
+                        .map_err(|e| ::bsql_core::driver_sqlite::SqliteError::Internal(
+                            format!("invalid datetime in column {}: {}", #col_idx_str, e),
+                        ))?
+                }
+            }
+        }
+        "::time::Date" | "time::Date" => {
+            quote! {
+                {
+                    let _bsql_bytes = _bsql_stmt.column_text(#idx)
+                        .ok_or_else(|| #err)?;
+                    let s = ::std::str::from_utf8(_bsql_bytes)
+                        .map_err(|_| ::bsql_core::driver_sqlite::SqliteError::Internal(
+                            format!("invalid UTF-8 in column {}", #col_idx_str),
+                        ))?;
+                    ::time::Date::parse(s, &::time::macros::format_description!("[year]-[month]-[day]"))
+                        .map_err(|e| ::bsql_core::driver_sqlite::SqliteError::Internal(
+                            format!("invalid date in column {}: {}", #col_idx_str, e),
+                        ))?
+                }
+            }
+        }
+        "::time::Time" | "time::Time" => {
+            quote! {
+                {
+                    let _bsql_bytes = _bsql_stmt.column_text(#idx)
+                        .ok_or_else(|| #err)?;
+                    let s = ::std::str::from_utf8(_bsql_bytes)
+                        .map_err(|_| ::bsql_core::driver_sqlite::SqliteError::Internal(
+                            format!("invalid UTF-8 in column {}", #col_idx_str),
+                        ))?;
+                    ::time::Time::parse(s, &::time::macros::format_description!("[hour]:[minute]:[second]"))
+                        .map_err(|e| ::bsql_core::driver_sqlite::SqliteError::Internal(
+                            format!("invalid time in column {}: {}", #col_idx_str, e),
+                        ))?
+                }
+            }
+        }
+        "::chrono::NaiveDateTime" | "chrono::NaiveDateTime" => {
+            quote! {
+                {
+                    let _bsql_bytes = _bsql_stmt.column_text(#idx)
+                        .ok_or_else(|| #err)?;
+                    let s = ::std::str::from_utf8(_bsql_bytes)
+                        .map_err(|_| ::bsql_core::driver_sqlite::SqliteError::Internal(
+                            format!("invalid UTF-8 in column {}", #col_idx_str),
+                        ))?;
+                    s.parse::<::chrono::NaiveDateTime>().map_err(|e| ::bsql_core::driver_sqlite::SqliteError::Internal(
+                        format!("invalid datetime in column {}: {}", #col_idx_str, e),
+                    ))?
+                }
+            }
+        }
+        "::chrono::NaiveDate" | "chrono::NaiveDate" => {
+            quote! {
+                {
+                    let _bsql_bytes = _bsql_stmt.column_text(#idx)
+                        .ok_or_else(|| #err)?;
+                    let s = ::std::str::from_utf8(_bsql_bytes)
+                        .map_err(|_| ::bsql_core::driver_sqlite::SqliteError::Internal(
+                            format!("invalid UTF-8 in column {}", #col_idx_str),
+                        ))?;
+                    s.parse::<::chrono::NaiveDate>().map_err(|e| ::bsql_core::driver_sqlite::SqliteError::Internal(
+                        format!("invalid date in column {}: {}", #col_idx_str, e),
+                    ))?
+                }
+            }
+        }
+        "::chrono::NaiveTime" | "chrono::NaiveTime" => {
+            quote! {
+                {
+                    let _bsql_bytes = _bsql_stmt.column_text(#idx)
+                        .ok_or_else(|| #err)?;
+                    let s = ::std::str::from_utf8(_bsql_bytes)
+                        .map_err(|_| ::bsql_core::driver_sqlite::SqliteError::Internal(
+                            format!("invalid UTF-8 in column {}", #col_idx_str),
+                        ))?;
+                    s.parse::<::chrono::NaiveTime>().map_err(|e| ::bsql_core::driver_sqlite::SqliteError::Internal(
+                        format!("invalid time in column {}: {}", #col_idx_str, e),
+                    ))?
+                }
+            }
+        }
+        "::rust_decimal::Decimal" | "rust_decimal::Decimal" => {
+            quote! {
+                {
+                    let _bsql_bytes = _bsql_stmt.column_text(#idx)
+                        .ok_or_else(|| #err)?;
+                    let s = ::std::str::from_utf8(_bsql_bytes)
+                        .map_err(|_| ::bsql_core::driver_sqlite::SqliteError::Internal(
+                            format!("invalid UTF-8 in column {}", #col_idx_str),
+                        ))?;
+                    s.parse::<::rust_decimal::Decimal>().map_err(|e| ::bsql_core::driver_sqlite::SqliteError::Internal(
+                        format!("invalid decimal in column {}: {}", #col_idx_str, e),
+                    ))?
+                }
+            }
+        }
+        _ => {
+            // Fallback: read as text
+            quote! {
+                {
+                    let _bsql_bytes = _bsql_stmt.column_text(#idx)
+                        .ok_or_else(|| #err)?;
+                    ::std::str::from_utf8(_bsql_bytes)
+                        .map_err(|_| ::bsql_core::driver_sqlite::SqliteError::Internal(
+                            format!("invalid UTF-8 in column {}", #col_idx_str),
+                        ))?
+                        .to_owned()
+                }
+            }
         }
     }
 }
@@ -632,7 +1004,7 @@ fn gen_dynamic_executor_impls(
         let fetch_one_dispatcher =
             gen_sqlite_variant_dispatcher(parsed, variants, needs_limit, |sql_lit, sql_hash| {
                 quote! {
-                    let (result, arena) = pool.#qm(#sql_lit, #sql_hash, params).await?;
+                    let (result, arena) = pool.#qm(#sql_lit, #sql_hash, params)?;
                     if result.len() != 1 {
                         return Err(::bsql_core::error::QueryError::row_count(
                             "exactly 1 row",
@@ -647,7 +1019,7 @@ fn gen_dynamic_executor_impls(
         let fetch_all_dispatcher =
             gen_sqlite_variant_dispatcher(parsed, variants, false, |sql_lit, sql_hash| {
                 quote! {
-                    let (result, arena) = pool.#qm(#sql_lit, #sql_hash, params).await?;
+                    let (result, arena) = pool.#qm(#sql_lit, #sql_hash, params)?;
                     let mut out = Vec::with_capacity(result.len());
                     for _bsql_row_idx in 0..result.len() {
                         out.push(#result_name { #row_decode });
@@ -659,7 +1031,7 @@ fn gen_dynamic_executor_impls(
         let fetch_optional_dispatcher =
             gen_sqlite_variant_dispatcher(parsed, variants, needs_limit, |sql_lit, sql_hash| {
                 quote! {
-                    let (result, arena) = pool.#qm(#sql_lit, #sql_hash, params).await?;
+                    let (result, arena) = pool.#qm(#sql_lit, #sql_hash, params)?;
                     match result.len() {
                         0 => Ok(None),
                         1 => {
@@ -675,21 +1047,21 @@ fn gen_dynamic_executor_impls(
             });
 
         quote! {
-            pub async fn fetch_one(
+            pub fn fetch_one(
                 self,
                 pool: &::bsql_core::SqlitePool,
             ) -> ::bsql_core::BsqlResult<#result_name> {
                 #fetch_one_dispatcher
             }
 
-            pub async fn fetch_all(
+            pub fn fetch_all(
                 self,
                 pool: &::bsql_core::SqlitePool,
             ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
                 #fetch_all_dispatcher
             }
 
-            pub async fn fetch_optional(
+            pub fn fetch_optional(
                 self,
                 pool: &::bsql_core::SqlitePool,
             ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
@@ -703,12 +1075,12 @@ fn gen_dynamic_executor_impls(
     let execute_dispatcher =
         gen_sqlite_variant_dispatcher(parsed, variants, false, |sql_lit, sql_hash| {
             quote! {
-                pool.execute_sql(#sql_lit, #sql_hash, params).await
+                pool.execute_sql(#sql_lit, #sql_hash, params)
             }
         });
 
     let execute_method = quote! {
-        pub async fn execute(
+        pub fn execute(
             self,
             pool: &::bsql_core::SqlitePool,
         ) -> ::bsql_core::BsqlResult<u64> {
@@ -996,13 +1368,13 @@ pub fn generate_sort_sqlite_query_code(
         quote! {
             #[allow(non_camel_case_types)]
             impl<'_bsql> #executor_name<'_bsql> {
-                pub async fn fetch_one(
+                pub fn fetch_one(
                     self,
                     pool: &::bsql_core::SqlitePool,
                 ) -> ::bsql_core::BsqlResult<#result_name> {
                     #params_build
                     #build_limited_sql
-                    let (result, arena) = pool.#qm(&sql, sql_hash, params).await?;
+                    let (result, arena) = pool.#qm(&sql, sql_hash, params)?;
                     if result.len() != 1 {
                         return Err(::bsql_core::error::QueryError::row_count(
                             "exactly 1 row",
@@ -1013,13 +1385,13 @@ pub fn generate_sort_sqlite_query_code(
                     Ok(#result_name { #row_decode })
                 }
 
-                pub async fn fetch_all(
+                pub fn fetch_all(
                     self,
                     pool: &::bsql_core::SqlitePool,
                 ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
                     #params_build
                     #build_sql
-                    let (result, arena) = pool.#qm(&sql, sql_hash, params).await?;
+                    let (result, arena) = pool.#qm(&sql, sql_hash, params)?;
                     let mut out = Vec::with_capacity(result.len());
                     for _bsql_row_idx in 0..result.len() {
                         out.push(#result_name { #row_decode });
@@ -1027,13 +1399,13 @@ pub fn generate_sort_sqlite_query_code(
                     Ok(out)
                 }
 
-                pub async fn fetch_optional(
+                pub fn fetch_optional(
                     self,
                     pool: &::bsql_core::SqlitePool,
                 ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
                     #params_build
                     #build_limited_sql
-                    let (result, arena) = pool.#qm(&sql, sql_hash, params).await?;
+                    let (result, arena) = pool.#qm(&sql, sql_hash, params)?;
                     match result.len() {
                         0 => Ok(None),
                         1 => {
@@ -1047,13 +1419,13 @@ pub fn generate_sort_sqlite_query_code(
                     }
                 }
 
-                pub async fn execute(
+                pub fn execute(
                     self,
                     pool: &::bsql_core::SqlitePool,
                 ) -> ::bsql_core::BsqlResult<u64> {
                     #params_build
                     #build_sql
-                    pool.execute_sql(&sql, sql_hash, params).await
+                    pool.execute_sql(&sql, sql_hash, params)
                 }
             }
         }
@@ -1062,13 +1434,13 @@ pub fn generate_sort_sqlite_query_code(
         quote! {
             #[allow(non_camel_case_types)]
             impl<'_bsql> #executor_name<'_bsql> {
-                pub async fn execute(
+                pub fn execute(
                     self,
                     pool: &::bsql_core::SqlitePool,
                 ) -> ::bsql_core::BsqlResult<u64> {
                     #params_build
                     #build_sql
-                    pool.execute_sql(&sql, sql_hash, params).await
+                    pool.execute_sql(&sql, sql_hash, params)
                 }
             }
         }
