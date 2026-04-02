@@ -24,6 +24,7 @@ pub fn generate_sqlite_query_code(
 ) -> TokenStream {
     let sqlite_sql = pg_to_sqlite_params(&parsed.positional_sql);
     let result_struct = gen_result_struct(parsed, validation);
+    let arena_result_struct = gen_arena_result_struct(parsed, validation);
     let executor_struct = gen_executor_struct(parsed);
     let executor_impls = gen_executor_impls(parsed, validation, &sqlite_sql);
     let constructor = gen_constructor(parsed);
@@ -31,6 +32,7 @@ pub fn generate_sqlite_query_code(
     quote! {
         {
             #result_struct
+            #arena_result_struct
             #executor_struct
             #executor_impls
             #constructor
@@ -50,6 +52,84 @@ fn gen_result_struct(parsed: &ParsedQuery, validation: &ValidationResult) -> Tok
     let fields = validation.columns.iter().enumerate().map(|(i, col)| {
         let field_name = format_ident!("{}", deduped_names[i]);
         let field_type = parse_result_type(&col.rust_type);
+        quote! { pub #field_name: #field_type }
+    });
+
+    quote! {
+        #[derive(Debug)]
+        #[allow(non_camel_case_types)]
+        pub struct #struct_name {
+            #(#fields,)*
+        }
+    }
+}
+
+// --- Arena result struct (for fetch_all with text/blob columns) ---
+
+/// Returns true if any column in the result set is String, Vec<u8>, or
+/// an Option wrapping one of those — i.e., types that require heap allocation
+/// in the non-arena path and benefit from arena-backed borrowed references.
+fn has_arena_columns(validation: &ValidationResult) -> bool {
+    validation
+        .columns
+        .iter()
+        .any(|col| is_arena_type(&col.rust_type))
+}
+
+/// Returns true if `rust_type` is a type that benefits from arena allocation.
+fn is_arena_type(rust_type: &str) -> bool {
+    match rust_type {
+        "String" | "Vec<u8>" => true,
+        _ => {
+            if let Some(inner) = rust_type
+                .strip_prefix("Option<")
+                .and_then(|s| s.strip_suffix('>'))
+            {
+                matches!(inner, "String" | "Vec<u8>")
+            } else {
+                false
+            }
+        }
+    }
+}
+
+/// Convert a column rust_type to its arena-borrowed equivalent.
+/// String -> &'static str, Vec<u8> -> &'static [u8], Option<String> -> Option<&'static str>, etc.
+fn arena_result_type(type_str: &str) -> TokenStream {
+    match type_str {
+        "String" => quote! { &'static str },
+        "Vec<u8>" => quote! { &'static [u8] },
+        _ => {
+            if let Some(inner) = type_str
+                .strip_prefix("Option<")
+                .and_then(|s| s.strip_suffix('>'))
+            {
+                match inner {
+                    "String" => quote! { Option<&'static str> },
+                    "Vec<u8>" => quote! { Option<&'static [u8]> },
+                    _ => parse_result_type(type_str),
+                }
+            } else {
+                parse_result_type(type_str)
+            }
+        }
+    }
+}
+
+fn arena_result_struct_name(parsed: &ParsedQuery) -> proc_macro2::Ident {
+    format_ident!("BsqlArenaResult_{}", &parsed.statement_name)
+}
+
+fn gen_arena_result_struct(parsed: &ParsedQuery, validation: &ValidationResult) -> TokenStream {
+    if validation.columns.is_empty() || !has_arena_columns(validation) {
+        return TokenStream::new();
+    }
+
+    let struct_name = arena_result_struct_name(parsed);
+    let deduped_names = deduplicate_column_names(&validation.columns);
+    let fields = validation.columns.iter().enumerate().map(|(i, col)| {
+        let field_name = format_ident!("{}", deduped_names[i]);
+        let field_type = arena_result_type(&col.rust_type);
         quote! { pub #field_name: #field_type }
     });
 
@@ -162,8 +242,58 @@ fn gen_executor_impls(
         TokenStream::new()
     };
 
+    let use_arena = has_columns && has_arena_columns(validation);
+
+    let arena_decode = if use_arena {
+        gen_sqlite_arena_decode(validation)
+    } else {
+        TokenStream::new()
+    };
+
     let fetch_methods = if has_columns {
         let result_name = result_struct_name(parsed);
+
+        let fetch_all_method = if use_arena {
+            let arena_name = arena_result_struct_name(parsed);
+            quote! {
+                /// Fetch all rows. Arena-backed — text/blob columns borrow from a
+                /// contiguous bump allocator instead of individual heap allocations.
+                pub fn fetch_all(
+                    self,
+                    pool: &::bsql_core::SqlitePool,
+                ) -> ::bsql_core::BsqlResult<::bsql_core::driver_sqlite::ArenaRows<#arena_name>> {
+                    #direct_params_build
+                    pool.fetch_all_arena(
+                        #sql_lit,
+                        #sql_hash_val,
+                        _bsql_params,
+                        #is_write,
+                        |_bsql_stmt, _bsql_arena| {
+                            Ok(#arena_name { #arena_decode })
+                        },
+                    )
+                }
+            }
+        } else {
+            quote! {
+                /// Fetch all rows. Zero-copy direct decode — no arena allocation.
+                pub fn fetch_all(
+                    self,
+                    pool: &::bsql_core::SqlitePool,
+                ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
+                    #direct_params_build
+                    pool.fetch_all_direct(
+                        #sql_lit,
+                        #sql_hash_val,
+                        _bsql_params,
+                        #is_write,
+                        |_bsql_stmt| {
+                            Ok(#result_name { #direct_decode })
+                        },
+                    )
+                }
+            }
+        };
 
         quote! {
             /// Fetch exactly one row. Zero-copy direct decode — no arena allocation.
@@ -183,22 +313,7 @@ fn gen_executor_impls(
                 )
             }
 
-            /// Fetch all rows. Zero-copy direct decode — no arena allocation.
-            pub fn fetch_all(
-                self,
-                pool: &::bsql_core::SqlitePool,
-            ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
-                #direct_params_build
-                pool.fetch_all_direct(
-                    #sql_lit,
-                    #sql_hash_val,
-                    _bsql_params,
-                    #is_write,
-                    |_bsql_stmt| {
-                        Ok(#result_name { #direct_decode })
-                    },
-                )
-            }
+            #fetch_all_method
 
             /// Fetch zero or one row. Zero-copy direct decode — no arena allocation.
             pub fn fetch_optional(
@@ -593,6 +708,108 @@ fn gen_sqlite_direct_feature_gated_decode(idx: i32, rust_type: &str) -> TokenStr
     }
 }
 
+// --- Arena-backed decode for fetch_all ---
+//
+// These functions generate decode code that copies text/blob data into the arena
+// and returns &'static str / &'static [u8] via lifetime extension. Non-text
+// columns (integers, floats, bools) are decoded identically to the direct path.
+
+fn gen_sqlite_arena_decode(validation: &ValidationResult) -> TokenStream {
+    let deduped_names = deduplicate_column_names(&validation.columns);
+    let fields = deduped_names.iter().enumerate().map(|(i, name)| {
+        let field_name = format_ident!("{}", name);
+        let col = &validation.columns[i];
+        let col_idx = i as i32;
+        let decode_expr = gen_sqlite_arena_column_decode(col_idx, &col.rust_type);
+        quote! { #field_name: #decode_expr }
+    });
+
+    quote! { #(#fields),* }
+}
+
+fn gen_sqlite_arena_column_decode(idx: i32, rust_type: &str) -> TokenStream {
+    if let Some(inner) = rust_type
+        .strip_prefix("Option<")
+        .and_then(|s| s.strip_suffix('>'))
+    {
+        gen_sqlite_arena_nullable_decode(idx, inner)
+    } else {
+        gen_sqlite_arena_not_null_decode(idx, rust_type)
+    }
+}
+
+fn gen_sqlite_arena_not_null_decode(idx: i32, rust_type: &str) -> TokenStream {
+    let col_idx_str = idx.to_string();
+    match rust_type {
+        // Text: copy into arena, return &'static str
+        "String" => {
+            let err = gen_direct_decode_error(&col_idx_str, "&str");
+            quote! {
+                {
+                    let _bsql_bytes = _bsql_stmt.column_text(#idx)
+                        .ok_or_else(|| #err)?;
+                    let _bsql_off = _bsql_arena.alloc_copy(_bsql_bytes);
+                    let _bsql_s = _bsql_arena.get_str(_bsql_off, _bsql_bytes.len())
+                        .ok_or_else(|| ::bsql_core::driver_sqlite::SqliteError::Internal(
+                            format!("invalid UTF-8 in column {}", #col_idx_str),
+                        ))?;
+                    unsafe { ::bsql_core::driver_sqlite::extend_lifetime_str(_bsql_s) }
+                }
+            }
+        }
+        // Blob: copy into arena, return &'static [u8]
+        "Vec<u8>" => {
+            let err = gen_direct_decode_error(&col_idx_str, "&[u8]");
+            quote! {
+                {
+                    if _bsql_stmt.column_type(#idx) == ::bsql_core::driver_sqlite::SQLITE_NULL {
+                        return Err(#err);
+                    }
+                    let _bsql_raw = _bsql_stmt.column_blob(#idx);
+                    let _bsql_off = _bsql_arena.alloc_copy(_bsql_raw);
+                    let _bsql_slice = _bsql_arena.get(_bsql_off, _bsql_raw.len());
+                    unsafe { ::bsql_core::driver_sqlite::extend_lifetime_bytes(_bsql_slice) }
+                }
+            }
+        }
+        // All non-text types: identical to direct decode (no arena needed)
+        _ => gen_sqlite_direct_not_null_decode(idx, rust_type),
+    }
+}
+
+fn gen_sqlite_arena_nullable_decode(idx: i32, inner_type: &str) -> TokenStream {
+    match inner_type {
+        // Option<String> -> Option<&'static str>
+        "String" => quote! {
+            match _bsql_stmt.column_text(#idx) {
+                None => None,
+                Some(_bsql_bytes) => {
+                    let _bsql_off = _bsql_arena.alloc_copy(_bsql_bytes);
+                    match _bsql_arena.get_str(_bsql_off, _bsql_bytes.len()) {
+                        Some(_bsql_s) => Some(unsafe {
+                            ::bsql_core::driver_sqlite::extend_lifetime_str(_bsql_s)
+                        }),
+                        None => None,
+                    }
+                }
+            }
+        },
+        // Option<Vec<u8>> -> Option<&'static [u8]>
+        "Vec<u8>" => quote! {
+            if _bsql_stmt.column_type(#idx) == ::bsql_core::driver_sqlite::SQLITE_NULL {
+                None
+            } else {
+                let _bsql_raw = _bsql_stmt.column_blob(#idx);
+                let _bsql_off = _bsql_arena.alloc_copy(_bsql_raw);
+                let _bsql_slice = _bsql_arena.get(_bsql_off, _bsql_raw.len());
+                Some(unsafe { ::bsql_core::driver_sqlite::extend_lifetime_bytes(_bsql_slice) })
+            }
+        },
+        // Non-text option types: identical to direct decode
+        _ => gen_sqlite_direct_nullable_decode(idx, inner_type),
+    }
+}
+
 // --- Param to ParamValue conversion ---
 
 fn gen_param_to_param_value(name: &proc_macro2::Ident, rust_type: &str) -> TokenStream {
@@ -806,6 +1023,7 @@ pub fn generate_dynamic_sqlite_query_code(
     variants: &[QueryVariant],
 ) -> TokenStream {
     let result_struct = gen_result_struct(parsed, validation);
+    let arena_result_struct = gen_arena_result_struct(parsed, validation);
     let executor_struct = gen_dynamic_executor_struct(parsed);
     let executor_impls = gen_dynamic_executor_impls(parsed, validation, variants);
     let constructor = gen_dynamic_constructor(parsed);
@@ -813,6 +1031,7 @@ pub fn generate_dynamic_sqlite_query_code(
     quote! {
         {
             #result_struct
+            #arena_result_struct
             #executor_struct
             #executor_impls
             #constructor
@@ -871,6 +1090,14 @@ fn gen_dynamic_executor_impls(
         TokenStream::new()
     };
 
+    let use_arena = has_columns && has_arena_columns(validation);
+
+    let arena_decode = if use_arena {
+        gen_sqlite_arena_decode(validation)
+    } else {
+        TokenStream::new()
+    };
+
     let fetch_methods = if has_columns {
         let result_name = result_struct_name(parsed);
         let needs_limit = has_columns && is_select && !parsed.normalized_sql.contains(" limit ");
@@ -894,20 +1121,62 @@ fn gen_dynamic_executor_impls(
             },
         );
 
-        let fetch_all_dispatcher =
-            gen_sqlite_direct_variant_dispatcher(parsed, variants, false, |sql_lit, sql_hash| {
-                quote! {
-                    pool.fetch_all_direct(
-                        #sql_lit,
-                        #sql_hash,
-                        _bsql_params,
-                        #is_write,
-                        |_bsql_stmt| {
-                            Ok(#result_name { #direct_decode })
-                        },
-                    )
+        let fetch_all_method = if use_arena {
+            let arena_name = arena_result_struct_name(parsed);
+            let fetch_all_dispatcher = gen_sqlite_direct_variant_dispatcher(
+                parsed,
+                variants,
+                false,
+                |sql_lit, sql_hash| {
+                    quote! {
+                        pool.fetch_all_arena(
+                            #sql_lit,
+                            #sql_hash,
+                            _bsql_params,
+                            #is_write,
+                            |_bsql_stmt, _bsql_arena| {
+                                Ok(#arena_name { #arena_decode })
+                            },
+                        )
+                    }
+                },
+            );
+            quote! {
+                pub fn fetch_all(
+                    self,
+                    pool: &::bsql_core::SqlitePool,
+                ) -> ::bsql_core::BsqlResult<::bsql_core::driver_sqlite::ArenaRows<#arena_name>> {
+                    #fetch_all_dispatcher
                 }
-            });
+            }
+        } else {
+            let fetch_all_dispatcher = gen_sqlite_direct_variant_dispatcher(
+                parsed,
+                variants,
+                false,
+                |sql_lit, sql_hash| {
+                    quote! {
+                        pool.fetch_all_direct(
+                            #sql_lit,
+                            #sql_hash,
+                            _bsql_params,
+                            #is_write,
+                            |_bsql_stmt| {
+                                Ok(#result_name { #direct_decode })
+                            },
+                        )
+                    }
+                },
+            );
+            quote! {
+                pub fn fetch_all(
+                    self,
+                    pool: &::bsql_core::SqlitePool,
+                ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
+                    #fetch_all_dispatcher
+                }
+            }
+        };
 
         let fetch_optional_dispatcher = gen_sqlite_direct_variant_dispatcher(
             parsed,
@@ -936,12 +1205,7 @@ fn gen_dynamic_executor_impls(
                 #fetch_one_dispatcher
             }
 
-            pub fn fetch_all(
-                self,
-                pool: &::bsql_core::SqlitePool,
-            ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
-                #fetch_all_dispatcher
-            }
+            #fetch_all_method
 
             pub fn fetch_optional(
                 self,
@@ -1096,6 +1360,7 @@ pub fn generate_sort_sqlite_query_code(
     sort_enum_name: &str,
 ) -> TokenStream {
     let result_struct = gen_result_struct(parsed, validation);
+    let arena_result_struct = gen_arena_result_struct(parsed, validation);
     let sort_enum_ident = format_ident!("{}", sort_enum_name);
     let executor_name = executor_struct_name(parsed);
 
@@ -1223,8 +1488,57 @@ pub fn generate_sort_sqlite_query_code(
         TokenStream::new()
     };
 
+    let use_arena = has_columns && has_arena_columns(validation);
+
+    let arena_decode = if use_arena {
+        gen_sqlite_arena_decode(validation)
+    } else {
+        TokenStream::new()
+    };
+
     let fetch_methods = if has_columns {
         let result_name = result_struct_name(parsed);
+
+        let fetch_all_method = if use_arena {
+            let arena_name = arena_result_struct_name(parsed);
+            quote! {
+                pub fn fetch_all(
+                    self,
+                    pool: &::bsql_core::SqlitePool,
+                ) -> ::bsql_core::BsqlResult<::bsql_core::driver_sqlite::ArenaRows<#arena_name>> {
+                    #direct_params_build
+                    #build_sql
+                    pool.fetch_all_arena(
+                        &sql,
+                        sql_hash,
+                        _bsql_params,
+                        #is_write,
+                        |_bsql_stmt, _bsql_arena| {
+                            Ok(#arena_name { #arena_decode })
+                        },
+                    )
+                }
+            }
+        } else {
+            quote! {
+                pub fn fetch_all(
+                    self,
+                    pool: &::bsql_core::SqlitePool,
+                ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
+                    #direct_params_build
+                    #build_sql
+                    pool.fetch_all_direct(
+                        &sql,
+                        sql_hash,
+                        _bsql_params,
+                        #is_write,
+                        |_bsql_stmt| {
+                            Ok(#result_name { #direct_decode })
+                        },
+                    )
+                }
+            }
+        };
 
         quote! {
             #[allow(non_camel_case_types)]
@@ -1246,22 +1560,7 @@ pub fn generate_sort_sqlite_query_code(
                     )
                 }
 
-                pub fn fetch_all(
-                    self,
-                    pool: &::bsql_core::SqlitePool,
-                ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
-                    #direct_params_build
-                    #build_sql
-                    pool.fetch_all_direct(
-                        &sql,
-                        sql_hash,
-                        _bsql_params,
-                        #is_write,
-                        |_bsql_stmt| {
-                            Ok(#result_name { #direct_decode })
-                        },
-                    )
-                }
+                #fetch_all_method
 
                 pub fn fetch_optional(
                     self,
@@ -1322,6 +1621,7 @@ pub fn generate_sort_sqlite_query_code(
     quote! {
         {
             #result_struct
+            #arena_result_struct
             #executor_struct
             #fetch_methods
             #constructor

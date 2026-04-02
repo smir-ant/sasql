@@ -6,7 +6,7 @@
 //!   BENCH_DATABASE_URL  — PostgreSQL connection string (runtime)
 //!   BSQL_DATABASE_URL   — same URL (compile-time, for bsql::query!)
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
 fn bench_database_url() -> String {
     std::env::var("BENCH_DATABASE_URL").expect("BENCH_DATABASE_URL must be set")

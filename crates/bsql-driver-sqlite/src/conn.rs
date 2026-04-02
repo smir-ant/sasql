@@ -8,8 +8,10 @@
 //! All row data is copied into an `Arena` during the step loop, making the result
 //! independent of the SQLite statement lifetime.
 //!
-//! This module contains **zero** `unsafe` code — all FFI interaction goes through
-//! the safe [`DbHandle`] and [`StmtHandle`] wrapper types in [`crate::ffi`].
+//! All FFI interaction goes through the safe [`DbHandle`] and [`StmtHandle`]
+//! wrapper types in [`crate::ffi`]. The only `unsafe` block is in
+//! `fetch_all_arena` which constructs an `ArenaRows` — a self-referential
+//! struct where rows borrow from a co-owned arena (see `bsql_arena::ArenaRows`).
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
@@ -334,6 +336,47 @@ impl SqliteConnection {
         }
         stmt.reset()?;
         Ok(results)
+    }
+
+    /// Fetch all rows into an arena-backed result. Text and blob data is
+    /// bump-allocated into the arena; the returned `ArenaRows<T>` owns both
+    /// the arena and the decoded rows.
+    ///
+    /// The `decode` closure receives `(&StmtHandle, &mut Arena)`. For text
+    /// columns it should:
+    /// 1. `arena.alloc_copy(bytes)` — copy from SQLite into the arena
+    /// 2. `arena.get_str(offset, len)` — get a `&str` borrowing from the arena
+    /// 3. `extend_lifetime_str(s)` — transmute to `&'static str`
+    ///
+    /// This eliminates per-row heap allocation for strings — all text data
+    /// lives in one contiguous arena that is freed in a single deallocation.
+    #[inline]
+    pub fn fetch_all_arena<F, T>(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&dyn SqliteEncode],
+        decode: F,
+    ) -> Result<bsql_arena::ArenaRows<T>, SqliteError>
+    where
+        F: Fn(&StmtHandle, &mut Arena) -> Result<T, SqliteError>,
+    {
+        let stmt = self.get_or_prepare(sql, sql_hash)?;
+        stmt.clear_bindings();
+        for (i, param) in params.iter().enumerate() {
+            param.bind(stmt, (i + 1) as i32)?;
+        }
+        let mut arena = bsql_arena::acquire_arena();
+        let mut results = Vec::new();
+        while let StepResult::Row = stmt.step()? {
+            results.push(decode(stmt, &mut arena)?);
+        }
+        stmt.reset()?;
+        // SAFETY: The decode closure stored &'static str / &'static [u8]
+        // that actually point into `arena`. The ArenaRows struct guarantees
+        // `results` (Vec<T>) is dropped before `arena` (field declaration
+        // order), so the references are valid for the lifetime of ArenaRows.
+        Ok(unsafe { bsql_arena::ArenaRows::from_raw_parts(results, arena) })
     }
 
     /// Execute a statement via direct param binding. Returns affected row count.
@@ -2184,6 +2227,253 @@ mod tests {
             });
         assert!(result.is_err());
 
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- fetch_all_arena ----
+
+    #[test]
+    fn fetch_all_arena_empty() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER, name TEXT)").unwrap();
+
+        let sql = "SELECT id, name FROM t";
+        let hash = hash_sql(sql);
+        let rows = conn
+            .fetch_all_arena(sql, hash, &[], |stmt, arena| {
+                let id = stmt.column_int64(0);
+                let bytes = stmt.column_text(1).unwrap_or(b"");
+                let off = arena.alloc_copy(bytes);
+                let s = arena.get_str(off, bytes.len()).unwrap();
+                let s = unsafe { bsql_arena::extend_lifetime_str(s) };
+                Ok((id, s))
+            })
+            .unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(rows.len(), 0);
+
+        drop(rows);
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fetch_all_arena_text_columns() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER, name TEXT)").unwrap();
+        conn.exec("INSERT INTO t VALUES (1, 'alice')").unwrap();
+        conn.exec("INSERT INTO t VALUES (2, 'bob')").unwrap();
+        conn.exec("INSERT INTO t VALUES (3, 'charlie')").unwrap();
+
+        let sql = "SELECT id, name FROM t ORDER BY id";
+        let hash = hash_sql(sql);
+
+        struct Row {
+            id: i64,
+            name: &'static str,
+        }
+
+        let rows = conn
+            .fetch_all_arena(sql, hash, &[], |stmt, arena| {
+                let id = stmt.column_int64(0);
+                let bytes = stmt
+                    .column_text(1)
+                    .ok_or_else(|| SqliteError::Internal("null name".into()))?;
+                let off = arena.alloc_copy(bytes);
+                let s = arena
+                    .get_str(off, bytes.len())
+                    .ok_or_else(|| SqliteError::Internal("bad utf8".into()))?;
+                let s = unsafe { bsql_arena::extend_lifetime_str(s) };
+                Ok(Row { id, name: s })
+            })
+            .unwrap();
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].id, 1);
+        assert_eq!(rows[0].name, "alice");
+        assert_eq!(rows[1].id, 2);
+        assert_eq!(rows[1].name, "bob");
+        assert_eq!(rows[2].id, 3);
+        assert_eq!(rows[2].name, "charlie");
+
+        // Verify we can iterate
+        let names: Vec<&str> = rows.iter().map(|r| r.name).collect();
+        assert_eq!(names, vec!["alice", "bob", "charlie"]);
+
+        drop(rows);
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fetch_all_arena_1000_rows() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER, name TEXT)").unwrap();
+        conn.exec("BEGIN").unwrap();
+        for i in 0..1000 {
+            conn.exec(&format!("INSERT INTO t VALUES ({i}, 'user_{i}')"))
+                .unwrap();
+        }
+        conn.exec("COMMIT").unwrap();
+
+        let sql = "SELECT id, name FROM t ORDER BY id";
+        let hash = hash_sql(sql);
+
+        struct Row {
+            id: i64,
+            name: &'static str,
+        }
+
+        let rows = conn
+            .fetch_all_arena(sql, hash, &[], |stmt, arena| {
+                let id = stmt.column_int64(0);
+                let bytes = stmt.column_text(1).unwrap_or(b"");
+                let off = arena.alloc_copy(bytes);
+                let s = arena.get_str(off, bytes.len()).unwrap();
+                let s = unsafe { bsql_arena::extend_lifetime_str(s) };
+                Ok(Row { id, name: s })
+            })
+            .unwrap();
+
+        assert_eq!(rows.len(), 1000);
+        assert_eq!(rows[0].name, "user_0");
+        assert_eq!(rows[999].name, "user_999");
+        assert_eq!(rows[500].id, 500);
+
+        // One arena allocation for all strings
+        assert!(rows.arena_allocated() > 0);
+
+        drop(rows);
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fetch_all_arena_blob_columns() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER, data BLOB)").unwrap();
+        conn.exec("INSERT INTO t VALUES (1, X'DEADBEEF')").unwrap();
+        conn.exec("INSERT INTO t VALUES (2, X'CAFEBABE')").unwrap();
+
+        let sql = "SELECT id, data FROM t ORDER BY id";
+        let hash = hash_sql(sql);
+
+        struct Row {
+            id: i64,
+            data: &'static [u8],
+        }
+
+        let rows = conn
+            .fetch_all_arena(sql, hash, &[], |stmt, arena| {
+                let id = stmt.column_int64(0);
+                let raw = stmt.column_blob(1);
+                let off = arena.alloc_copy(raw);
+                let slice = arena.get(off, raw.len());
+                let slice = unsafe { bsql_arena::extend_lifetime_bytes(slice) };
+                Ok(Row { id, data: slice })
+            })
+            .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].data, &[0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(rows[1].data, &[0xCA, 0xFE, 0xBA, 0xBE]);
+
+        drop(rows);
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fetch_all_arena_null_text_handling() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER, name TEXT)").unwrap();
+        conn.exec("INSERT INTO t VALUES (1, 'present')").unwrap();
+        conn.exec("INSERT INTO t VALUES (2, NULL)").unwrap();
+        conn.exec("INSERT INTO t VALUES (3, 'also_present')")
+            .unwrap();
+
+        let sql = "SELECT id, name FROM t ORDER BY id";
+        let hash = hash_sql(sql);
+
+        struct Row {
+            id: i64,
+            name: Option<&'static str>,
+        }
+
+        let rows = conn
+            .fetch_all_arena(sql, hash, &[], |stmt, arena| {
+                let id = stmt.column_int64(0);
+                let name = match stmt.column_text(1) {
+                    None => None,
+                    Some(bytes) => {
+                        let off = arena.alloc_copy(bytes);
+                        let s = arena.get_str(off, bytes.len()).unwrap();
+                        Some(unsafe { bsql_arena::extend_lifetime_str(s) })
+                    }
+                };
+                Ok(Row { id, name })
+            })
+            .unwrap();
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].name, Some("present"));
+        assert_eq!(rows[1].name, None);
+        assert_eq!(rows[2].name, Some("also_present"));
+
+        drop(rows);
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fetch_all_arena_decode_error() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER)").unwrap();
+        conn.exec("INSERT INTO t VALUES (1)").unwrap();
+
+        let sql = "SELECT id FROM t";
+        let hash = hash_sql(sql);
+        let result: Result<bsql_arena::ArenaRows<i64>, SqliteError> =
+            conn.fetch_all_arena(sql, hash, &[], |_stmt, _arena| {
+                Err(SqliteError::Internal("forced error".into()))
+            });
+        assert!(result.is_err());
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fetch_all_arena_integers_only() {
+        // Verify arena path works for integer-only queries too (no text columns)
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (a INTEGER, b INTEGER)").unwrap();
+        conn.exec("INSERT INTO t VALUES (1, 10)").unwrap();
+        conn.exec("INSERT INTO t VALUES (2, 20)").unwrap();
+
+        let sql = "SELECT a, b FROM t ORDER BY a";
+        let hash = hash_sql(sql);
+        let rows = conn
+            .fetch_all_arena(sql, hash, &[], |stmt, _arena| {
+                Ok((stmt.column_int64(0), stmt.column_int64(1)))
+            })
+            .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], (1, 10));
+        assert_eq!(rows[1], (2, 20));
+        // Arena should have zero allocated bytes (no text)
+        assert_eq!(rows.arena_allocated(), 0);
+
+        drop(rows);
         drop(conn);
         let _ = std::fs::remove_file(&path);
     }

@@ -6,7 +6,7 @@
 //!   BENCH_SQLITE_PATH     — path to the SQLite database file (runtime)
 //!   BSQL_DATABASE_URL     — sqlite://<same path> (compile-time, for bsql::query!)
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 
 fn bench_sqlite_path() -> String {
     std::env::var("BENCH_SQLITE_PATH").expect("BENCH_SQLITE_PATH must be set")
@@ -33,10 +33,9 @@ fn bench_sqlite_fetch_one(c: &mut Criterion) {
     // Warm up
     {
         let id = 42i64;
-        let _row =
-            bsql::query!("SELECT id, name, email FROM bench_users WHERE id = $id: i64")
-                .fetch_one(&bsql_pool)
-                .unwrap();
+        let _row = bsql::query!("SELECT id, name, email FROM bench_users WHERE id = $id: i64")
+            .fetch_one(&bsql_pool)
+            .unwrap();
     }
     rt.block_on(async {
         let _row: (i64, String, String) =
@@ -72,10 +71,9 @@ fn bench_sqlite_fetch_one(c: &mut Criterion) {
     group.bench_function("bsql", |b| {
         b.iter(|| {
             let id = 42i64;
-            let _user =
-                bsql::query!("SELECT id, name, email FROM bench_users WHERE id = $id: i64")
-                    .fetch_one(&bsql_pool)
-                    .unwrap();
+            let _user = bsql::query!("SELECT id, name, email FROM bench_users WHERE id = $id: i64")
+                .fetch_one(&bsql_pool)
+                .unwrap();
         });
     });
 

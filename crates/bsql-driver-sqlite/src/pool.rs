@@ -261,6 +261,28 @@ impl SqlitePool {
         }
     }
 
+    /// Fetch all rows into an arena-backed result — zero per-row heap allocation
+    /// for text and blob columns. See [`SqliteConnection::fetch_all_arena`] for details.
+    pub fn fetch_all_arena<F, T>(
+        &self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&dyn SqliteEncode],
+        is_write: bool,
+        decode: F,
+    ) -> Result<bsql_arena::ArenaRows<T>, SqliteError>
+    where
+        F: Fn(&StmtHandle, &mut bsql_arena::Arena) -> Result<T, SqliteError>,
+    {
+        if is_write {
+            let mut conn = self.acquire_writer()?;
+            conn.fetch_all_arena(sql, sql_hash, params, decode)
+        } else {
+            let mut conn = self.acquire_reader()?;
+            conn.fetch_all_arena(sql, sql_hash, params, decode)
+        }
+    }
+
     /// Execute a statement via direct param binding — zero arena/ParamValue overhead.
     ///
     /// Takes `&[&dyn SqliteEncode]` directly instead of `SmallVec<ParamValue>`.
@@ -1825,6 +1847,143 @@ mod tests {
         let sql_hash = hash_sql(sql);
         let affected = pool.execute_direct(sql, sql_hash, &[]).unwrap();
         assert_eq!(affected, 1);
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- fetch_all_arena pool tests ----
+
+    #[test]
+    fn pool_fetch_all_arena_text() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER, name TEXT)")
+            .unwrap();
+        pool.simple_exec("INSERT INTO t VALUES (1, 'alice')")
+            .unwrap();
+        pool.simple_exec("INSERT INTO t VALUES (2, 'bob')").unwrap();
+
+        let sql = "SELECT id, name FROM t ORDER BY id";
+        let sql_hash = hash_sql(sql);
+
+        struct Row {
+            id: i64,
+            name: &'static str,
+        }
+
+        let rows = pool
+            .fetch_all_arena(sql, sql_hash, &[], false, |stmt, arena| {
+                let id = stmt.column_int64(0);
+                let bytes = stmt
+                    .column_text(1)
+                    .ok_or_else(|| SqliteError::Internal("null".into()))?;
+                let off = arena.alloc_copy(bytes);
+                let s = arena.get_str(off, bytes.len()).unwrap();
+                let s = unsafe { bsql_arena::extend_lifetime_str(s) };
+                Ok(Row { id, name: s })
+            })
+            .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, 1);
+        assert_eq!(rows[0].name, "alice");
+        assert_eq!(rows[1].id, 2);
+        assert_eq!(rows[1].name, "bob");
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pool_fetch_all_arena_empty() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (name TEXT)").unwrap();
+
+        let sql = "SELECT name FROM t";
+        let sql_hash = hash_sql(sql);
+        let rows = pool
+            .fetch_all_arena(sql, sql_hash, &[], false, |stmt, arena| {
+                let bytes = stmt.column_text(0).unwrap_or(b"");
+                let off = arena.alloc_copy(bytes);
+                let s = arena.get_str(off, bytes.len()).unwrap();
+                Ok(unsafe { bsql_arena::extend_lifetime_str(s) })
+            })
+            .unwrap();
+        assert!(rows.is_empty());
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pool_fetch_all_arena_writer() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER, name TEXT)")
+            .unwrap();
+        pool.simple_exec("INSERT INTO t VALUES (1, 'test')")
+            .unwrap();
+
+        // is_write = true routes to writer
+        let sql = "SELECT id, name FROM t";
+        let sql_hash = hash_sql(sql);
+        let rows = pool
+            .fetch_all_arena(sql, sql_hash, &[], true, |stmt, arena| {
+                let id = stmt.column_int64(0);
+                let bytes = stmt.column_text(1).unwrap_or(b"");
+                let off = arena.alloc_copy(bytes);
+                let s = arena.get_str(off, bytes.len()).unwrap();
+                let s = unsafe { bsql_arena::extend_lifetime_str(s) };
+                Ok((id, s))
+            })
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, 1);
+        assert_eq!(rows[0].1, "test");
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pool_fetch_all_arena_1000_rows() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER, name TEXT)")
+            .unwrap();
+        pool.simple_exec("BEGIN").unwrap();
+        for i in 0..1000 {
+            pool.simple_exec(&format!("INSERT INTO t VALUES ({i}, 'name_{i}')"))
+                .unwrap();
+        }
+        pool.simple_exec("COMMIT").unwrap();
+
+        let sql = "SELECT id, name FROM t ORDER BY id";
+        let sql_hash = hash_sql(sql);
+
+        struct Row {
+            id: i64,
+            name: &'static str,
+        }
+
+        let rows = pool
+            .fetch_all_arena(sql, sql_hash, &[], false, |stmt, arena| {
+                let id = stmt.column_int64(0);
+                let bytes = stmt.column_text(1).unwrap_or(b"");
+                let off = arena.alloc_copy(bytes);
+                let s = arena.get_str(off, bytes.len()).unwrap();
+                let s = unsafe { bsql_arena::extend_lifetime_str(s) };
+                Ok(Row { id, name: s })
+            })
+            .unwrap();
+
+        assert_eq!(rows.len(), 1000);
+        assert_eq!(rows[0].name, "name_0");
+        assert_eq!(rows[999].name, "name_999");
+        assert!(rows.arena_allocated() > 0);
 
         drop(pool);
         let _ = std::fs::remove_file(&path);

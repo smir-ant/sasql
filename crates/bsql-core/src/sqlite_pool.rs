@@ -171,6 +171,27 @@ impl SqlitePool {
             .map_err(BsqlError::from_sqlite)
     }
 
+    /// Fetch all rows into an arena-backed result — zero per-row heap allocation
+    /// for text/blob columns. See [`bsql_driver_sqlite::conn::SqliteConnection::fetch_all_arena`].
+    pub fn fetch_all_arena<F, T>(
+        &self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&dyn bsql_driver_sqlite::codec::SqliteEncode],
+        is_write: bool,
+        decode: F,
+    ) -> BsqlResult<bsql_arena::ArenaRows<T>>
+    where
+        F: Fn(
+            &bsql_driver_sqlite::ffi::StmtHandle,
+            &mut bsql_arena::Arena,
+        ) -> Result<T, bsql_driver_sqlite::SqliteError>,
+    {
+        self.inner
+            .fetch_all_arena(sql, sql_hash, params, is_write, decode)
+            .map_err(BsqlError::from_sqlite)
+    }
+
     /// Execute a statement via direct param binding — zero arena/ParamValue overhead.
     ///
     /// Takes `&[&dyn SqliteEncode]` directly instead of `SmallVec<ParamValue>`.

@@ -56,6 +56,9 @@ pub mod driver_sqlite {
     pub use bsql_driver_sqlite::pool::ParamValue;
     pub use smallvec::{SmallVec, smallvec};
 
+    // Arena types for arena-backed fetch_all
+    pub use bsql_arena::{Arena, ArenaRows, extend_lifetime_bytes, extend_lifetime_str};
+
     /// SQLite NULL type indicator (matches `SQLITE_NULL` = 5).
     /// Re-exported here so generated code does not need a direct libsqlite3-sys dep.
     pub const SQLITE_NULL: i32 = 5;
