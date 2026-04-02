@@ -30,8 +30,8 @@ use crate::conn::{Config, Connection, QueryResult};
 /// # Example
 ///
 /// ```no_run
-/// # async fn example() -> Result<(), bsql_driver::DriverError> {
-/// let pool = bsql_driver::Pool::connect("postgres://user:pass@localhost/db").await?;
+/// # async fn example() -> Result<(), bsql_driver_postgres::DriverError> {
+/// let pool = bsql_driver_postgres::Pool::connect("postgres://user:pass@localhost/db").await?;
 /// let mut conn = pool.acquire().await?;
 /// conn.simple_query("SELECT 1").await?;
 /// // conn is returned to pool on drop
@@ -269,8 +269,8 @@ impl Pool {
     /// # Example
     ///
     /// ```no_run
-    /// # async fn example() -> Result<(), bsql_driver::DriverError> {
-    /// let pool = bsql_driver::Pool::connect("postgres://user:pass@localhost/db").await?;
+    /// # async fn example() -> Result<(), bsql_driver_postgres::DriverError> {
+    /// let pool = bsql_driver_postgres::Pool::connect("postgres://user:pass@localhost/db").await?;
     /// pool.set_warmup_sqls(&[
     ///     "SELECT id, name FROM users WHERE id = $1::int4",
     ///     "SELECT id, title FROM tickets WHERE status = ANY($1::text[])",
@@ -550,8 +550,8 @@ impl Drop for PoolGuard {
 /// # Example
 ///
 /// ```no_run
-/// # async fn example() -> Result<(), bsql_driver::DriverError> {
-/// # let pool = bsql_driver::Pool::connect("postgres://user:pass@localhost/db").await?;
+/// # async fn example() -> Result<(), bsql_driver_postgres::DriverError> {
+/// # let pool = bsql_driver_postgres::Pool::connect("postgres://user:pass@localhost/db").await?;
 /// let mut tx = pool.begin().await?;
 /// tx.simple_query("INSERT INTO t VALUES (1)").await?;
 /// tx.commit().await?;

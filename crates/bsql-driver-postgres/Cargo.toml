@@ -1,5 +1,5 @@
 [package]
-name = "bsql-driver"
+name = "bsql-driver-postgres"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,6 +16,7 @@ uuid = ["dep:uuid"]
 decimal = ["dep:rust_decimal"]
 
 [dependencies]
+bsql-arena = { workspace = true }
 tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "time"] }
 rapidhash = { workspace = true }
 simdutf8 = { version = "0.1", default-features = false, features = ["std"] }

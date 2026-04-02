@@ -15,10 +15,14 @@ uuid = ["bsql-core/uuid", "bsql-macros/uuid"]
 decimal = ["bsql-core/decimal", "bsql-macros/decimal"]
 explain = ["bsql-macros/explain"]
 tls = ["bsql-core/tls", "bsql-macros/tls"]
+sqlite = ["bsql-core/sqlite", "bsql-macros/sqlite", "dep:bsql-driver-sqlite"]
 
 [dependencies]
 bsql-core = { workspace = true }
 bsql-macros = { workspace = true }
+
+# SQLite (optional)
+bsql-driver-sqlite = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

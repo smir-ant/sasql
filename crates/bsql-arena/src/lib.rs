@@ -1,3 +1,6 @@
+#![forbid(unsafe_code)]
+#![deny(clippy::all)]
+
 //! Bump allocator for row data — one allocation per query result.
 //!
 //! All row data (strings, byte arrays) from a single query is allocated into a
@@ -36,7 +39,7 @@ const SHRINK_THRESHOLD: usize = 64 * 1024;
 /// # Example
 ///
 /// ```
-/// use bsql_driver::Arena;
+/// use bsql_arena::Arena;
 ///
 /// let mut arena = Arena::new();
 /// let offset = arena.alloc_copy(b"hello");
@@ -291,7 +294,7 @@ thread_local! {
 /// # Example
 ///
 /// ```
-/// use bsql_driver::arena::{acquire_arena, release_arena};
+/// use bsql_arena::{acquire_arena, release_arena};
 ///
 /// let mut arena = acquire_arena();
 /// let offset = arena.alloc_copy(b"data");

@@ -891,7 +891,7 @@ fn gen_stream_struct(
     }
 }
 
-/// Generate row field decoding using typed getters from bsql_driver::Row.
+/// Generate row field decoding using typed getters from bsql_driver_postgres::Row.
 ///
 /// For each column, generates the appropriate getter call based on the Rust type:
 /// - `i32` -> `row.get_i32(idx).unwrap_or_default()`

@@ -7,6 +7,8 @@
 extern crate proc_macro;
 
 mod codegen;
+#[cfg(feature = "sqlite")]
+mod codegen_sqlite;
 mod connection;
 mod dynamic;
 mod offline;
@@ -17,7 +19,11 @@ mod sql_norm;
 mod stmt_name;
 mod suggest;
 pub(crate) mod types;
+#[cfg(feature = "sqlite")]
+mod types_sqlite;
 mod validate;
+#[cfg(feature = "sqlite")]
+mod validate_sqlite;
 
 use proc_macro::TokenStream;
 
@@ -71,6 +77,22 @@ fn query_impl(input: proc_macro2::TokenStream) -> Result<proc_macro2::TokenStrea
     let parsed = parse::parse_query(&sql)
         .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?;
 
+    // Detect backend from database URL (if not offline)
+    #[cfg(feature = "sqlite")]
+    {
+        let backend = connection::detect_backend()
+            .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?;
+        if backend == Some(connection::Backend::Sqlite) {
+            return query_impl_sqlite(parsed);
+        }
+    }
+
+    // PostgreSQL path (default)
+    query_impl_postgres(parsed)
+}
+
+/// PostgreSQL query implementation (the original path).
+fn query_impl_postgres(parsed: parse::ParsedQuery) -> Result<proc_macro2::TokenStream, syn::Error> {
     // 2. Sort query path — $[sort: EnumType] present
     if parsed.sort_placeholder.is_some() {
         return query_impl_sort(parsed);
@@ -88,8 +110,8 @@ fn query_impl(input: proc_macro2::TokenStream) -> Result<proc_macro2::TokenStrea
                 .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?
         } else {
             // ONLINE: validate against PostgreSQL via PREPARE with suggestions
-            let result = connection::with_connection(|rt, client| {
-                validate::validate_query_with_suggestions(&parsed, rt, client)
+            let result = connection::with_connection(|rt, conn| {
+                validate::validate_query_with_suggestions(&parsed, rt, conn)
             })?;
 
             // Write to offline cache for future use
@@ -120,8 +142,8 @@ fn query_impl(input: proc_macro2::TokenStream) -> Result<proc_macro2::TokenStrea
                 .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?
         } else {
             // ONLINE: validate ALL variants against PostgreSQL and check param types
-            let result = connection::with_connection(|rt, client| {
-                validate::validate_variants(&variants, &parsed, rt, client)
+            let result = connection::with_connection(|rt, conn| {
+                validate::validate_variants(&variants, &parsed, rt, conn)
             })?;
 
             // Write to offline cache for future use
@@ -137,6 +159,51 @@ fn query_impl(input: proc_macro2::TokenStream) -> Result<proc_macro2::TokenStrea
             &variants,
         ))
     }
+}
+
+/// SQLite query implementation.
+///
+/// Validates against a live SQLite database at compile time, then generates
+/// code that executes via `bsql_core::SqlitePool`.
+#[cfg(feature = "sqlite")]
+fn query_impl_sqlite(parsed: parse::ParsedQuery) -> Result<proc_macro2::TokenStream, syn::Error> {
+    // Sort queries and dynamic (optional clause) queries are not yet
+    // supported for SQLite. Emit a clear compile error.
+    if parsed.sort_placeholder.is_some() {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "bsql: $[sort: EnumType] is not yet supported for SQLite queries",
+        ));
+    }
+    if !parsed.optional_clauses.is_empty() {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "bsql: optional clauses ([...]) are not yet supported for SQLite queries",
+        ));
+    }
+
+    let validation = if offline::is_offline() {
+        offline::lookup_cached_validation(&parsed)
+            .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?
+    } else {
+        let result = connection::with_sqlite_connection(|conn| {
+            validate_sqlite::validate_query_sqlite(&parsed, conn)
+        })?;
+
+        // Write to offline cache for future use
+        offline::write_cache(&parsed, &result);
+
+        result
+    };
+
+    // SQLite doesn't type parameters at prepare time, so we skip
+    // the PG-style param type check. Parameter types are verified
+    // at runtime by the SqliteEncode trait.
+
+    Ok(codegen_sqlite::generate_sqlite_query_code(
+        &parsed,
+        &validation,
+    ))
 }
 
 /// Handle sort queries — queries with `$[sort: EnumType]`.
@@ -184,8 +251,8 @@ fn query_impl_sort(parsed: parse::ParsedQuery) -> Result<proc_macro2::TokenStrea
         offline::lookup_cached_validation(&parsed)
             .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?
     } else {
-        let result = connection::with_connection(|rt, client| {
-            validate::validate_query_with_suggestions(&dummy_parsed, rt, client)
+        let result = connection::with_connection(|rt, conn| {
+            validate::validate_query_with_suggestions(&dummy_parsed, rt, conn)
         })?;
 
         offline::write_cache(&parsed, &result);

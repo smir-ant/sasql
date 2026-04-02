@@ -332,7 +332,27 @@ pub struct ColumnDesc {
     pub type_oid: u32,
     /// Type size in bytes (-1 for variable-length).
     pub type_size: i16,
+    /// OID of the source table (0 if not a table column, e.g. computed).
+    pub table_oid: u32,
+    /// Column number within the source table (0 if not a table column).
+    pub column_id: i16,
 }
+
+/// Result of a `prepare_describe` call — column and parameter metadata
+/// without executing the query.
+#[derive(Debug, Clone)]
+pub struct PrepareResult {
+    /// Output columns (empty for INSERT/UPDATE/DELETE without RETURNING).
+    pub columns: Vec<ColumnDesc>,
+    /// PostgreSQL OIDs of the expected parameter types.
+    pub param_oids: Vec<u32>,
+}
+
+/// A single row of text values returned by `simple_query_rows`.
+///
+/// Each field is `None` for SQL NULL, `Some(text)` otherwise.
+/// Only used for compile-time schema introspection queries.
+pub type SimpleRow = Vec<Option<String>>;
 
 // --- Connection ---
 
@@ -403,7 +423,7 @@ impl Connection {
             #[cfg(not(feature = "tls"))]
             SslMode::Require => {
                 return Err(DriverError::Protocol(
-                    "TLS required but bsql-driver compiled without 'tls' feature".into(),
+                    "TLS required but bsql-driver-postgres compiled without 'tls' feature".into(),
                 ));
             }
             #[cfg(not(feature = "tls"))]
@@ -648,6 +668,118 @@ impl Connection {
         // Cache the statement
         self.stmts.insert(sql_hash, StmtInfo { name, columns });
         Ok(())
+    }
+
+    /// Prepare a statement and return full column + parameter metadata.
+    ///
+    /// Sends Parse + Describe(Statement) + Sync, then reads:
+    /// - ParseComplete
+    /// - ParameterDescription (param type OIDs)
+    /// - RowDescription or NoData (column metadata)
+    /// - ReadyForQuery
+    ///
+    /// Unlike `prepare_only`, this always sends Parse (no cache check) and
+    /// uses the unnamed statement `""` so it does not pollute the statement
+    /// cache. This is designed for compile-time SQL validation in the proc
+    /// macro, where we need column + param metadata but never execute.
+    pub async fn prepare_describe(&mut self, sql: &str) -> Result<PrepareResult, DriverError> {
+        self.write_buf.clear();
+        // Use unnamed statement "" — PG replaces it on every Parse,
+        // so there is no cache pollution.
+        proto::write_parse(&mut self.write_buf, "", sql, &[]);
+        proto::write_describe(&mut self.write_buf, b'S', "");
+        proto::write_sync(&mut self.write_buf);
+        self.flush_write().await?;
+
+        // Read ParseComplete
+        self.expect_message(|m| matches!(m, BackendMessage::ParseComplete))
+            .await?;
+
+        // Read ParameterDescription + RowDescription/NoData
+        let mut param_oids: Vec<u32> = Vec::new();
+        let columns;
+        loop {
+            let msg = self.read_one_message().await?;
+            match msg {
+                BackendMessage::ParameterDescription { data } => {
+                    param_oids = proto::parse_parameter_description(data)?;
+                }
+                BackendMessage::RowDescription { data } => {
+                    columns = proto::parse_row_description(data)?;
+                    break;
+                }
+                BackendMessage::NoData => {
+                    columns = Vec::new();
+                    break;
+                }
+                BackendMessage::NoticeResponse { .. }
+                | BackendMessage::NotificationResponse { .. } => {}
+                BackendMessage::ErrorResponse { data } => {
+                    let fields = proto::parse_error_response(data);
+                    self.drain_to_ready().await?;
+                    return Err(self.make_server_error(fields));
+                }
+                other => {
+                    return Err(DriverError::Protocol(format!(
+                        "expected ParameterDescription/RowDescription/NoData, got: {other:?}"
+                    )));
+                }
+            }
+        }
+
+        // ReadyForQuery
+        self.expect_ready().await?;
+
+        Ok(PrepareResult {
+            columns,
+            param_oids,
+        })
+    }
+
+    /// Execute a simple (text protocol) query and return all result rows.
+    ///
+    /// Each row is a `Vec<Option<String>>` — NULL values are `None`, text
+    /// values are `Some(String)`. This uses the simple query protocol which
+    /// always returns text-format results.
+    ///
+    /// Designed for compile-time schema introspection queries in the proc
+    /// macro (e.g. `pg_attribute`, `information_schema`). Not intended for
+    /// high-performance runtime use.
+    pub async fn simple_query_rows(&mut self, sql: &str) -> Result<Vec<SimpleRow>, DriverError> {
+        self.write_buf.clear();
+        proto::write_simple_query(&mut self.write_buf, sql);
+        self.flush_write().await?;
+
+        let mut rows: Vec<SimpleRow> = Vec::new();
+        loop {
+            let msg = self.read_one_message().await?;
+            match msg {
+                BackendMessage::ReadyForQuery { status } => {
+                    self.tx_status = status;
+                    self.touch();
+                    return Ok(rows);
+                }
+                BackendMessage::DataRow { data } => {
+                    rows.push(proto::parse_simple_data_row(data)?);
+                }
+                BackendMessage::RowDescription { .. }
+                | BackendMessage::CommandComplete { .. }
+                | BackendMessage::EmptyQuery
+                | BackendMessage::NoticeResponse { .. }
+                | BackendMessage::NotificationResponse { .. } => {}
+                BackendMessage::ErrorResponse { data } => {
+                    let fields = proto::parse_error_response(data);
+                    self.drain_to_ready().await?;
+                    return Err(self.make_server_error(fields));
+                }
+                BackendMessage::ParameterStatus { .. } => {}
+                other => {
+                    return Err(DriverError::Protocol(format!(
+                        "unexpected message during simple_query_rows: {other:?}"
+                    )));
+                }
+            }
+        }
     }
 
     /// Begin a streaming query using the PG extended query protocol with
@@ -1390,9 +1522,9 @@ async fn buffered_read_exact(
 /// # Example
 ///
 /// ```no_run
-/// # async fn example() -> Result<(), bsql_driver::DriverError> {
-/// # let mut conn: bsql_driver::Connection = todo!();
-/// # let mut arena = bsql_driver::Arena::new();
+/// # async fn example() -> Result<(), bsql_driver_postgres::DriverError> {
+/// # let mut conn: bsql_driver_postgres::Connection = todo!();
+/// # let mut arena = bsql_driver_postgres::Arena::new();
 /// let result = conn.query("SELECT 1 as n", 0, &[], &mut arena).await?;
 /// for i in 0..result.len() {
 ///     let row = result.row(i, &arena);

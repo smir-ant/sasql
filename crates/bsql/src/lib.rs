@@ -13,7 +13,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! bsql = "0.13"
+//! bsql = "0.14"
 //! tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 //! ```
 //!
@@ -74,6 +74,15 @@ pub use bsql_core::pool::{Pool, PoolBuilder, PoolConnection, PoolStatus};
 pub use bsql_core::stream::QueryStream;
 pub use bsql_core::transaction::{IsolationLevel, Transaction};
 
+// SQLite pool
+#[cfg(feature = "sqlite")]
+pub use bsql_core::SqlitePool;
+
 // Re-export driver types used by generated code
 #[doc(hidden)]
 pub use bsql_core::driver;
+
+// Re-export SQLite driver types used by generated code
+#[cfg(feature = "sqlite")]
+#[doc(hidden)]
+pub use bsql_core::driver_sqlite;

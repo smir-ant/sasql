@@ -1,0 +1,11 @@
+[package]
+name = "bsql-arena"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bump allocator with thread-local recycling for bsql drivers"
+
+[dependencies]
+simdutf8 = { version = "0.1", default-features = false, features = ["std"] }

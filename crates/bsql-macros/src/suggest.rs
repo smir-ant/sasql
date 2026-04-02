@@ -78,21 +78,21 @@ pub fn did_you_mean<'a>(target: &str, candidates: &[&'a str]) -> Option<&'a str>
 /// names for public schema tables.
 pub fn fetch_table_names(
     rt: &tokio::runtime::Runtime,
-    client: &tokio_postgres::Client,
+    conn: &mut bsql_driver_postgres::Connection,
 ) -> Vec<String> {
     let query = "SELECT table_schema, table_name FROM information_schema.tables \
                  WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
                  ORDER BY table_schema, table_name";
-    match rt.block_on(client.query(query, &[])) {
+    match rt.block_on(conn.simple_query_rows(query)) {
         Ok(rows) => rows
             .iter()
-            .map(|r| {
-                let schema: String = r.get(0);
-                let table: String = r.get(1);
+            .filter_map(|r| {
+                let schema = r.first()?.as_deref()?;
+                let table = r.get(1)?.as_deref()?;
                 if schema == "public" {
-                    table
+                    Some(table.to_owned())
                 } else {
-                    format!("{schema}.{table}")
+                    Some(format!("{schema}.{table}"))
                 }
             })
             .collect(),
@@ -106,20 +106,20 @@ pub fn fetch_table_names(
 /// Used to generate "did you mean?" suggestions without N+1 round-trips.
 pub fn fetch_all_columns(
     rt: &tokio::runtime::Runtime,
-    client: &tokio_postgres::Client,
+    conn: &mut bsql_driver_postgres::Connection,
 ) -> Vec<(String, String, String)> {
     let query = "SELECT table_schema, table_name, column_name \
                  FROM information_schema.columns \
                  WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
                  ORDER BY table_schema, table_name, ordinal_position";
-    match rt.block_on(client.query(query, &[])) {
+    match rt.block_on(conn.simple_query_rows(query)) {
         Ok(rows) => rows
             .iter()
-            .map(|r| {
-                let schema: String = r.get(0);
-                let table: String = r.get(1);
-                let column: String = r.get(2);
-                (schema, table, column)
+            .filter_map(|r| {
+                let schema = r.first()?.as_deref()?.to_owned();
+                let table = r.get(1)?.as_deref()?.to_owned();
+                let column = r.get(2)?.as_deref()?.to_owned();
+                Some((schema, table, column))
             })
             .collect(),
         Err(_) => Vec::new(),
@@ -131,7 +131,7 @@ pub fn fetch_all_columns(
 /// Used to generate "did you mean?" suggestions when a column is not found.
 pub fn fetch_column_names(
     rt: &tokio::runtime::Runtime,
-    client: &tokio_postgres::Client,
+    conn: &mut bsql_driver_postgres::Connection,
     table_name: &str,
 ) -> Vec<String> {
     // Support schema-qualified names (e.g., "myschema.mytable")
@@ -141,10 +141,21 @@ pub fn fetch_column_names(
         ("public", table_name)
     };
 
-    let query = "SELECT column_name FROM information_schema.columns \
-                 WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position";
-    match rt.block_on(client.query(query, &[&schema, &table])) {
-        Ok(rows) => rows.iter().map(|r| r.get::<_, String>(0)).collect(),
+    // Use simple_query with string interpolation. Schema and table names are
+    // from PG error messages (not user input), so SQL injection is not a concern.
+    // We still single-quote-escape them for correctness.
+    let safe_schema = schema.replace('\'', "''");
+    let safe_table = table.replace('\'', "''");
+    let query = format!(
+        "SELECT column_name FROM information_schema.columns \
+         WHERE table_schema = '{safe_schema}' AND table_name = '{safe_table}' \
+         ORDER BY ordinal_position"
+    );
+    match rt.block_on(conn.simple_query_rows(&query)) {
+        Ok(rows) => rows
+            .iter()
+            .filter_map(|r| r.first()?.as_deref().map(String::from))
+            .collect(),
         Err(_) => Vec::new(),
     }
 }
@@ -156,11 +167,11 @@ pub fn fetch_column_names(
 pub fn enhance_error(
     error_msg: &str,
     rt: &tokio::runtime::Runtime,
-    client: &tokio_postgres::Client,
+    conn: &mut bsql_driver_postgres::Connection,
 ) -> Option<String> {
     // Table not found: "relation \"xyz\" does not exist"
     if let Some(table) = extract_relation_name(error_msg) {
-        let tables = fetch_table_names(rt, client);
+        let tables = fetch_table_names(rt, conn);
         let table_refs: Vec<&str> = tables.iter().map(|s| s.as_str()).collect();
         if let Some(suggestion) = did_you_mean(&table, &table_refs) {
             return Some(format!(
@@ -181,7 +192,7 @@ pub fn enhance_error(
         // Try to extract the table name from the error for scoped lookup
         let table = extract_column_relation(error_msg);
         if let Some(table) = table {
-            let columns = fetch_column_names(rt, client, &table);
+            let columns = fetch_column_names(rt, conn, &table);
             let col_refs: Vec<&str> = columns.iter().map(|s| s.as_str()).collect();
             if let Some(suggestion) = did_you_mean(&column, &col_refs) {
                 return Some(format!(
@@ -197,7 +208,7 @@ pub fn enhance_error(
         }
 
         // No table in the error — batch-fetch all columns and compute distances in Rust
-        let all_columns = fetch_all_columns(rt, client);
+        let all_columns = fetch_all_columns(rt, conn);
         let mut best: Option<(&str, &str, usize)> = None;
         for (_schema, table, col_name) in &all_columns {
             let dist = levenshtein(&column, col_name);

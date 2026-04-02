@@ -17,24 +17,22 @@ chrono = []
 uuid = []
 decimal = []
 explain = []
-tls = ["dep:tokio-postgres-rustls", "dep:rustls", "dep:webpki-roots"]
+tls = ["bsql-driver-postgres/tls"]
+sqlite = ["dep:bsql-driver-sqlite", "dep:libsqlite3-sys"]
 
 [dependencies]
 syn = { workspace = true }
 quote = { workspace = true }
 proc-macro2 = { workspace = true }
-tokio-postgres = { workspace = true, features = ["runtime"] }
-postgres-types = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 bitcode = { workspace = true }
 bsql-core = { workspace = true }
-bsql-driver = { workspace = true }
+bsql-driver-postgres = { workspace = true }
 smallvec = { workspace = true }
 
-# TLS (optional)
-tokio-postgres-rustls = { workspace = true, optional = true }
-rustls = { workspace = true, optional = true }
-webpki-roots = { workspace = true, optional = true }
+# SQLite (optional)
+bsql-driver-sqlite = { workspace = true, optional = true }
+libsqlite3-sys = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"

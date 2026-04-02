@@ -169,9 +169,9 @@ impl BsqlError {
     /// Unlike the blanket `From<DriverError>` impl (which maps `Io` to `Connect`),
     /// this maps `Io` errors to `Query` — because a network failure mid-query is
     /// a query error, not a connection error.
-    pub fn from_driver_query(e: bsql_driver::DriverError) -> Self {
+    pub fn from_driver_query(e: bsql_driver_postgres::DriverError) -> Self {
         match e {
-            bsql_driver::DriverError::Io(io_err) => BsqlError::Query(QueryError {
+            bsql_driver_postgres::DriverError::Io(io_err) => BsqlError::Query(QueryError {
                 message: Cow::Owned(format!("I/O error during query: {io_err}")),
                 pg_code: None,
                 source: Some(Box::new(io_err)),
@@ -183,23 +183,23 @@ impl BsqlError {
 
 // --- From conversions ---
 
-impl From<bsql_driver::DriverError> for BsqlError {
-    fn from(e: bsql_driver::DriverError) -> Self {
+impl From<bsql_driver_postgres::DriverError> for BsqlError {
+    fn from(e: bsql_driver_postgres::DriverError) -> Self {
         match e {
-            bsql_driver::DriverError::Io(io_err) => BsqlError::Connect(ConnectError {
+            bsql_driver_postgres::DriverError::Io(io_err) => BsqlError::Connect(ConnectError {
                 message: Cow::Owned(io_err.to_string()),
                 source: Some(Box::new(io_err)),
             }),
-            bsql_driver::DriverError::Auth(msg) => BsqlError::Connect(ConnectError {
+            bsql_driver_postgres::DriverError::Auth(msg) => BsqlError::Connect(ConnectError {
                 message: Cow::Owned(msg),
                 source: None,
             }),
-            bsql_driver::DriverError::Protocol(msg) => BsqlError::Query(QueryError {
+            bsql_driver_postgres::DriverError::Protocol(msg) => BsqlError::Query(QueryError {
                 message: Cow::Owned(msg),
                 pg_code: None,
                 source: None,
             }),
-            bsql_driver::DriverError::Server {
+            bsql_driver_postgres::DriverError::Server {
                 code,
                 message,
                 detail,
@@ -225,8 +225,39 @@ impl From<bsql_driver::DriverError> for BsqlError {
                     source: None,
                 })
             }
-            bsql_driver::DriverError::Pool(msg) => BsqlError::Pool(PoolError {
+            bsql_driver_postgres::DriverError::Pool(msg) => BsqlError::Pool(PoolError {
                 message: Cow::Owned(msg),
+                source: None,
+            }),
+        }
+    }
+}
+
+// --- SQLite error conversion ---
+
+#[cfg(feature = "sqlite")]
+impl BsqlError {
+    /// Convert a SQLite driver error into a `BsqlError`.
+    pub fn from_sqlite(e: bsql_driver_sqlite::SqliteError) -> Self {
+        match e {
+            bsql_driver_sqlite::SqliteError::Sqlite { code, message } => {
+                BsqlError::Query(QueryError {
+                    message: Cow::Owned(format!("SQLite error [{code}]: {message}")),
+                    pg_code: None,
+                    source: None,
+                })
+            }
+            bsql_driver_sqlite::SqliteError::Io(io_err) => BsqlError::Connect(ConnectError {
+                message: Cow::Owned(format!("SQLite I/O error: {io_err}")),
+                source: Some(Box::new(io_err)),
+            }),
+            bsql_driver_sqlite::SqliteError::Internal(msg) => BsqlError::Query(QueryError {
+                message: Cow::Owned(format!("SQLite internal error: {msg}")),
+                pg_code: None,
+                source: None,
+            }),
+            bsql_driver_sqlite::SqliteError::Pool(msg) => BsqlError::Pool(PoolError {
+                message: Cow::Owned(format!("SQLite pool error: {msg}")),
                 source: None,
             }),
         }
@@ -401,7 +432,7 @@ mod tests {
 
     #[test]
     fn server_error_preserves_detail_and_hint() {
-        let driver_err = bsql_driver::DriverError::Server {
+        let driver_err = bsql_driver_postgres::DriverError::Server {
             code: "23505".into(),
             message: "duplicate key".into(),
             detail: Some("Key (login)=(alice) already exists.".into()),
@@ -430,7 +461,7 @@ mod tests {
 
     #[test]
     fn server_error_without_detail_hint() {
-        let driver_err = bsql_driver::DriverError::Server {
+        let driver_err = bsql_driver_postgres::DriverError::Server {
             code: "42P01".into(),
             message: "relation does not exist".into(),
             detail: None,
@@ -526,7 +557,7 @@ mod tests {
     #[test]
     fn from_driver_query_maps_io_to_query() {
         let io_err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pipe broke");
-        let e = BsqlError::from_driver_query(bsql_driver::DriverError::Io(io_err));
+        let e = BsqlError::from_driver_query(bsql_driver_postgres::DriverError::Io(io_err));
         match &e {
             BsqlError::Query(q) => {
                 assert!(q.message.contains("I/O error during query"));
@@ -538,7 +569,8 @@ mod tests {
 
     #[test]
     fn from_driver_query_non_io_delegates_to_from() {
-        let e = BsqlError::from_driver_query(bsql_driver::DriverError::Pool("test".into()));
+        let e =
+            BsqlError::from_driver_query(bsql_driver_postgres::DriverError::Pool("test".into()));
         assert!(matches!(e, BsqlError::Pool(_)));
     }
 }

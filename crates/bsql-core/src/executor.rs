@@ -6,9 +6,9 @@
 //! The `query_raw` / `query_raw_readonly` methods use the bsql-driver's arena-based
 //! row storage. Generated code decodes columns from `Row` via typed getters.
 
-use bsql_driver::arena::{acquire_arena, release_arena};
-use bsql_driver::codec::Encode;
-use bsql_driver::{Arena, QueryResult};
+use bsql_driver_postgres::arena::{acquire_arena, release_arena};
+use bsql_driver_postgres::codec::Encode;
+use bsql_driver_postgres::{Arena, QueryResult};
 
 use crate::error::{BsqlError, BsqlResult};
 use crate::pool::{Pool, PoolConnection};
@@ -40,12 +40,12 @@ impl OwnedResult {
     }
 
     /// Get a row by index.
-    pub fn row(&self, idx: usize) -> bsql_driver::Row<'_> {
+    pub fn row(&self, idx: usize) -> bsql_driver_postgres::Row<'_> {
         self.result.row(idx, &self.arena)
     }
 
     /// Iterate over rows.
-    pub fn iter(&self) -> impl Iterator<Item = bsql_driver::Row<'_>> {
+    pub fn iter(&self) -> impl Iterator<Item = bsql_driver_postgres::Row<'_>> {
         self.result.rows(&self.arena)
     }
 }

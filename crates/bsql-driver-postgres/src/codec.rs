@@ -17,7 +17,7 @@ use crate::DriverError;
 /// # Example
 ///
 /// ```
-/// use bsql_driver::Encode;
+/// use bsql_driver_postgres::Encode;
 ///
 /// let mut buf = Vec::new();
 /// 42i32.encode_binary(&mut buf);

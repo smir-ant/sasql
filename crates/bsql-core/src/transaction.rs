@@ -13,8 +13,8 @@
 
 use std::fmt;
 
-use bsql_driver::arena::acquire_arena;
-use bsql_driver::codec::Encode;
+use bsql_driver_postgres::arena::acquire_arena;
+use bsql_driver_postgres::codec::Encode;
 use tokio::sync::Mutex;
 
 use crate::error::{BsqlError, BsqlResult, ConnectError};
@@ -59,14 +59,14 @@ impl fmt::Display for IsolationLevel {
 /// at a time. `tokio::sync::Mutex` (over `RefCell`) is required because the
 /// future holding the lock must be `Send` for tokio task migration.
 pub struct Transaction {
-    inner: Mutex<Option<bsql_driver::Transaction>>,
+    inner: Mutex<Option<bsql_driver_postgres::Transaction>>,
     /// Set to true when commit() or rollback() is called.
     finished: bool,
 }
 
 impl Transaction {
     /// Wrap a driver-level transaction.
-    pub(crate) fn from_driver(tx: bsql_driver::Transaction) -> Self {
+    pub(crate) fn from_driver(tx: bsql_driver_postgres::Transaction) -> Self {
         Self {
             inner: Mutex::new(Some(tx)),
             finished: false,

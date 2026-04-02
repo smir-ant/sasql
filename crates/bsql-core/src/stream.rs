@@ -11,8 +11,8 @@
 
 use std::sync::Arc;
 
-use bsql_driver::arena::release_arena;
-use bsql_driver::{Arena, ColumnDesc, QueryResult};
+use bsql_driver_postgres::arena::release_arena;
+use bsql_driver_postgres::{Arena, ColumnDesc, QueryResult};
 
 /// Default chunk size for streaming queries.
 ///
@@ -43,7 +43,7 @@ const STREAM_CHUNK_SIZE: i32 = 64;
 /// ```
 pub struct QueryStream {
     /// Held to keep the connection alive while streaming.
-    guard: Option<bsql_driver::PoolGuard>,
+    guard: Option<bsql_driver_postgres::PoolGuard>,
     arena: Option<Arena>,
     /// Current chunk's row metadata.
     current_result: Option<QueryResult>,
@@ -68,7 +68,7 @@ impl QueryStream {
     /// `finished` is true if the first chunk was the only chunk (CommandComplete
     /// received).
     pub(crate) fn new(
-        guard: bsql_driver::PoolGuard,
+        guard: bsql_driver_postgres::PoolGuard,
         arena: Arena,
         first_result: QueryResult,
         columns: Arc<[ColumnDesc]>,
@@ -96,7 +96,7 @@ impl QueryStream {
     /// must be fully decoded (into owned types) before calling `next_row()`
     /// again. The generated code already does this — it decodes into owned
     /// struct fields.
-    pub fn next_row(&mut self) -> Option<bsql_driver::Row<'_>> {
+    pub fn next_row(&mut self) -> Option<bsql_driver_postgres::Row<'_>> {
         // Check if current chunk has more rows
         if let Some(ref result) = self.current_result {
             if self.position < result.len() {
@@ -179,13 +179,13 @@ impl QueryStream {
         }
 
         let guard = self.guard.as_mut().ok_or_else(|| {
-            crate::error::BsqlError::from(bsql_driver::DriverError::Pool(
+            crate::error::BsqlError::from(bsql_driver_postgres::DriverError::Pool(
                 "stream guard already taken".into(),
             ))
         })?;
 
         let arena = self.arena.as_mut().ok_or_else(|| {
-            crate::error::BsqlError::from(bsql_driver::DriverError::Pool(
+            crate::error::BsqlError::from(bsql_driver_postgres::DriverError::Pool(
                 "stream arena already taken".into(),
             ))
         })?;

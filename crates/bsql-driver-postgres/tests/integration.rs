@@ -1,4 +1,4 @@
-//! Integration tests for bsql-driver.
+//! Integration tests for bsql-driver-postgres.
 //!
 //! These tests require a running PostgreSQL instance. Set `BSQL_DATABASE_URL`
 //! to a connection URL, e.g.:
@@ -9,7 +9,7 @@
 //!
 //! Tests are skipped (not failed) if the environment variable is not set.
 
-use bsql_driver::{Arena, Config, Connection, DriverError, Pool, hash_sql};
+use bsql_driver_postgres::{Arena, Config, Connection, DriverError, Pool, hash_sql};
 
 fn db_url() -> Option<String> {
     std::env::var("BSQL_DATABASE_URL").ok()
@@ -48,7 +48,7 @@ async fn connect_wrong_port() {
         user: "nobody".into(),
         password: "".into(),
         database: "nonexistent".into(),
-        ssl: bsql_driver::SslMode::Disable,
+        ssl: bsql_driver_postgres::SslMode::Disable,
         statement_timeout_secs: 30,
     })
     .await;
@@ -1330,7 +1330,7 @@ async fn simd_utf8_multibyte() {
 
 #[test]
 fn simd_utf8_rejects_invalid() {
-    use bsql_driver::codec::decode_str;
+    use bsql_driver_postgres::codec::decode_str;
     assert!(decode_str(&[0xFF, 0xFE]).is_err());
     assert!(decode_str(&[0xC0, 0xAF]).is_err()); // overlong encoding
     assert!(decode_str(&[0xED, 0xA0, 0x80]).is_err()); // surrogate half
@@ -1338,7 +1338,7 @@ fn simd_utf8_rejects_invalid() {
 
 #[test]
 fn simd_utf8_accepts_valid() {
-    use bsql_driver::codec::decode_str;
+    use bsql_driver_postgres::codec::decode_str;
     assert_eq!(decode_str(b"hello").unwrap(), "hello");
     assert_eq!(decode_str(b"").unwrap(), "");
     assert_eq!(decode_str("\u{1f600}".as_bytes()).unwrap(), "\u{1f600}");

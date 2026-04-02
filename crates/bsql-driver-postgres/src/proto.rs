@@ -615,8 +615,12 @@ pub fn parse_row_description(data: &[u8]) -> Result<Vec<crate::conn::ColumnDesc>
             ));
         }
 
-        // table_oid (4) + col_attr (2) = 6 bytes, skip
-        pos += 6;
+        let table_oid =
+            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += 4;
+
+        let column_id = i16::from_be_bytes([data[pos], data[pos + 1]]);
+        pos += 2;
 
         let type_oid = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
         pos += 4;
@@ -631,10 +635,85 @@ pub fn parse_row_description(data: &[u8]) -> Result<Vec<crate::conn::ColumnDesc>
             name: name.into(),
             type_oid,
             type_size,
+            table_oid,
+            column_id,
         });
     }
 
     Ok(columns)
+}
+
+/// Parse a ParameterDescription payload into parameter type OIDs.
+///
+/// Format: `[num_params: i16] [oid: i32]...`
+pub fn parse_parameter_description(data: &[u8]) -> Result<Vec<u32>, DriverError> {
+    if data.len() < 2 {
+        return Err(DriverError::Protocol(
+            "ParameterDescription too short".into(),
+        ));
+    }
+    let raw_count = i16::from_be_bytes([data[0], data[1]]);
+    if raw_count < 0 {
+        return Err(DriverError::Protocol(format!(
+            "ParameterDescription: negative param count {raw_count}"
+        )));
+    }
+    let count = raw_count as usize;
+    if data.len() < 2 + count * 4 {
+        return Err(DriverError::Protocol(
+            "ParameterDescription truncated".into(),
+        ));
+    }
+    let mut oids = Vec::with_capacity(count);
+    let mut pos = 2;
+    for _ in 0..count {
+        let oid = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        oids.push(oid);
+        pos += 4;
+    }
+    Ok(oids)
+}
+
+/// Parse rows from the simple query protocol text result.
+///
+/// The simple query protocol returns rows as text strings (not binary).
+/// Each `DataRow` in `data` contains columns as NUL-terminated C strings.
+///
+/// This is a lightweight helper for compile-time schema introspection queries
+/// only. It processes the raw bytes of multiple DataRow messages that were
+/// collected by the caller.
+pub fn parse_simple_data_row(data: &[u8]) -> Result<Vec<Option<String>>, DriverError> {
+    if data.len() < 2 {
+        return Err(DriverError::Protocol("DataRow too short".into()));
+    }
+    let col_count = i16::from_be_bytes([data[0], data[1]]);
+    if col_count < 0 {
+        return Err(DriverError::Protocol(format!(
+            "DataRow: negative column count {col_count}"
+        )));
+    }
+    let mut row = Vec::with_capacity(col_count as usize);
+    let mut pos = 2;
+    for _ in 0..col_count as usize {
+        if pos + 4 > data.len() {
+            return Err(DriverError::Protocol("DataRow column truncated".into()));
+        }
+        let len = i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+        pos += 4;
+        if len == -1 {
+            row.push(None);
+        } else {
+            let len = len as usize;
+            if pos + len > data.len() {
+                return Err(DriverError::Protocol("DataRow value truncated".into()));
+            }
+            let text = std::str::from_utf8(&data[pos..pos + len])
+                .map_err(|e| DriverError::Protocol(format!("invalid UTF-8 in DataRow: {e}")))?;
+            row.push(Some(text.to_owned()));
+            pos += len;
+        }
+    }
+    Ok(row)
 }
 
 // --- ErrorResponse parsing ---

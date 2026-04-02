@@ -68,16 +68,16 @@ impl Notification {
 enum Command {
     Listen(
         String,
-        tokio::sync::oneshot::Sender<Result<(), bsql_driver::DriverError>>,
+        tokio::sync::oneshot::Sender<Result<(), bsql_driver_postgres::DriverError>>,
     ),
     Unlisten(
         String,
-        tokio::sync::oneshot::Sender<Result<(), bsql_driver::DriverError>>,
+        tokio::sync::oneshot::Sender<Result<(), bsql_driver_postgres::DriverError>>,
     ),
-    UnlistenAll(tokio::sync::oneshot::Sender<Result<(), bsql_driver::DriverError>>),
+    UnlistenAll(tokio::sync::oneshot::Sender<Result<(), bsql_driver_postgres::DriverError>>),
     Notify(
         String,
-        tokio::sync::oneshot::Sender<Result<(), bsql_driver::DriverError>>,
+        tokio::sync::oneshot::Sender<Result<(), bsql_driver_postgres::DriverError>>,
     ),
 }
 
@@ -138,7 +138,7 @@ impl Listener {
     ///
     /// Opens a dedicated connection (not from any pool).
     pub async fn connect(url: &str) -> BsqlResult<Self> {
-        let config = bsql_driver::Config::from_url(url)
+        let config = bsql_driver_postgres::Config::from_url(url)
             .map_err(|e| ConnectError::create(format!("listener connect failed: {e}")))?;
 
         // Disable statement_timeout on the listener connection -- it only runs
@@ -146,7 +146,7 @@ impl Listener {
         let mut listener_config = config;
         listener_config.statement_timeout_secs = 0;
 
-        let conn = bsql_driver::Connection::connect(&listener_config)
+        let conn = bsql_driver_postgres::Connection::connect(&listener_config)
             .await
             .map_err(|e| ConnectError::create(format!("listener connect failed: {e}")))?;
 
@@ -341,8 +341,8 @@ fn quote_ident(name: &str) -> BsqlResult<String> {
 /// On connection loss, attempts reconnection with exponential backoff and
 /// re-subscribes to all tracked channels.
 async fn drive_listener(
-    mut conn: bsql_driver::Connection,
-    config: bsql_driver::Config,
+    mut conn: bsql_driver_postgres::Connection,
+    config: bsql_driver_postgres::Config,
     mut cmd_rx: mpsc::Receiver<Command>,
     notif_tx: mpsc::Sender<Notification>,
     channels: Arc<Mutex<HashSet<String>>>,
@@ -417,9 +417,9 @@ async fn drive_listener(
 /// Attempt to reconnect with exponential backoff: 100ms, 200ms, 400ms, ... up to 5s.
 /// Gives up after 10 consecutive failures.
 async fn reconnect_with_backoff(
-    config: &bsql_driver::Config,
+    config: &bsql_driver_postgres::Config,
     channels: &Arc<Mutex<HashSet<String>>>,
-) -> Option<bsql_driver::Connection> {
+) -> Option<bsql_driver_postgres::Connection> {
     let mut delay = std::time::Duration::from_millis(100);
     let max_delay = std::time::Duration::from_secs(5);
     let max_attempts = 10;
@@ -427,7 +427,7 @@ async fn reconnect_with_backoff(
     for attempt in 1..=max_attempts {
         tokio::time::sleep(delay).await;
 
-        match bsql_driver::Connection::connect(config).await {
+        match bsql_driver_postgres::Connection::connect(config).await {
             Ok(mut new_conn) => {
                 // Re-subscribe to all tracked channels
                 let channel_set = channels.lock().unwrap_or_else(|e| e.into_inner()).clone();

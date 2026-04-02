@@ -9,16 +9,22 @@ description = "Runtime support for bsql — compile-time safe SQL for Rust"
 
 [features]
 default = []
-time = ["dep:time", "bsql-driver/time"]
-chrono = ["dep:chrono", "bsql-driver/chrono"]
-uuid = ["dep:uuid", "bsql-driver/uuid"]
-decimal = ["dep:rust_decimal", "bsql-driver/decimal"]
-tls = ["bsql-driver/tls"]
+time = ["dep:time", "bsql-driver-postgres/time"]
+chrono = ["dep:chrono", "bsql-driver-postgres/chrono"]
+uuid = ["dep:uuid", "bsql-driver-postgres/uuid"]
+decimal = ["dep:rust_decimal", "bsql-driver-postgres/decimal"]
+tls = ["bsql-driver-postgres/tls"]
+sqlite = ["dep:bsql-driver-sqlite"]
 
 [dependencies]
-bsql-driver = { workspace = true }
+bsql-arena = { workspace = true }
+bsql-driver-postgres = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "macros"] }
 rapidhash = { workspace = true }
+smallvec = { workspace = true }
+
+# SQLite (optional)
+bsql-driver-sqlite = { workspace = true, optional = true }
 
 # Feature-gated type crates (optional)
 time = { workspace = true, optional = true }

@@ -1,12 +1,12 @@
-//! Connection pool — thin wrapper over `bsql_driver::Pool`.
+//! Connection pool — thin wrapper over `bsql_driver_postgres::Pool`.
 //!
 //! Delegates all connection management, fail-fast semantics, and LIFO ordering
 //! to the driver. This layer adds only the bsql error type conversions.
 
 use std::time::Duration;
 
-use bsql_driver::arena::acquire_arena;
-use bsql_driver::codec::Encode;
+use bsql_driver_postgres::arena::acquire_arena;
+use bsql_driver_postgres::codec::Encode;
 use tokio::sync::Mutex;
 
 use crate::error::{BsqlError, BsqlResult};
@@ -15,9 +15,9 @@ use crate::transaction::Transaction;
 
 /// A PostgreSQL connection pool.
 ///
-/// Wraps `bsql_driver::Pool` with bsql error types and the `Executor` trait.
+/// Wraps `bsql_driver_postgres::Pool` with bsql error types and the `Executor` trait.
 pub struct Pool {
-    pub(crate) inner: bsql_driver::Pool,
+    pub(crate) inner: bsql_driver_postgres::Pool,
 }
 
 /// Builder for configuring a connection pool.
@@ -72,11 +72,11 @@ impl PoolBuilder {
 
     pub async fn build(self) -> BsqlResult<Pool> {
         let url = self.url.ok_or_else(|| {
-            BsqlError::from(bsql_driver::DriverError::Pool(
+            BsqlError::from(bsql_driver_postgres::DriverError::Pool(
                 "pool builder requires a URL".into(),
             ))
         })?;
-        let mut builder = bsql_driver::Pool::builder()
+        let mut builder = bsql_driver_postgres::Pool::builder()
             .url(&url)
             .max_size(self.max_size);
 
@@ -100,7 +100,7 @@ impl Pool {
     ///
     /// Format: `postgres://user:password@host:port/dbname`
     pub async fn connect(url: &str) -> BsqlResult<Self> {
-        let inner = bsql_driver::Pool::connect(url)
+        let inner = bsql_driver_postgres::Pool::connect(url)
             .await
             .map_err(BsqlError::from)?;
         Ok(Pool { inner })
@@ -170,8 +170,12 @@ impl Pool {
             .await
             .map_err(BsqlError::from)?;
 
-        let first_result =
-            bsql_driver::QueryResult::from_parts(all_col_offsets, num_cols, columns.clone(), 0);
+        let first_result = bsql_driver_postgres::QueryResult::from_parts(
+            all_col_offsets,
+            num_cols,
+            columns.clone(),
+            0,
+        );
 
         Ok(QueryStream::new(guard, arena, first_result, columns, !more))
     }
@@ -242,7 +246,7 @@ impl std::fmt::Debug for Pool {
 ///
 /// Returned to the pool when dropped.
 pub struct PoolConnection {
-    pub(crate) inner: Mutex<bsql_driver::PoolGuard>,
+    pub(crate) inner: Mutex<bsql_driver_postgres::PoolGuard>,
 }
 
 /// Snapshot of pool utilization.

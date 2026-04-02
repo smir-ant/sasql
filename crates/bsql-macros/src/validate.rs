@@ -6,7 +6,8 @@
 
 use smallvec::SmallVec;
 use tokio::runtime::Runtime;
-use tokio_postgres::Client;
+
+use bsql_driver_postgres::{ColumnDesc, Connection, DriverError};
 
 use crate::dynamic::QueryVariant;
 use crate::parse::ParsedQuery;
@@ -44,59 +45,65 @@ pub struct ValidationResult {
 
 /// Validate a parsed query against a live PostgreSQL instance.
 ///
-/// Uses `client.prepare()` which:
+/// Uses `conn.prepare_describe()` which:
 /// 1. Validates SQL syntax
 /// 2. Validates table/column existence
 /// 3. Returns column metadata and parameter types
 pub fn validate_query(
     parsed: &ParsedQuery,
     rt: &Runtime,
-    client: &Client,
+    conn: &mut Connection,
 ) -> Result<ValidationResult, String> {
-    rt.block_on(validate_async(parsed, client))
+    rt.block_on(validate_async(parsed, conn))
 }
 
-async fn validate_async(parsed: &ParsedQuery, client: &Client) -> Result<ValidationResult, String> {
+async fn validate_async(
+    parsed: &ParsedQuery,
+    conn: &mut Connection,
+) -> Result<ValidationResult, String> {
     // Prepare the query — this validates syntax, tables, columns, types.
-    let stmt = client
-        .prepare(&parsed.positional_sql)
+    let result = conn
+        .prepare_describe(&parsed.positional_sql)
         .await
-        .map_err(|e| format_pg_error(&e, parsed))?;
+        .map_err(|e| format_driver_error(&e, parsed))?;
 
-    // Extract parameter type OIDs and detect PG enums
-    let param_pg_oids: SmallVec<[u32; 8]> = stmt.params().iter().map(|t| t.oid()).collect();
-    let param_is_pg_enum: SmallVec<[bool; 8]> = stmt
-        .params()
-        .iter()
-        .map(|t| matches!(t.kind(), postgres_types::Kind::Enum(_)))
-        .collect();
+    // Extract parameter type OIDs
+    let param_pg_oids: SmallVec<[u32; 8]> = result.param_oids.iter().copied().collect();
 
-    let columns = build_columns(client, stmt.columns()).await?;
+    // Detect PG enums by querying pg_type.typtype for each parameter OID.
+    let param_is_pg_enum = detect_pg_enums(conn, &result.param_oids).await;
+
+    let columns = build_columns(conn, &result.columns).await?;
 
     Ok(ValidationResult {
         columns,
         param_pg_oids,
         param_is_pg_enum,
         #[cfg(feature = "explain")]
-        explain_plan: fetch_explain_plan(client, parsed).await,
+        explain_plan: fetch_explain_plan(conn, parsed).await,
     })
 }
 
 /// Resolve column metadata (name, type, nullability) from a prepared statement.
 async fn build_columns(
-    client: &Client,
-    pg_columns: &[tokio_postgres::Column],
+    conn: &mut Connection,
+    pg_columns: &[ColumnDesc],
 ) -> Result<Vec<ColumnInfo>, String> {
-    let nullable_flags = resolve_nullability_batch(client, pg_columns).await;
+    let nullable_flags = resolve_nullability_batch(conn, pg_columns).await;
+
+    // Detect which columns are PG enum types (for the enum error message).
+    let enum_flags = detect_column_enums(conn, pg_columns).await;
 
     let mut columns = Vec::with_capacity(pg_columns.len());
     for (i, col) in pg_columns.iter().enumerate() {
-        let pg_oid = col.type_().oid();
-        let pg_type_name = col.type_().name().to_owned();
-        let name = col.name().to_owned();
+        let pg_oid = col.type_oid;
+        let pg_type_name = bsql_core::types::pg_name_for_oid(pg_oid)
+            .unwrap_or("unknown")
+            .to_owned();
+        let name = col.name.to_string();
         let is_nullable = nullable_flags[i];
 
-        if matches!(col.type_().kind(), postgres_types::Kind::Enum(_)) {
+        if enum_flags[i] {
             return Err(format!(
                 "column \"{name}\" is PostgreSQL enum type `{pg_type_name}`. \
                  Define a Rust enum with #[bsql::pg_enum] or cast to text: {name}::text"
@@ -128,7 +135,7 @@ async fn build_columns(
 /// Returns a human-readable summary of the query plan. Errors are silently
 /// ignored -- EXPLAIN is informational and must never block compilation.
 #[cfg(feature = "explain")]
-async fn fetch_explain_plan(client: &Client, parsed: &ParsedQuery) -> Option<String> {
+async fn fetch_explain_plan(conn: &mut Connection, parsed: &ParsedQuery) -> Option<String> {
     // EXPLAIN cannot handle parameterized queries directly. We use
     // EXPLAIN (FORMAT TEXT) with a generic plan (PG 16+ supports
     // EXPLAIN (GENERIC_PLAN) for prepared statements).
@@ -137,17 +144,11 @@ async fn fetch_explain_plan(client: &Client, parsed: &ParsedQuery) -> Option<Str
     // (e.g. because of parameters), we skip silently.
     let explain_sql = format!("EXPLAIN (FORMAT TEXT, COSTS) {}", parsed.positional_sql);
 
-    match client.simple_query(&explain_sql).await {
-        Ok(messages) => {
-            let lines: Vec<String> = messages
-                .iter()
-                .filter_map(|msg| {
-                    if let tokio_postgres::SimpleQueryMessage::Row(row) = msg {
-                        row.get(0).map(String::from)
-                    } else {
-                        None
-                    }
-                })
+    match conn.simple_query_rows(&explain_sql).await {
+        Ok(rows) => {
+            let lines: Vec<String> = rows
+                .into_iter()
+                .filter_map(|row| row.into_iter().next().flatten())
                 .collect();
 
             if lines.is_empty() {
@@ -163,12 +164,9 @@ async fn fetch_explain_plan(client: &Client, parsed: &ParsedQuery) -> Option<Str
 /// Determine nullability for all columns in a single PG round-trip.
 ///
 /// For columns backed by a real table, queries `pg_attribute.attnotnull` in
-/// batch using `unnest`. Computed columns (aggregates, functions) default to
-/// nullable (the safe choice).
-async fn resolve_nullability_batch(
-    client: &Client,
-    columns: &[tokio_postgres::Column],
-) -> Vec<bool> {
+/// batch using string-interpolated OIDs. Computed columns (aggregates,
+/// functions) default to nullable (the safe choice).
+async fn resolve_nullability_batch(conn: &mut Connection, columns: &[ColumnDesc]) -> Vec<bool> {
     let col_count = columns.len();
     // Default: all nullable (safe). We overwrite entries we can resolve.
     let mut result = vec![true; col_count];
@@ -179,13 +177,10 @@ async fn resolve_nullability_batch(
     let mut col_indices: Vec<usize> = Vec::new();
 
     for (i, col) in columns.iter().enumerate() {
-        match (col.table_oid(), col.column_id()) {
-            (Some(t), Some(c)) if t != 0 && c != 0 => {
-                table_oids.push(t);
-                col_nums.push(c);
-                col_indices.push(i);
-            }
-            _ => {} // computed → stays true (nullable)
+        if col.table_oid != 0 && col.column_id != 0 {
+            table_oids.push(col.table_oid);
+            col_nums.push(col.column_id);
+            col_indices.push(i);
         }
     }
 
@@ -193,15 +188,34 @@ async fn resolve_nullability_batch(
         return result;
     }
 
-    // Single batched query: unnest the OID/attnum arrays and join pg_attribute
-    let query = "\
-        SELECT a.attrelid, a.attnum, NOT a.attnotnull \
-        FROM pg_attribute a \
-        WHERE (a.attrelid, a.attnum) IN (\
-            SELECT unnest($1::oid[]), unnest($2::int2[])\
-        )";
+    // Build an ARRAY literal for each: '{oid1,oid2,...}' and '{num1,num2,...}'
+    let oid_array = format!(
+        "ARRAY[{}]::oid[]",
+        table_oids
+            .iter()
+            .map(|o| o.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let num_array = format!(
+        "ARRAY[{}]::int2[]",
+        col_nums
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
 
-    if let Ok(rows) = client.query(query, &[&table_oids, &col_nums]).await {
+    // Single batched query: unnest the OID/attnum arrays and join pg_attribute
+    let query = format!(
+        "SELECT a.attrelid, a.attnum, NOT a.attnotnull \
+         FROM pg_attribute a \
+         WHERE (a.attrelid, a.attnum) IN (\
+             SELECT unnest({oid_array}), unnest({num_array})\
+         )"
+    );
+
+    if let Ok(rows) = conn.simple_query_rows(&query).await {
         // Build lookup: (table_oid, col_num) -> original column index
         let mut lookup: std::collections::HashMap<(u32, i16), Vec<usize>> =
             std::collections::HashMap::with_capacity(table_oids.len());
@@ -210,9 +224,22 @@ async fn resolve_nullability_batch(
         }
 
         for row in &rows {
-            let oid: u32 = row.get(0);
-            let num: i16 = row.get(1);
-            let is_nullable: bool = row.get(2);
+            // Columns: attrelid (oid as text), attnum (int2 as text), is_nullable (bool as text)
+            let oid: u32 = row
+                .first()
+                .and_then(|v| v.as_deref())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let num: i16 = row
+                .get(1)
+                .and_then(|v| v.as_deref())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let is_nullable: bool = row
+                .get(2)
+                .and_then(|v| v.as_deref())
+                .map(|s| s == "t" || s == "true")
+                .unwrap_or(true);
             if let Some(indices) = lookup.get(&(oid, num)) {
                 for &idx in indices {
                     result[idx] = is_nullable;
@@ -221,6 +248,93 @@ async fn resolve_nullability_batch(
         }
     }
     // If the query fails, all columns stay nullable (safe default)
+
+    result
+}
+
+/// Detect which parameter OIDs are PostgreSQL enum types.
+///
+/// Queries `pg_type.typtype` for each OID. Returns `'e'` for enum types.
+/// Uses a single batched simple query with string-interpolated OIDs.
+async fn detect_pg_enums(conn: &mut Connection, oids: &[u32]) -> SmallVec<[bool; 8]> {
+    if oids.is_empty() {
+        return SmallVec::new();
+    }
+
+    let oid_list = oids
+        .iter()
+        .map(|o| o.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let query = format!("SELECT oid, typtype FROM pg_type WHERE oid IN ({oid_list})");
+
+    let mut enum_map: std::collections::HashMap<u32, bool> =
+        std::collections::HashMap::with_capacity(oids.len());
+
+    if let Ok(rows) = conn.simple_query_rows(&query).await {
+        for row in &rows {
+            let oid: u32 = row
+                .first()
+                .and_then(|v| v.as_deref())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let typtype: &str = row.get(1).and_then(|v| v.as_deref()).unwrap_or("b");
+            enum_map.insert(oid, typtype == "e");
+        }
+    }
+
+    oids.iter()
+        .map(|oid| enum_map.get(oid).copied().unwrap_or(false))
+        .collect()
+}
+
+/// Detect which column type OIDs are PostgreSQL enum types.
+///
+/// Similar to `detect_pg_enums` but for column OIDs. Only queries OIDs
+/// that are not in the standard built-in type range (< 10000).
+async fn detect_column_enums(conn: &mut Connection, columns: &[ColumnDesc]) -> Vec<bool> {
+    let mut result = vec![false; columns.len()];
+
+    // Only check non-built-in OIDs (built-in types are never enums)
+    let custom_oids: Vec<(usize, u32)> = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.type_oid >= 10000)
+        .map(|(i, c)| (i, c.type_oid))
+        .collect();
+
+    if custom_oids.is_empty() {
+        return result;
+    }
+
+    let oid_list = custom_oids
+        .iter()
+        .map(|(_, o)| o.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let query = format!("SELECT oid, typtype FROM pg_type WHERE oid IN ({oid_list})");
+
+    if let Ok(rows) = conn.simple_query_rows(&query).await {
+        let mut enum_set: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for row in &rows {
+            let oid: u32 = row
+                .first()
+                .and_then(|v| v.as_deref())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let typtype: &str = row.get(1).and_then(|v| v.as_deref()).unwrap_or("b");
+            if typtype == "e" {
+                enum_set.insert(oid);
+            }
+        }
+        for &(idx, oid) in &custom_oids {
+            if enum_set.contains(&oid) {
+                result[idx] = true;
+            }
+        }
+    }
 
     result
 }
@@ -248,11 +362,11 @@ pub fn validate_variants(
     variants: &[QueryVariant],
     parsed: &ParsedQuery,
     rt: &Runtime,
-    client: &Client,
+    conn: &mut Connection,
 ) -> Result<ValidationResult, String> {
     if variants.len() <= 1 {
         // Single variant or no optional clauses — use normal validation
-        return validate_query(parsed, rt, client);
+        return validate_query(parsed, rt, conn);
     }
 
     // Validate every variant and collect results.
@@ -260,7 +374,7 @@ pub fn validate_variants(
     let mut canonical_result: Option<ValidationResult> = None;
 
     for (i, variant) in variants.iter().enumerate() {
-        let result = rt.block_on(validate_variant_async(variant, client, parsed, i))?;
+        let result = rt.block_on(validate_variant_async(variant, conn, parsed, i))?;
 
         // Check parameter type compatibility for this variant
         check_variant_param_types(variant, &result)?;
@@ -289,23 +403,19 @@ pub fn validate_variants(
 
 async fn validate_variant_async(
     variant: &QueryVariant,
-    client: &Client,
+    conn: &mut Connection,
     parsed: &ParsedQuery,
     variant_index: usize,
 ) -> Result<ValidationResult, String> {
-    let stmt = client
-        .prepare(&variant.sql)
+    let result = conn
+        .prepare_describe(&variant.sql)
         .await
-        .map_err(|e| format_variant_error(&e, variant, parsed, variant_index))?;
+        .map_err(|e| format_variant_driver_error(&e, variant, parsed, variant_index))?;
 
-    let param_pg_oids: SmallVec<[u32; 8]> = stmt.params().iter().map(|t| t.oid()).collect();
-    let param_is_pg_enum: SmallVec<[bool; 8]> = stmt
-        .params()
-        .iter()
-        .map(|t| matches!(t.kind(), postgres_types::Kind::Enum(_)))
-        .collect();
+    let param_pg_oids: SmallVec<[u32; 8]> = result.param_oids.iter().copied().collect();
+    let param_is_pg_enum = detect_pg_enums(conn, &result.param_oids).await;
 
-    let columns = build_columns(client, stmt.columns()).await?;
+    let columns = build_columns(conn, &result.columns).await?;
 
     Ok(ValidationResult {
         columns,
@@ -410,28 +520,32 @@ fn strip_option(ty: &str) -> &str {
     ty
 }
 
-/// Extract the common parts of a PostgreSQL error: message, detail, hint.
-fn format_db_error_base(e: &tokio_postgres::Error) -> String {
-    if let Some(db_err) = e.as_db_error() {
-        let detail = db_err.detail().unwrap_or("");
-        let hint = db_err.hint().unwrap_or("");
-        let mut out = format!("PostgreSQL error: {}", db_err.message());
-        if !detail.is_empty() {
-            out.push_str(&format!("\n  detail: {detail}"));
+/// Extract the common parts of a DriverError: message, detail, hint.
+fn format_driver_error_base(e: &DriverError) -> String {
+    match e {
+        DriverError::Server {
+            message,
+            detail,
+            hint,
+            ..
+        } => {
+            let mut out = format!("PostgreSQL error: {message}");
+            if let Some(d) = detail {
+                out.push_str(&format!("\n  detail: {d}"));
+            }
+            if let Some(h) = hint {
+                out.push_str(&format!("\n  hint: {h}"));
+            }
+            out
         }
-        if !hint.is_empty() {
-            out.push_str(&format!("\n  hint: {hint}"));
-        }
-        out
-    } else {
-        format!("PostgreSQL error: {e}")
+        other => format!("PostgreSQL error: {other}"),
     }
 }
 
 /// Format a variant-specific PostgreSQL error with context about which
 /// clause combination caused the failure.
-fn format_variant_error(
-    e: &tokio_postgres::Error,
+fn format_variant_driver_error(
+    e: &DriverError,
     variant: &QueryVariant,
     parsed: &ParsedQuery,
     variant_index: usize,
@@ -454,7 +568,7 @@ fn format_variant_error(
         format!("with {}", clause_strs.join(", "))
     };
 
-    let base_msg = format_db_error_base(e);
+    let base_msg = format_driver_error_base(e);
     format!(
         "optional clause variant {} ({clause_desc}) produces invalid SQL:\n  \
          {base_msg}\n  SQL: {}",
@@ -463,14 +577,12 @@ fn format_variant_error(
 }
 
 /// Format a PostgreSQL error into a developer-friendly compile error message.
-fn format_pg_error(e: &tokio_postgres::Error, parsed: &ParsedQuery) -> String {
-    let mut out = format_db_error_base(e);
+fn format_driver_error(e: &DriverError, parsed: &ParsedQuery) -> String {
+    let mut out = format_driver_error_base(e);
 
-    if let Some(db_err) = e.as_db_error() {
-        if let Some(pos) = db_err.position() {
-            out.push_str(&format!("\n  position: {pos:?}"));
-        }
-    }
+    // For Server errors, include position if extractable from the message
+    // (our driver doesn't expose position directly, but PG includes it in
+    // the error message text when relevant).
     out.push_str(&format!("\n  SQL: {}", parsed.positional_sql));
 
     out
@@ -481,15 +593,15 @@ fn format_pg_error(e: &tokio_postgres::Error, parsed: &ParsedQuery) -> String {
 pub fn validate_query_with_suggestions(
     parsed: &ParsedQuery,
     rt: &Runtime,
-    client: &Client,
+    conn: &mut Connection,
 ) -> Result<ValidationResult, String> {
-    match rt.block_on(validate_async(parsed, client)) {
+    match rt.block_on(validate_async(parsed, conn)) {
         Ok(result) => Ok(result),
         Err(base_error) => {
             // Enhance the error with "did you mean?" suggestions.
             // This runs as a separate block_on because enhance_error
             // queries the schema with additional SQL.
-            if let Some(suggestion) = crate::suggest::enhance_error(&base_error, rt, client) {
+            if let Some(suggestion) = crate::suggest::enhance_error(&base_error, rt, conn) {
                 Err(format!("{base_error}{suggestion}"))
             } else {
                 Err(base_error)

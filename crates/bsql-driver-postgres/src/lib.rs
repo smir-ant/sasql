@@ -1,6 +1,6 @@
 //! PostgreSQL wire protocol driver for bsql.
 //!
-//! `bsql-driver` is a purpose-built PostgreSQL driver optimized for bsql's
+//! `bsql-driver-postgres` is a purpose-built PostgreSQL driver optimized for bsql's
 //! architecture: binary protocol only, arena allocation for row data, pipelined
 //! extended query protocol, LIFO connection pool with fail-fast semantics.
 //!
@@ -17,14 +17,14 @@
 //! # Example
 //!
 //! ```no_run
-//! use bsql_driver::{Pool, Arena};
+//! use bsql_driver_postgres::{Pool, Arena};
 //!
-//! # async fn example() -> Result<(), bsql_driver::DriverError> {
+//! # async fn example() -> Result<(), bsql_driver_postgres::DriverError> {
 //! let pool = Pool::connect("postgres://user:pass@localhost/db").await?;
 //! let mut conn = pool.acquire().await?;
 //! let mut arena = Arena::new();
 //!
-//! let hash = bsql_driver::hash_sql("SELECT $1::int4 + $2::int4 AS sum");
+//! let hash = bsql_driver_postgres::hash_sql("SELECT $1::int4 + $2::int4 AS sum");
 //! let result = conn.query(
 //!     "SELECT $1::int4 + $2::int4 AS sum",
 //!     hash,
@@ -53,12 +53,14 @@ mod tls;
 pub use arena::Arena;
 pub use codec::Encode;
 pub use conn::hash_sql;
-pub use conn::{ColumnDesc, Config, Connection, QueryResult, Row, SslMode};
+pub use conn::{
+    ColumnDesc, Config, Connection, PrepareResult, QueryResult, Row, SimpleRow, SslMode,
+};
 pub use pool::{Pool, PoolBuilder, PoolGuard, PoolStatus, Transaction};
 
 // --- DriverError ---
 
-/// Error type for all bsql-driver operations.
+/// Error type for all bsql-driver-postgres operations.
 ///
 /// Variants cover the four failure modes: I/O, authentication, wire protocol
 /// violations, server-reported errors, and pool management.
@@ -66,7 +68,7 @@ pub use pool::{Pool, PoolBuilder, PoolGuard, PoolStatus, Transaction};
 /// # Example
 ///
 /// ```
-/// use bsql_driver::DriverError;
+/// use bsql_driver_postgres::DriverError;
 ///
 /// fn handle_error(err: DriverError) {
 ///     match err {
