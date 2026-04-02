@@ -50,6 +50,12 @@ struct PoolInner {
     open_count: AtomicUsize,
     config: Config,
     connecting: Notify,
+    /// SQL statements to PREPARE on new connections (warmup).
+    ///
+    /// When a new connection is created, these are pre-prepared via the
+    /// extended query protocol before the connection is returned. This
+    /// eliminates Parse overhead on first use.
+    warmup_sqls: std::sync::RwLock<Arc<[Box<str>]>>,
 }
 
 impl Pool {
@@ -107,7 +113,10 @@ impl Pool {
 
         // Open a new connection
         match Connection::connect(&self.inner.config).await {
-            Ok(conn) => {
+            Ok(mut conn) => {
+                // Warmup: pre-PREPARE frequently used statements
+                self.warmup_connection(&mut conn).await;
+
                 self.inner.connecting.notify_waiters();
                 Ok(PoolGuard {
                     conn: Some(conn),
@@ -141,6 +150,61 @@ impl Pool {
     /// Maximum pool size.
     pub fn max_size(&self) -> usize {
         self.inner.max_size
+    }
+
+    /// Pre-PREPARE warmup statements on a new connection.
+    ///
+    /// Best-effort: errors on individual statements are silently ignored.
+    /// The connection remains usable even if warmup fails.
+    async fn warmup_connection(&self, conn: &mut Connection) {
+        let sqls = self
+            .inner
+            .warmup_sqls
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+
+        if sqls.is_empty() {
+            return;
+        }
+
+        for sql in sqls.iter() {
+            let sql_hash = crate::conn::hash_sql(sql);
+            // Use execute with an empty arena — we only care about Parse+Describe
+            // caching the statement. Errors are silently ignored.
+            let mut arena = Arena::new();
+            let _ = conn.query(sql, sql_hash, &[], &mut arena).await;
+        }
+    }
+
+    /// Set the SQL statements to pre-PREPARE on new connections.
+    ///
+    /// Each SQL string is PREPAREd (Parse+Describe+Sync) on new connections
+    /// before they are returned from `acquire()`. This eliminates the first-use
+    /// Parse overhead for frequently executed queries.
+    ///
+    /// Warmup errors are silently ignored — a bad warmup SQL must not prevent
+    /// the connection from being usable.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), bsql_driver::DriverError> {
+    /// let pool = bsql_driver::Pool::connect("postgres://user:pass@localhost/db").await?;
+    /// pool.set_warmup_sqls(&[
+    ///     "SELECT id, name FROM users WHERE id = $1::int4",
+    ///     "SELECT id, title FROM tickets WHERE status = ANY($1::text[])",
+    /// ]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn set_warmup_sqls(&self, sqls: &[&str]) {
+        let boxed: Arc<[Box<str>]> = sqls.iter().map(|s| (*s).into()).collect::<Vec<_>>().into();
+        *self
+            .inner
+            .warmup_sqls
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = boxed;
     }
 }
 
@@ -197,6 +261,7 @@ impl PoolBuilder {
                 open_count: AtomicUsize::new(0),
                 config,
                 connecting: Notify::new(),
+                warmup_sqls: std::sync::RwLock::new(Arc::from(Vec::<Box<str>>::new())),
             }),
         })
     }

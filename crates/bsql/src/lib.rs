@@ -61,9 +61,10 @@
 //! | `.fetch_optional(&pool)` | `Option<T>` | 2+ rows |
 //! | `.execute(&pool)` | `u64` (affected rows) | never |
 
-// Re-export the query! macro and pg_enum attribute macro
+// Re-export the query! macro and attribute macros
 pub use bsql_macros::pg_enum;
 pub use bsql_macros::query;
+pub use bsql_macros::sort;
 
 // Re-export all runtime types
 pub use bsql_core::error::{self, BsqlError, BsqlResult};

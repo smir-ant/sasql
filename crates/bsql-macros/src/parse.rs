@@ -24,6 +24,16 @@ pub struct Param {
     pub position: usize,
 }
 
+/// A sort placeholder: `$[sort: EnumType]` in the SQL text.
+///
+/// Replaced with `{SORT}` in positional_sql. At codegen time, each sort
+/// variant's SQL fragment is spliced in to produce separate SQL strings.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SortPlaceholder {
+    /// The enum type name (e.g. `"TicketSort"`).
+    pub enum_name: String,
+}
+
 /// An optional clause: a SQL fragment wrapped in `[...]` that is
 /// included/excluded at runtime based on `Option` parameters.
 #[derive(Debug, Clone, PartialEq)]
@@ -66,6 +76,8 @@ pub struct ParsedQuery {
     pub statement_name: String,
     /// Optional clauses extracted from `[...]` blocks.
     pub optional_clauses: SmallVec<[OptionalClause; 4]>,
+    /// Sort placeholder, if any (`$[sort: EnumType]`). At most one per query.
+    pub sort_placeholder: Option<SortPlaceholder>,
 }
 
 /// Parse the raw SQL from a `query!` invocation.
@@ -77,7 +89,8 @@ pub fn parse_query(sql: &str) -> Result<ParsedQuery, String> {
     }
 
     let comment_stripped = strip_comments(sql);
-    let (positional_sql, params, optional_clauses) = extract_params(&comment_stripped)?;
+    let (positional_sql, params, optional_clauses, sort_placeholder) =
+        extract_params(&comment_stripped)?;
     let normalized_sql = normalize_sql(&positional_sql);
     let kind = detect_query_kind(&normalized_sql)?;
 
@@ -93,6 +106,7 @@ pub fn parse_query(sql: &str) -> Result<ParsedQuery, String> {
         kind,
         statement_name: stmt_name,
         optional_clauses,
+        sort_placeholder,
     })
 }
 
@@ -107,10 +121,19 @@ pub fn parse_query(sql: &str) -> Result<ParsedQuery, String> {
 /// offset, never interpreting individual bytes as chars).
 fn extract_params(
     sql: &str,
-) -> Result<(String, SmallVec<[Param; 4]>, SmallVec<[OptionalClause; 4]>), String> {
+) -> Result<
+    (
+        String,
+        SmallVec<[Param; 4]>,
+        SmallVec<[OptionalClause; 4]>,
+        Option<SortPlaceholder>,
+    ),
+    String,
+> {
     let mut out = String::with_capacity(sql.len());
     let mut params: SmallVec<[Param; 4]> = SmallVec::new();
     let mut optional_clauses: SmallVec<[OptionalClause; 4]> = SmallVec::new();
+    let mut sort_placeholder: Option<SortPlaceholder> = None;
     let bytes = sql.as_bytes();
     let len = bytes.len();
     let mut i = 0; // byte offset into `sql`
@@ -142,6 +165,18 @@ fn extract_params(
         if b == b':' && i + 1 < len && bytes[i + 1] == b':' {
             out.push_str("::");
             i += 2;
+            continue;
+        }
+
+        // Sort placeholder: $[sort: EnumType]
+        if b == b'$' && i + 1 < len && bytes[i + 1] == b'[' {
+            let (sp, end) = parse_sort_placeholder(sql, i)?;
+            if sort_placeholder.is_some() {
+                return Err("only one $[sort: EnumType] placeholder is allowed per query".into());
+            }
+            sort_placeholder = Some(sp);
+            out.push_str("{SORT}");
+            i = end;
             continue;
         }
 
@@ -233,7 +268,82 @@ fn extract_params(
         ));
     }
 
-    Ok((out, params, optional_clauses))
+    Ok((out, params, optional_clauses, sort_placeholder))
+}
+
+/// Parse a `$[sort: EnumType]` placeholder starting at byte position `start`
+/// (which is the `$` character, followed by `[`).
+///
+/// Returns the SortPlaceholder and the byte position after the closing `]`.
+fn parse_sort_placeholder(sql: &str, start: usize) -> Result<(SortPlaceholder, usize), String> {
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    // Skip $[
+    let mut i = start + 2;
+
+    // Skip whitespace
+    while i < len && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+
+    // Expect "sort"
+    if i + 4 > len || &sql[i..i + 4] != "sort" {
+        return Err(format!(
+            "expected `sort` after `$[` at position {start}, e.g. `$[sort: EnumType]`"
+        ));
+    }
+    i += 4;
+
+    // Skip whitespace
+    while i < len && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+
+    // Expect :
+    if i >= len || bytes[i] != b':' {
+        return Err(format!(
+            "expected `:` after `$[sort` at position {start}, e.g. `$[sort: EnumType]`"
+        ));
+    }
+    i += 1;
+
+    // Skip whitespace
+    while i < len && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+
+    // Parse enum name: ASCII identifier chars
+    let name_start = i;
+    while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+    let enum_name = &sql[name_start..i];
+
+    if enum_name.is_empty() {
+        return Err(format!(
+            "expected enum type name after `$[sort:` at position {start}"
+        ));
+    }
+
+    // Skip whitespace
+    while i < len && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+
+    // Expect ]
+    if i >= len || bytes[i] != b']' {
+        return Err(format!(
+            "expected `]` after enum type in `$[sort: {enum_name}` at position {start}"
+        ));
+    }
+    i += 1;
+
+    Ok((
+        SortPlaceholder {
+            enum_name: enum_name.to_owned(),
+        },
+        i,
+    ))
 }
 
 /// Parse a `[SQL fragment with $param: Option<T>]` optional clause starting at
@@ -1404,6 +1514,89 @@ mod tests {
             err.contains("multiple optional clauses"),
             "should reject same param in different clauses: {err}"
         );
+    }
+
+    // --- sort placeholder ---
+
+    #[test]
+    fn sort_placeholder_extracted() {
+        let r =
+            parse_query("SELECT id FROM t WHERE 1 = 1 ORDER BY $[sort: TicketSort] LIMIT $l: i64")
+                .unwrap();
+        assert!(r.sort_placeholder.is_some());
+        assert_eq!(r.sort_placeholder.as_ref().unwrap().enum_name, "TicketSort");
+        assert!(
+            r.positional_sql.contains("{SORT}"),
+            "should contain {{SORT}}: {}",
+            r.positional_sql
+        );
+        assert!(
+            !r.positional_sql.contains("$[sort"),
+            "should not contain raw $[sort: {}",
+            r.positional_sql
+        );
+        assert_eq!(r.params.len(), 1);
+        assert_eq!(r.params[0].name, "l");
+    }
+
+    #[test]
+    fn sort_placeholder_no_params() {
+        let r = parse_query("SELECT id FROM t ORDER BY $[sort: MySort]").unwrap();
+        assert!(r.sort_placeholder.is_some());
+        assert_eq!(r.sort_placeholder.as_ref().unwrap().enum_name, "MySort");
+        assert!(r.params.is_empty());
+    }
+
+    #[test]
+    fn sort_placeholder_with_spaces() {
+        let r = parse_query("SELECT id FROM t ORDER BY $[ sort : MySortEnum ]").unwrap();
+        assert!(r.sort_placeholder.is_some());
+        assert_eq!(r.sort_placeholder.as_ref().unwrap().enum_name, "MySortEnum");
+    }
+
+    #[test]
+    fn two_sort_placeholders_rejected() {
+        let r = parse_query("SELECT id FROM t ORDER BY $[sort: A] LIMIT 1 OFFSET $[sort: B]");
+        assert!(r.is_err());
+        let err = r.unwrap_err();
+        assert!(
+            err.contains("only one"),
+            "should reject multiple sort placeholders: {err}"
+        );
+    }
+
+    #[test]
+    fn sort_placeholder_bad_syntax_missing_colon() {
+        let r = parse_query("SELECT id FROM t ORDER BY $[sort MySort]");
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn sort_placeholder_bad_syntax_missing_name() {
+        let r = parse_query("SELECT id FROM t ORDER BY $[sort: ]");
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn sort_placeholder_bad_syntax_missing_bracket() {
+        let r = parse_query("SELECT id FROM t ORDER BY $[sort: MySort");
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn sort_placeholder_with_optional_clauses() {
+        let r = parse_query(
+            "SELECT id FROM t WHERE 1 = 1 [AND a = $a: Option<i32>] ORDER BY $[sort: S]",
+        )
+        .unwrap();
+        assert!(r.sort_placeholder.is_some());
+        assert_eq!(r.optional_clauses.len(), 1);
+    }
+
+    #[test]
+    fn no_sort_placeholder() {
+        let r = parse_query("SELECT id FROM t WHERE id = $id: i32").unwrap();
+        assert!(r.sort_placeholder.is_none());
     }
 
     // --- safety gates: UPDATE/DELETE without WHERE ---

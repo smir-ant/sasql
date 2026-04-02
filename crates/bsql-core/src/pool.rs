@@ -114,6 +114,17 @@ impl Pool {
         Ok(QueryStream::new(guard, arena, result))
     }
 
+    /// Set the SQL statements to pre-PREPARE on new connections.
+    ///
+    /// Each SQL string is PREPAREd on new connections before they are returned
+    /// from `acquire()`. This eliminates first-use Parse overhead for hot queries.
+    ///
+    /// Warmup errors are silently ignored — a bad warmup SQL does not prevent
+    /// the connection from being usable.
+    pub fn set_warmup_sqls(&self, sqls: &[&str]) {
+        self.inner.set_warmup_sqls(sqls);
+    }
+
     /// Current pool status: open connections and max size.
     pub fn status(&self) -> PoolStatus {
         PoolStatus {

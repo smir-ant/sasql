@@ -64,6 +64,230 @@ pub fn generate_dynamic_query_code(
     }
 }
 
+/// Generate Rust code for a query with a `$[sort: EnumType]` placeholder.
+///
+/// The generated code:
+/// - Defines a result struct (same for all sort variants)
+/// - Defines an executor struct capturing parameters + sort enum
+/// - At runtime, calls `sort.sql()` to get the fragment, constructs the final
+///   SQL by replacing `{SORT}`, and dispatches via the sort enum's `sql()` method
+///
+/// Since sort fragments are spliced into SQL at runtime (each variant is a
+/// different SQL string), each variant gets its own sql_hash. The generated
+/// code builds the SQL string at runtime using `str::replace`.
+pub fn generate_sort_query_code(
+    parsed: &ParsedQuery,
+    validation: &ValidationResult,
+    sort_enum_name: &str,
+) -> TokenStream {
+    let result_struct = gen_result_struct(parsed, validation);
+    let sort_enum_ident = format_ident!("{}", sort_enum_name);
+
+    let executor_name = executor_struct_name(parsed);
+
+    // Build executor struct fields: all params + sort
+    let param_fields: Vec<TokenStream> = parsed
+        .params
+        .iter()
+        .map(|p| {
+            let name = param_ident(&p.name);
+            let ty = inject_lifetime(&p.rust_type);
+            quote! { #name: #ty }
+        })
+        .collect();
+
+    let executor_struct = quote! {
+        #[must_use = "query is not executed until .fetch_one(), .fetch_all(), .fetch_optional(), or .execute() is called"]
+        #[allow(non_camel_case_types)]
+        struct #executor_name<'_bsql> {
+            #(#param_fields,)*
+            sort: #sort_enum_ident,
+            _marker: ::std::marker::PhantomData<&'_bsql ()>,
+        }
+    };
+
+    // Build params slice
+    let param_refs: Vec<TokenStream> = parsed
+        .params
+        .iter()
+        .map(|p| {
+            let name = param_ident(&p.name);
+            quote! { &self.#name as &(dyn ::bsql_core::driver::Encode + Sync) }
+        })
+        .collect();
+
+    let params_slice = if param_refs.is_empty() {
+        quote! { &[] }
+    } else {
+        quote! { &[#(#param_refs),*] }
+    };
+
+    let is_select = parsed.kind == crate::parse::QueryKind::Select;
+    let query_method = if is_select {
+        quote! { query_raw_readonly }
+    } else {
+        quote! { query_raw }
+    };
+
+    let sql_template = &parsed.positional_sql;
+    let has_columns = !validation.columns.is_empty();
+
+    let fetch_methods = if has_columns {
+        let result_name = result_struct_name(parsed);
+        let stream_name = stream_struct_name(parsed);
+        let row_decode = gen_row_decode(validation);
+
+        let needs_limit = has_columns
+            && is_select
+            && !parsed.normalized_sql.contains(" limit ")
+            && !parsed.normalized_sql.contains(" for ");
+
+        let qm = &query_method;
+
+        // For sort queries, build SQL at runtime from the template + sort.sql()
+        let build_sql = quote! {
+            let sort_fragment = self.sort.sql();
+            let sql = #sql_template.replace("{SORT}", sort_fragment);
+            let sql_hash = ::bsql_core::driver::hash_sql(&sql);
+        };
+
+        let build_limited_sql = if needs_limit {
+            quote! {
+                let sort_fragment = self.sort.sql();
+                let base = #sql_template.replace("{SORT}", sort_fragment);
+                let sql = format!("{} LIMIT 2", base);
+                let sql_hash = ::bsql_core::driver::hash_sql(&sql);
+            }
+        } else {
+            build_sql.clone()
+        };
+
+        quote! {
+            #[allow(non_camel_case_types)]
+            pub struct #stream_name {
+                inner: ::bsql_core::QueryStream,
+            }
+
+            #[allow(non_camel_case_types)]
+            impl #stream_name {
+                pub fn next(&mut self) -> Option<#result_name> {
+                    let row = self.inner.next_row()?;
+                    Some(#result_name { #row_decode })
+                }
+
+                pub fn remaining(&self) -> usize {
+                    self.inner.remaining()
+                }
+            }
+
+            #[allow(non_camel_case_types)]
+            impl<'_bsql> #executor_name<'_bsql> {
+                pub async fn fetch_one<E: ::bsql_core::Executor>(
+                    self,
+                    executor: &E,
+                ) -> ::bsql_core::BsqlResult<#result_name> {
+                    #build_limited_sql
+                    let owned = executor.#qm(&sql, sql_hash, #params_slice).await?;
+                    if owned.len() != 1 {
+                        return Err(::bsql_core::error::QueryError::row_count(
+                            "exactly 1 row",
+                            owned.len() as u64,
+                        ));
+                    }
+                    let row = owned.row(0);
+                    Ok(#result_name { #row_decode })
+                }
+
+                pub async fn fetch_all<E: ::bsql_core::Executor>(
+                    self,
+                    executor: &E,
+                ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
+                    #build_sql
+                    let owned = executor.#qm(&sql, sql_hash, #params_slice).await?;
+                    Ok(owned.iter().map(|row| #result_name { #row_decode }).collect())
+                }
+
+                pub async fn fetch_optional<E: ::bsql_core::Executor>(
+                    self,
+                    executor: &E,
+                ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
+                    #build_limited_sql
+                    let owned = executor.#qm(&sql, sql_hash, #params_slice).await?;
+                    match owned.len() {
+                        0 => Ok(None),
+                        1 => {
+                            let row = owned.row(0);
+                            Ok(Some(#result_name { #row_decode }))
+                        }
+                        n => Err(::bsql_core::error::QueryError::row_count(
+                            "0 or 1 rows",
+                            n as u64,
+                        )),
+                    }
+                }
+
+                pub async fn fetch_stream(
+                    self,
+                    pool: &::bsql_core::Pool,
+                ) -> ::bsql_core::BsqlResult<#stream_name> {
+                    #build_sql
+                    let inner = pool.query_stream(&sql, sql_hash, #params_slice).await?;
+                    Ok(#stream_name { inner })
+                }
+
+                pub async fn execute<E: ::bsql_core::Executor>(
+                    self,
+                    executor: &E,
+                ) -> ::bsql_core::BsqlResult<u64> {
+                    #build_sql
+                    executor.execute_raw(&sql, sql_hash, #params_slice).await
+                }
+            }
+        }
+    } else {
+        // Execute-only (no result columns)
+        let build_sql = quote! {
+            let sort_fragment = self.sort.sql();
+            let sql = #sql_template.replace("{SORT}", sort_fragment);
+            let sql_hash = ::bsql_core::driver::hash_sql(&sql);
+        };
+
+        quote! {
+            #[allow(non_camel_case_types)]
+            impl<'_bsql> #executor_name<'_bsql> {
+                pub async fn execute<E: ::bsql_core::Executor>(
+                    self,
+                    executor: &E,
+                ) -> ::bsql_core::BsqlResult<u64> {
+                    #build_sql
+                    executor.execute_raw(&sql, sql_hash, #params_slice).await
+                }
+            }
+        }
+    };
+
+    // Constructor: captures params + sort from scope
+    let field_inits: Vec<proc_macro2::Ident> =
+        parsed.params.iter().map(|p| param_ident(&p.name)).collect();
+
+    let constructor = quote! {
+        #executor_name {
+            #(#field_inits,)*
+            sort,
+            _marker: ::std::marker::PhantomData,
+        }
+    };
+
+    quote! {
+        {
+            #result_struct
+            #executor_struct
+            #fetch_methods
+            #constructor
+        }
+    }
+}
+
 /// Generate the result struct (the rows returned by SELECT / RETURNING).
 fn gen_result_struct(parsed: &ParsedQuery, validation: &ValidationResult) -> TokenStream {
     if validation.columns.is_empty() {
