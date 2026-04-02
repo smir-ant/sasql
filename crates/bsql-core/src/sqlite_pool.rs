@@ -151,6 +151,40 @@ impl SqlitePool {
             .map_err(BsqlError::from_sqlite)
     }
 
+    /// Fetch all rows via direct decode — zero arena overhead.
+    ///
+    /// The `decode` closure reads columns directly from the stepped statement
+    /// for each row. This is the fastest path for multi-row queries.
+    pub fn fetch_all_direct<F, T>(
+        &self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&dyn bsql_driver_sqlite::codec::SqliteEncode],
+        is_write: bool,
+        decode: F,
+    ) -> BsqlResult<Vec<T>>
+    where
+        F: Fn(&bsql_driver_sqlite::ffi::StmtHandle) -> Result<T, bsql_driver_sqlite::SqliteError>,
+    {
+        self.inner
+            .fetch_all_direct(sql, sql_hash, params, is_write, decode)
+            .map_err(BsqlError::from_sqlite)
+    }
+
+    /// Execute a statement via direct param binding — zero arena/ParamValue overhead.
+    ///
+    /// Takes `&[&dyn SqliteEncode]` directly instead of `SmallVec<ParamValue>`.
+    pub fn execute_direct(
+        &self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&dyn bsql_driver_sqlite::codec::SqliteEncode],
+    ) -> BsqlResult<u64> {
+        self.inner
+            .execute_direct(sql, sql_hash, params)
+            .map_err(BsqlError::from_sqlite)
+    }
+
     /// Execute a simple SQL statement on the writer (PRAGMA, DDL).
     pub fn simple_exec(&self, sql: &str) -> BsqlResult<()> {
         self.inner.simple_exec(sql).map_err(BsqlError::from_sqlite)

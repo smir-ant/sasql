@@ -237,6 +237,43 @@ impl SqlitePool {
         }
     }
 
+    /// Fetch all rows via direct decode — zero arena overhead.
+    ///
+    /// The `decode` closure reads columns directly from the stepped statement
+    /// for each row. This is the fastest path for multi-row queries.
+    pub fn fetch_all_direct<F, T>(
+        &self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&dyn SqliteEncode],
+        is_write: bool,
+        decode: F,
+    ) -> Result<Vec<T>, SqliteError>
+    where
+        F: Fn(&StmtHandle) -> Result<T, SqliteError>,
+    {
+        if is_write {
+            let mut conn = self.acquire_writer()?;
+            conn.fetch_all_direct(sql, sql_hash, params, decode)
+        } else {
+            let mut conn = self.acquire_reader()?;
+            conn.fetch_all_direct(sql, sql_hash, params, decode)
+        }
+    }
+
+    /// Execute a statement via direct param binding — zero arena/ParamValue overhead.
+    ///
+    /// Takes `&[&dyn SqliteEncode]` directly instead of `SmallVec<ParamValue>`.
+    pub fn execute_direct(
+        &self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&dyn SqliteEncode],
+    ) -> Result<u64, SqliteError> {
+        let mut conn = self.acquire_writer()?;
+        conn.execute_direct(sql, sql_hash, params)
+    }
+
     /// Start a streaming query on a reader connection.
     ///
     /// Returns `(result, arena, state, reader_idx)`. The `reader_idx` must be
@@ -1506,6 +1543,288 @@ mod tests {
             })
             .unwrap();
         assert_eq!(result, None);
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- fetch_all_direct ---
+
+    #[test]
+    fn pool_fetch_all_direct_empty() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER, name TEXT)")
+            .unwrap();
+
+        let sql = "SELECT id, name FROM t";
+        let sql_hash = hash_sql(sql);
+        let rows: Vec<(i64, String)> = pool
+            .fetch_all_direct(sql, sql_hash, &[], false, |stmt| {
+                let id = stmt.column_int64(0);
+                let name = stmt
+                    .column_text(1)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .map(|s| s.to_owned())
+                    .ok_or_else(|| SqliteError::Internal("decode error".into()))?;
+                Ok((id, name))
+            })
+            .unwrap();
+        assert!(rows.is_empty());
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pool_fetch_all_direct_single_row() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER, name TEXT)")
+            .unwrap();
+        pool.simple_exec("INSERT INTO t VALUES (1, 'alice')")
+            .unwrap();
+
+        let sql = "SELECT id, name FROM t";
+        let sql_hash = hash_sql(sql);
+        let rows: Vec<(i64, String)> = pool
+            .fetch_all_direct(sql, sql_hash, &[], false, |stmt| {
+                let id = stmt.column_int64(0);
+                let name = stmt
+                    .column_text(1)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .map(|s| s.to_owned())
+                    .ok_or_else(|| SqliteError::Internal("decode error".into()))?;
+                Ok((id, name))
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], (1, "alice".to_owned()));
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pool_fetch_all_direct_100_rows() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER)").unwrap();
+        for i in 0..100 {
+            pool.simple_exec(&format!("INSERT INTO t VALUES ({i})"))
+                .unwrap();
+        }
+
+        let sql = "SELECT id FROM t ORDER BY id";
+        let sql_hash = hash_sql(sql);
+        let rows: Vec<i64> = pool
+            .fetch_all_direct(sql, sql_hash, &[], false, |stmt| Ok(stmt.column_int64(0)))
+            .unwrap();
+        assert_eq!(rows.len(), 100);
+        assert_eq!(rows[0], 0);
+        assert_eq!(rows[99], 99);
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pool_fetch_all_direct_10k_rows() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER)").unwrap();
+        pool.simple_exec("BEGIN").unwrap();
+        for i in 0..10_000 {
+            pool.simple_exec(&format!("INSERT INTO t VALUES ({i})"))
+                .unwrap();
+        }
+        pool.simple_exec("COMMIT").unwrap();
+
+        let sql = "SELECT id FROM t ORDER BY id";
+        let sql_hash = hash_sql(sql);
+        let rows: Vec<i64> = pool
+            .fetch_all_direct(sql, sql_hash, &[], false, |stmt| Ok(stmt.column_int64(0)))
+            .unwrap();
+        assert_eq!(rows.len(), 10_000);
+        assert_eq!(rows[0], 0);
+        assert_eq!(rows[9_999], 9_999);
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pool_fetch_all_direct_null_columns() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER, name TEXT)")
+            .unwrap();
+        pool.simple_exec("INSERT INTO t VALUES (1, NULL)").unwrap();
+        pool.simple_exec("INSERT INTO t VALUES (NULL, 'bob')")
+            .unwrap();
+
+        let sql = "SELECT id, name FROM t ORDER BY rowid";
+        let sql_hash = hash_sql(sql);
+        let rows: Vec<(Option<i64>, Option<String>)> = pool
+            .fetch_all_direct(sql, sql_hash, &[], false, |stmt| {
+                use libsqlite3_sys as raw;
+                let id = if stmt.column_type(0) == raw::SQLITE_NULL {
+                    None
+                } else {
+                    Some(stmt.column_int64(0))
+                };
+                let name = stmt
+                    .column_text(1)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .map(|s| s.to_owned());
+                Ok((id, name))
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], (Some(1), None));
+        assert_eq!(rows[1], (None, Some("bob".to_owned())));
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pool_fetch_all_direct_mixed_types() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (i INTEGER, r REAL, t TEXT, b BLOB)")
+            .unwrap();
+        pool.simple_exec("INSERT INTO t VALUES (42, 3.14, 'hello', X'DEADBEEF')")
+            .unwrap();
+
+        let sql = "SELECT i, r, t, b FROM t";
+        let sql_hash = hash_sql(sql);
+        let rows: Vec<(i64, f64, String, Vec<u8>)> = pool
+            .fetch_all_direct(sql, sql_hash, &[], false, |stmt| {
+                let i = stmt.column_int64(0);
+                let r = stmt.column_double(1);
+                let t = stmt
+                    .column_text(2)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .map(|s| s.to_owned())
+                    .ok_or_else(|| SqliteError::Internal("decode error".into()))?;
+                let b = stmt.column_blob(3).to_vec();
+                Ok((i, r, t, b))
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, 42);
+        assert!((rows[0].1 - 3.14).abs() < f64::EPSILON);
+        assert_eq!(rows[0].2, "hello");
+        assert_eq!(rows[0].3, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pool_fetch_all_direct_with_params() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER)").unwrap();
+        for i in 0..5 {
+            pool.simple_exec(&format!("INSERT INTO t VALUES ({i})"))
+                .unwrap();
+        }
+
+        let sql = "SELECT id FROM t WHERE id >= ?1 ORDER BY id";
+        let sql_hash = hash_sql(sql);
+        let min_id: i64 = 3;
+        let rows: Vec<i64> = pool
+            .fetch_all_direct(sql, sql_hash, &[&min_id], false, |stmt| {
+                Ok(stmt.column_int64(0))
+            })
+            .unwrap();
+        assert_eq!(rows, vec![3, 4]);
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pool_fetch_all_direct_writer() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER)").unwrap();
+        pool.simple_exec("INSERT INTO t VALUES (1)").unwrap();
+
+        let sql = "SELECT id FROM t";
+        let sql_hash = hash_sql(sql);
+        let rows: Vec<i64> = pool
+            .fetch_all_direct(sql, sql_hash, &[], true, |stmt| Ok(stmt.column_int64(0)))
+            .unwrap();
+        assert_eq!(rows, vec![1]);
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- execute_direct ---
+
+    #[test]
+    fn pool_execute_direct_insert() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER, name TEXT)")
+            .unwrap();
+
+        let sql = "INSERT INTO t VALUES (?1, ?2)";
+        let sql_hash = hash_sql(sql);
+        let id: i64 = 42;
+        let name = "alice";
+        let affected = pool.execute_direct(sql, sql_hash, &[&id, &name]).unwrap();
+        assert_eq!(affected, 1);
+
+        let sql_sel = "SELECT id FROM t";
+        let rows: Vec<i64> = pool
+            .fetch_all_direct(sql_sel, hash_sql(sql_sel), &[], false, |stmt| {
+                Ok(stmt.column_int64(0))
+            })
+            .unwrap();
+        assert_eq!(rows, vec![42]);
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pool_execute_direct_update() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER, val TEXT)")
+            .unwrap();
+        pool.simple_exec("INSERT INTO t VALUES (1, 'a')").unwrap();
+        pool.simple_exec("INSERT INTO t VALUES (2, 'b')").unwrap();
+
+        let sql = "UPDATE t SET val = ?1 WHERE id > ?2";
+        let sql_hash = hash_sql(sql);
+        let new_val = "new";
+        let min_id: i64 = 1;
+        let affected = pool
+            .execute_direct(sql, sql_hash, &[&new_val, &min_id])
+            .unwrap();
+        assert_eq!(affected, 1);
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pool_execute_direct_no_params() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER)").unwrap();
+        pool.simple_exec("INSERT INTO t VALUES (1)").unwrap();
+
+        let sql = "DELETE FROM t";
+        let sql_hash = hash_sql(sql);
+        let affected = pool.execute_direct(sql, sql_hash, &[]).unwrap();
+        assert_eq!(affected, 1);
 
         drop(pool);
         let _ = std::fs::remove_file(&path);

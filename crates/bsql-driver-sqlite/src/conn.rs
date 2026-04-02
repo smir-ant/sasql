@@ -304,6 +304,59 @@ impl SqliteConnection {
         }
     }
 
+    /// Fetch all rows, decoding directly from the statement handle.
+    ///
+    /// This is the zero-overhead path for multi-row queries: no arena
+    /// allocation, no QueryResult construction, no column copying. The
+    /// `decode` closure reads columns directly from the stepped statement
+    /// for each row and returns a decoded struct that is pushed to the result Vec.
+    ///
+    /// One tight loop: step -> decode -> push.
+    #[inline]
+    pub fn fetch_all_direct<F, T>(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&dyn SqliteEncode],
+        decode: F,
+    ) -> Result<Vec<T>, SqliteError>
+    where
+        F: Fn(&StmtHandle) -> Result<T, SqliteError>,
+    {
+        let stmt = self.get_or_prepare(sql, sql_hash)?;
+        stmt.clear_bindings();
+        for (i, param) in params.iter().enumerate() {
+            param.bind(stmt, (i + 1) as i32)?;
+        }
+        let mut results = Vec::new();
+        while let StepResult::Row = stmt.step()? {
+            results.push(decode(stmt)?);
+        }
+        stmt.reset()?;
+        Ok(results)
+    }
+
+    /// Execute a statement via direct param binding. Returns affected row count.
+    ///
+    /// Same as `execute()` but takes `&[&dyn SqliteEncode]` directly instead
+    /// of requiring the caller to build a `SmallVec<ParamValue>`.
+    #[inline]
+    pub fn execute_direct(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&dyn SqliteEncode],
+    ) -> Result<u64, SqliteError> {
+        let stmt = self.get_or_prepare(sql, sql_hash)?;
+        stmt.clear_bindings();
+        for (i, param) in params.iter().enumerate() {
+            param.bind(stmt, (i + 1) as i32)?;
+        }
+        stmt.step()?;
+        stmt.reset()?;
+        Ok(self.db.changes())
+    }
+
     /// Execute a query and return a streaming iterator.
     ///
     /// Unlike `query()`, this does not step all rows into an arena upfront.
@@ -1897,6 +1950,313 @@ mod tests {
             .streaming_next_chunk(&mut streaming2, &mut arena2)
             .unwrap();
         assert_eq!(chunk2.row_count, 5);
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- fetch_all_direct ----
+
+    #[test]
+    fn fetch_all_direct_empty() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER, name TEXT)").unwrap();
+
+        let sql = "SELECT id, name FROM t";
+        let hash = hash_sql(sql);
+        let rows: Vec<(i64, String)> = conn
+            .fetch_all_direct(sql, hash, &[], |stmt| {
+                let id = stmt.column_int64(0);
+                let name = stmt
+                    .column_text(1)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .map(|s| s.to_owned())
+                    .ok_or_else(|| SqliteError::Internal("decode error".into()))?;
+                Ok((id, name))
+            })
+            .unwrap();
+        assert!(rows.is_empty());
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fetch_all_direct_single_row() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER, name TEXT)").unwrap();
+        conn.exec("INSERT INTO t VALUES (1, 'alice')").unwrap();
+
+        let sql = "SELECT id, name FROM t";
+        let hash = hash_sql(sql);
+        let rows: Vec<(i64, String)> = conn
+            .fetch_all_direct(sql, hash, &[], |stmt| {
+                let id = stmt.column_int64(0);
+                let name = stmt
+                    .column_text(1)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .map(|s| s.to_owned())
+                    .ok_or_else(|| SqliteError::Internal("decode error".into()))?;
+                Ok((id, name))
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], (1, "alice".to_owned()));
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fetch_all_direct_100_rows() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER, val REAL)").unwrap();
+        conn.exec("BEGIN").unwrap();
+        for i in 0..100 {
+            conn.exec(&format!("INSERT INTO t VALUES ({i}, {}.5)", i))
+                .unwrap();
+        }
+        conn.exec("COMMIT").unwrap();
+
+        let sql = "SELECT id, val FROM t ORDER BY id";
+        let hash = hash_sql(sql);
+        let rows: Vec<(i64, f64)> = conn
+            .fetch_all_direct(sql, hash, &[], |stmt| {
+                Ok((stmt.column_int64(0), stmt.column_double(1)))
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 100);
+        for (i, (id, val)) in rows.iter().enumerate() {
+            assert_eq!(*id, i as i64);
+            assert!((val - (i as f64 + 0.5)).abs() < f64::EPSILON);
+        }
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fetch_all_direct_10k_rows() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER)").unwrap();
+        conn.exec("BEGIN").unwrap();
+        for i in 0..10_000 {
+            conn.exec(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+        }
+        conn.exec("COMMIT").unwrap();
+
+        let sql = "SELECT id FROM t ORDER BY id";
+        let hash = hash_sql(sql);
+        let rows: Vec<i64> = conn
+            .fetch_all_direct(sql, hash, &[], |stmt| Ok(stmt.column_int64(0)))
+            .unwrap();
+        assert_eq!(rows.len(), 10_000);
+        assert_eq!(rows[0], 0);
+        assert_eq!(rows[9_999], 9_999);
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fetch_all_direct_null_columns() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER, name TEXT)").unwrap();
+        conn.exec("INSERT INTO t VALUES (1, NULL)").unwrap();
+        conn.exec("INSERT INTO t VALUES (2, 'bob')").unwrap();
+        conn.exec("INSERT INTO t VALUES (NULL, 'carol')").unwrap();
+
+        let sql = "SELECT id, name FROM t ORDER BY rowid";
+        let hash = hash_sql(sql);
+        let rows: Vec<(Option<i64>, Option<String>)> = conn
+            .fetch_all_direct(sql, hash, &[], |stmt| {
+                let id = if stmt.column_type(0) == raw::SQLITE_NULL {
+                    None
+                } else {
+                    Some(stmt.column_int64(0))
+                };
+                let name = stmt
+                    .column_text(1)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .map(|s| s.to_owned());
+                Ok((id, name))
+            })
+            .unwrap();
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], (Some(1), None));
+        assert_eq!(rows[1], (Some(2), Some("bob".to_owned())));
+        assert_eq!(rows[2], (None, Some("carol".to_owned())));
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fetch_all_direct_mixed_types() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (i INTEGER, r REAL, t TEXT, b BLOB)")
+            .unwrap();
+        conn.exec("INSERT INTO t VALUES (42, 3.14, 'hello', X'DEADBEEF')")
+            .unwrap();
+        conn.exec("INSERT INTO t VALUES (-1, 0.0, '', X'')")
+            .unwrap();
+
+        let sql = "SELECT i, r, t, b FROM t ORDER BY rowid";
+        let hash = hash_sql(sql);
+        let rows: Vec<(i64, f64, String, Vec<u8>)> = conn
+            .fetch_all_direct(sql, hash, &[], |stmt| {
+                let i = stmt.column_int64(0);
+                let r = stmt.column_double(1);
+                let t = stmt
+                    .column_text(2)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .map(|s| s.to_owned())
+                    .ok_or_else(|| SqliteError::Internal("decode error".into()))?;
+                let b = stmt.column_blob(3).to_vec();
+                Ok((i, r, t, b))
+            })
+            .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, 42);
+        assert!((rows[0].1 - 3.14).abs() < f64::EPSILON);
+        assert_eq!(rows[0].2, "hello");
+        assert_eq!(rows[0].3, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(rows[1].0, -1);
+        assert!((rows[1].1 - 0.0).abs() < f64::EPSILON);
+        assert_eq!(rows[1].2, "");
+        assert!(rows[1].3.is_empty());
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fetch_all_direct_with_params() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER, name TEXT)").unwrap();
+        conn.exec("INSERT INTO t VALUES (1, 'a')").unwrap();
+        conn.exec("INSERT INTO t VALUES (2, 'b')").unwrap();
+        conn.exec("INSERT INTO t VALUES (3, 'c')").unwrap();
+
+        let sql = "SELECT id, name FROM t WHERE id > ?1 ORDER BY id";
+        let hash = hash_sql(sql);
+        let min_id: i64 = 1;
+        let rows: Vec<(i64, String)> = conn
+            .fetch_all_direct(sql, hash, &[&min_id], |stmt| {
+                let id = stmt.column_int64(0);
+                let name = stmt
+                    .column_text(1)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .map(|s| s.to_owned())
+                    .ok_or_else(|| SqliteError::Internal("decode error".into()))?;
+                Ok((id, name))
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], (2, "b".to_owned()));
+        assert_eq!(rows[1], (3, "c".to_owned()));
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fetch_all_direct_decode_error() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER)").unwrap();
+        conn.exec("INSERT INTO t VALUES (1)").unwrap();
+
+        let sql = "SELECT id FROM t";
+        let hash = hash_sql(sql);
+        let result: Result<Vec<i64>, SqliteError> =
+            conn.fetch_all_direct(sql, hash, &[], |_stmt| {
+                Err(SqliteError::Internal("forced decode error".into()))
+            });
+        assert!(result.is_err());
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- execute_direct ----
+
+    #[test]
+    fn execute_direct_insert() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER, name TEXT)").unwrap();
+
+        let sql = "INSERT INTO t VALUES (?1, ?2)";
+        let hash = hash_sql(sql);
+        let id: i64 = 42;
+        let name = "alice";
+        let affected = conn.execute_direct(sql, hash, &[&id, &name]).unwrap();
+        assert_eq!(affected, 1);
+
+        // Verify it was inserted
+        let rows: Vec<(i64, String)> = conn
+            .fetch_all_direct(
+                "SELECT id, name FROM t",
+                hash_sql("SELECT id, name FROM t"),
+                &[],
+                |stmt| {
+                    let id = stmt.column_int64(0);
+                    let name = stmt
+                        .column_text(1)
+                        .and_then(|b| std::str::from_utf8(b).ok())
+                        .map(|s| s.to_owned())
+                        .ok_or_else(|| SqliteError::Internal("decode error".into()))?;
+                    Ok((id, name))
+                },
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], (42, "alice".to_owned()));
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn execute_direct_update() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER, val TEXT)").unwrap();
+        conn.exec("INSERT INTO t VALUES (1, 'a')").unwrap();
+        conn.exec("INSERT INTO t VALUES (2, 'b')").unwrap();
+
+        let sql = "UPDATE t SET val = ?1";
+        let hash = hash_sql(sql);
+        let new_val = "new";
+        let affected = conn.execute_direct(sql, hash, &[&new_val]).unwrap();
+        assert_eq!(affected, 2);
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn execute_direct_no_params() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER)").unwrap();
+        conn.exec("INSERT INTO t VALUES (1)").unwrap();
+        conn.exec("INSERT INTO t VALUES (2)").unwrap();
+
+        let sql = "DELETE FROM t";
+        let hash = hash_sql(sql);
+        let affected = conn.execute_direct(sql, hash, &[]).unwrap();
+        assert_eq!(affected, 2);
 
         drop(conn);
         let _ = std::fs::remove_file(&path);
