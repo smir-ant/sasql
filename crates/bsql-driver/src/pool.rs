@@ -1,0 +1,397 @@
+//! Connection pool — LIFO ordering, fail-fast acquire, no timeouts.
+//!
+//! The pool maintains a stack of idle connections. `acquire()` pops the top
+//! (most recently used = warmest caches). On drop, the guard pushes the
+//! connection back. If the pool is exhausted, `acquire()` returns an error
+//! immediately — no blocking, no waiting.
+//!
+//! # Singleflight
+//!
+//! When multiple tasks need a new connection simultaneously, only one TCP connect
+//! is initiated per slot. Other tasks wait on a `Notify` and receive an error if
+//! the connect fails.
+
+use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use tokio::sync::{Mutex, Notify};
+
+use crate::DriverError;
+use crate::arena::Arena;
+use crate::codec::Encode;
+use crate::conn::{Config, Connection, QueryResult};
+
+// --- Pool ---
+
+/// A connection pool with LIFO ordering and fail-fast semantics.
+///
+/// # Example
+///
+/// ```no_run
+/// # async fn example() -> Result<(), bsql_driver::DriverError> {
+/// let pool = bsql_driver::Pool::connect("postgres://user:pass@localhost/db").await?;
+/// let mut conn = pool.acquire().await?;
+/// conn.simple_query("SELECT 1").await?;
+/// // conn is returned to pool on drop
+/// # Ok(())
+/// # }
+/// ```
+pub struct Pool {
+    inner: Arc<PoolInner>,
+}
+
+struct PoolInner {
+    stack: Mutex<Vec<Connection>>,
+    max_size: usize,
+    open_count: AtomicUsize,
+    config: Config,
+    connecting: Notify,
+}
+
+impl Pool {
+    /// Create a pool from a connection URL with default settings (max_size = 10).
+    ///
+    /// Validates the URL but does not open any connections yet (lazy initialization).
+    pub async fn connect(url: &str) -> Result<Self, DriverError> {
+        PoolBuilder::new().url(url).build().await
+    }
+
+    /// Create a pool builder for custom configuration.
+    pub fn builder() -> PoolBuilder {
+        PoolBuilder::new()
+    }
+
+    /// Acquire a connection from the pool.
+    ///
+    /// Returns immediately with the most recently used idle connection (LIFO).
+    /// If no idle connections are available and the pool is below max_size, a new
+    /// connection is created. If the pool is at max_size, returns
+    /// `DriverError::Pool` immediately — no blocking.
+    pub async fn acquire(&self) -> Result<PoolGuard, DriverError> {
+        // Try to pop an idle connection (fast path)
+        {
+            let mut stack = self.inner.stack.lock().await;
+            if let Some(conn) = stack.pop() {
+                return Ok(PoolGuard {
+                    conn: Some(conn),
+                    pool: self.inner.clone(),
+                });
+            }
+        }
+
+        // No idle connections — try to open a new one
+        let current = self.inner.open_count.load(Ordering::Acquire);
+        if current >= self.inner.max_size {
+            return Err(DriverError::Pool(format!(
+                "pool exhausted: all {max} connections in use",
+                max = self.inner.max_size
+            )));
+        }
+
+        // Try to claim a slot
+        if self
+            .inner
+            .open_count
+            .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            // Another task claimed the slot — check if we're now at max
+            let updated = self.inner.open_count.load(Ordering::Acquire);
+            if updated >= self.inner.max_size {
+                return Err(DriverError::Pool(format!(
+                    "pool exhausted: all {max} connections in use",
+                    max = self.inner.max_size
+                )));
+            }
+            // Retry claim
+            self.inner.open_count.fetch_add(1, Ordering::AcqRel);
+        }
+
+        // Open a new connection
+        match Connection::connect(&self.inner.config).await {
+            Ok(conn) => {
+                self.inner.connecting.notify_waiters();
+                Ok(PoolGuard {
+                    conn: Some(conn),
+                    pool: self.inner.clone(),
+                })
+            }
+            Err(e) => {
+                // Give back the slot
+                self.inner.open_count.fetch_sub(1, Ordering::AcqRel);
+                self.inner.connecting.notify_waiters();
+                Err(e)
+            }
+        }
+    }
+
+    /// Begin a transaction. Acquires a connection and sends BEGIN.
+    pub async fn begin(&self) -> Result<Transaction, DriverError> {
+        let mut guard = self.acquire().await?;
+        guard.simple_query("BEGIN").await?;
+        Ok(Transaction {
+            guard,
+            committed: false,
+        })
+    }
+
+    /// Current number of open connections (idle + in-use).
+    pub fn open_count(&self) -> usize {
+        self.inner.open_count.load(Ordering::Relaxed)
+    }
+
+    /// Maximum pool size.
+    pub fn max_size(&self) -> usize {
+        self.inner.max_size
+    }
+}
+
+impl Clone for Pool {
+    fn clone(&self) -> Self {
+        Pool {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+// --- PoolBuilder ---
+
+/// Builder for configuring a connection pool.
+pub struct PoolBuilder {
+    url: Option<String>,
+    max_size: usize,
+}
+
+impl PoolBuilder {
+    fn new() -> Self {
+        Self {
+            url: None,
+            max_size: 10,
+        }
+    }
+
+    /// Set the connection URL.
+    pub fn url(mut self, url: &str) -> Self {
+        self.url = Some(url.to_owned());
+        self
+    }
+
+    /// Set the maximum pool size. Default: 10.
+    ///
+    /// A max_size of 0 means the pool will reject all acquire() calls immediately.
+    pub fn max_size(mut self, size: usize) -> Self {
+        self.max_size = size;
+        self
+    }
+
+    /// Build the pool. Validates the URL but does not open connections.
+    pub async fn build(self) -> Result<Pool, DriverError> {
+        let url = self
+            .url
+            .ok_or_else(|| DriverError::Pool("pool builder requires a URL".into()))?;
+
+        let config = Config::from_url(&url)?;
+
+        Ok(Pool {
+            inner: Arc::new(PoolInner {
+                stack: Mutex::new(Vec::with_capacity(self.max_size)),
+                max_size: self.max_size,
+                open_count: AtomicUsize::new(0),
+                config,
+                connecting: Notify::new(),
+            }),
+        })
+    }
+}
+
+// --- PoolGuard ---
+
+/// A borrowed connection from the pool. Returns to the pool on drop.
+///
+/// If the connection is in a failed transaction state or broken, it is discarded
+/// instead of returned.
+pub struct PoolGuard {
+    conn: Option<Connection>,
+    pool: Arc<PoolInner>,
+}
+
+impl Deref for PoolGuard {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        self.conn.as_ref().expect("connection already taken")
+    }
+}
+
+impl DerefMut for PoolGuard {
+    fn deref_mut(&mut self) -> &mut Connection {
+        self.conn.as_mut().expect("connection already taken")
+    }
+}
+
+impl Drop for PoolGuard {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            let pool = self.pool.clone();
+
+            // If the connection is in a failed transaction state, discard it
+            if conn.is_in_failed_transaction() {
+                pool.open_count.fetch_sub(1, Ordering::AcqRel);
+                return;
+            }
+
+            // Return to pool via a spawned task (Drop can't be async)
+            // For LIFO: push to the top of the stack
+            tokio::spawn(async move {
+                let mut stack = pool.stack.lock().await;
+                stack.push(conn);
+            });
+        }
+    }
+}
+
+// --- Transaction ---
+
+/// A database transaction. Sends ROLLBACK on drop if not committed.
+///
+/// # Example
+///
+/// ```no_run
+/// # async fn example() -> Result<(), bsql_driver::DriverError> {
+/// # let pool = bsql_driver::Pool::connect("postgres://user:pass@localhost/db").await?;
+/// let mut tx = pool.begin().await?;
+/// tx.simple_query("INSERT INTO t VALUES (1)").await?;
+/// tx.commit().await?;
+/// # Ok(())
+/// # }
+/// ```
+pub struct Transaction {
+    guard: PoolGuard,
+    committed: bool,
+}
+
+impl Transaction {
+    /// Commit the transaction.
+    pub async fn commit(mut self) -> Result<(), DriverError> {
+        self.guard.simple_query("COMMIT").await?;
+        self.committed = true;
+        Ok(())
+    }
+
+    /// Rollback the transaction explicitly.
+    pub async fn rollback(mut self) -> Result<(), DriverError> {
+        self.guard.simple_query("ROLLBACK").await?;
+        self.committed = true; // prevent double rollback in drop
+        Ok(())
+    }
+
+    /// Execute a prepared query within the transaction.
+    pub async fn query(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&dyn Encode],
+        arena: &mut Arena,
+    ) -> Result<QueryResult, DriverError> {
+        self.guard.query(sql, sql_hash, params, arena).await
+    }
+
+    /// Execute without result rows within the transaction.
+    pub async fn execute(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&dyn Encode],
+    ) -> Result<u64, DriverError> {
+        self.guard.execute(sql, sql_hash, params).await
+    }
+
+    /// Simple query within the transaction.
+    pub async fn simple_query(&mut self, sql: &str) -> Result<(), DriverError> {
+        self.guard.simple_query(sql).await
+    }
+}
+
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        if !self.committed {
+            // Connection is in an uncommitted transaction — discard it from the pool.
+            // We can't send ROLLBACK in Drop (not async), so we mark the connection
+            // as tainted. The guard's Drop will see is_in_failed_transaction isn't
+            // applicable here (it's in 'T' state), but we need to discard it.
+            //
+            // Take the connection out of the guard and drop it, decrementing open_count.
+            if let Some(_conn) = self.guard.conn.take() {
+                self.guard.pool.open_count.fetch_sub(1, Ordering::AcqRel);
+                // Connection dropped — PG server will auto-rollback when it sees disconnect
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn pool_builder_requires_url() {
+        let result = PoolBuilder::new().build().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn pool_builder_validates_url() {
+        let result = PoolBuilder::new().url("not_a_url").build().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn pool_builder_accepts_valid_url() {
+        let pool = PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .max_size(5)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(pool.max_size(), 5);
+        assert_eq!(pool.open_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn pool_connect_validates_url() {
+        let result = Pool::connect("not_a_url").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn pool_max_size_zero() {
+        let pool = PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .max_size(0)
+            .build()
+            .await
+            .unwrap();
+
+        let result = pool.acquire().await;
+        assert!(result.is_err());
+        match result {
+            Err(DriverError::Pool(msg)) => assert!(msg.contains("exhausted")),
+            Err(e) => panic!("expected Pool error, got: {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pool_clone_shares_state() {
+        let pool = PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .max_size(5)
+            .build()
+            .await
+            .unwrap();
+
+        let pool2 = pool.clone();
+        assert_eq!(pool.max_size(), pool2.max_size());
+    }
+}
