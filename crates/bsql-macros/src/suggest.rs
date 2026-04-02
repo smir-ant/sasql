@@ -149,6 +149,9 @@ pub fn enhance_error(
                 ));
             }
         }
+
+        // No close match in any table — give a generic hint
+        return Some("\n  check the column name and table alias".to_owned());
     }
 
     None

@@ -44,6 +44,7 @@ What bsql does differently:
 | `UPDATE` without `WHERE` | Compile warning — flags accidental full-table updates (planned) |
 | `DELETE` without `WHERE` | Compile warning — same protection (planned) |
 | SQL syntax error | PostgreSQL's own error message, at compile time |
+| Typo in table/column name | Levenshtein-based "did you mean?" suggestions at compile time |
 
 ## Quick Start
 
@@ -162,11 +163,12 @@ Migrations, admin panels, and multi-tenant dynamic tables are infrastructure —
 | v0.7 | Released | Singleflight request coalescing, read/write splitting, EXPLAIN at compile time |
 | v0.8 | Released | TLS support, SmallVec optimizations |
 | v0.9 | Released | Connection warmup, safety gates (UPDATE/DELETE without WHERE) |
-| v0.10 | **Current** | Custom PG wire protocol driver (bsql-driver): binary protocol, arena allocation, zero-copy decoding, built-in pool, pipelining |
+| v0.10 | Released | Custom PG wire protocol driver (bsql-driver): binary protocol, arena allocation, zero-copy decoding, built-in pool, pipelining |
+| v0.11 | **Current** | Warmup prepare-only, sort+optional clause guard, Levenshtein suggestions, audit fixes |
 
 ## About the Development Process
 
-Built with [Claude Code](https://claude.ai/code). Specifications and 17 design principles written before the first line of code. Six rounds of architectural audit. 166 tests — unit, integration, and compile-fail — proving not just that the code works, but that broken code is rejected.
+Built with [Claude Code](https://claude.ai/code). Specifications and 17 design principles written before the first line of code. Multiple rounds of architectural audit. Unit, integration, and compile-fail tests proving not just that the code works, but that broken code is rejected.
 
 Without this process, I would not have discovered bitcode for serialization, rapidhash over FNV-1a, or the fail-fast pool pattern. I would have shipped UTF-8 bugs because I would have tested with ASCII only.
 

@@ -507,6 +507,36 @@ impl Connection {
 
     // --- Query execution ---
 
+    /// Prepare a statement without executing it (Parse+Describe+Sync only).
+    ///
+    /// Used by connection warmup to pre-cache statements without executing them.
+    /// If the statement is already cached, this is a no-op.
+    pub async fn prepare_only(&mut self, sql: &str, sql_hash: u64) -> Result<(), DriverError> {
+        if self.stmts.contains_key(&sql_hash) {
+            return Ok(());
+        }
+        let name = format!("s_{sql_hash:016x}").into_boxed_str();
+        self.write_buf.clear();
+        proto::write_parse(&mut self.write_buf, &name, sql, &[]);
+        proto::write_describe(&mut self.write_buf, b'S', &name);
+        proto::write_sync(&mut self.write_buf);
+        self.flush_write().await?;
+
+        // Read ParseComplete
+        self.expect_message(|m| matches!(m, BackendMessage::ParseComplete))
+            .await?;
+
+        // Read ParameterDescription + RowDescription/NoData via existing helper
+        let columns = self.read_column_description().await?;
+
+        // ReadyForQuery
+        self.expect_ready().await?;
+
+        // Cache the statement
+        self.stmts.insert(sql_hash, StmtInfo { name, columns });
+        Ok(())
+    }
+
     /// Execute a prepared query and return rows in arena-allocated storage.
     ///
     /// If the statement is not yet cached, Parse+Describe+Bind+Execute+Sync are

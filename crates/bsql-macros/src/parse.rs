@@ -97,6 +97,17 @@ pub fn parse_query(sql: &str) -> Result<ParsedQuery, String> {
     // Safety gate: UPDATE/DELETE without WHERE is a compile error.
     check_safety_gates(kind, &normalized_sql, &optional_clauses)?;
 
+    // Reject the combination of sort enums and optional clauses. The sort
+    // codegen replaces {SORT} in positional_sql but doesn't handle {OPT_N}
+    // placeholders, producing broken SQL at runtime.
+    if sort_placeholder.is_some() && !optional_clauses.is_empty() {
+        return Err(
+            "sort enums ($[sort: Enum]) and optional clauses ([...]) cannot be used in the same \
+             query. Split into separate queries or use a static ORDER BY."
+                .into(),
+        );
+    }
+
     let stmt_name = statement_name(&normalized_sql);
 
     Ok(ParsedQuery {
@@ -1584,13 +1595,16 @@ mod tests {
     }
 
     #[test]
-    fn sort_placeholder_with_optional_clauses() {
+    fn sort_placeholder_with_optional_clauses_rejected() {
         let r = parse_query(
             "SELECT id FROM t WHERE 1 = 1 [AND a = $a: Option<i32>] ORDER BY $[sort: S]",
-        )
-        .unwrap();
-        assert!(r.sort_placeholder.is_some());
-        assert_eq!(r.optional_clauses.len(), 1);
+        );
+        assert!(r.is_err());
+        let err = r.unwrap_err();
+        assert!(
+            err.contains("sort enums") && err.contains("optional clauses"),
+            "should reject sort + optional clause combination: {err}"
+        );
     }
 
     #[test]

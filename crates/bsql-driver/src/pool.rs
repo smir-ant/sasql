@@ -154,8 +154,11 @@ impl Pool {
 
     /// Pre-PREPARE warmup statements on a new connection.
     ///
-    /// Best-effort: errors on individual statements are silently ignored.
-    /// The connection remains usable even if warmup fails.
+    /// Uses `prepare_only()` which sends Parse+Describe+Sync without
+    /// Bind+Execute — no query execution, only statement caching.
+    ///
+    /// Best-effort: errors and timeouts on individual statements are silently
+    /// ignored. The connection remains usable even if warmup fails.
     async fn warmup_connection(&self, conn: &mut Connection) {
         let sqls = self
             .inner
@@ -170,10 +173,13 @@ impl Pool {
 
         for sql in sqls.iter() {
             let sql_hash = crate::conn::hash_sql(sql);
-            // Use execute with an empty arena — we only care about Parse+Describe
-            // caching the statement. Errors are silently ignored.
-            let mut arena = Arena::new();
-            let _ = conn.query(sql, sql_hash, &[], &mut arena).await;
+            // Parse+Describe+Sync only — no Bind+Execute. 5-second timeout
+            // per statement; if exceeded, skip and continue with the rest.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                conn.prepare_only(sql, sql_hash),
+            )
+            .await;
         }
     }
 

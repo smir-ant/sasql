@@ -476,5 +476,21 @@ async fn error_display_format() {
     let _: &dyn std::error::Error = &err;
 }
 
-// warmup tests removed — with bsql-driver, statements are cached per-connection
-// transparently. There is no explicit warmup API.
+// --- warmup ---
+
+#[tokio::test]
+async fn warmup_prepares_statements() {
+    let pool = pool().await;
+    pool.set_warmup_sqls(&["SELECT id, login FROM users WHERE id = $1::int4"]);
+    // Acquire forces warmup on the new connection — the statement is prepared
+    // via Parse+Describe+Sync (no Bind+Execute). Subsequent queries using the
+    // same SQL skip the Parse round-trip because the statement is already cached.
+    let conn = pool.acquire().await.unwrap();
+    let id = 1i32;
+    let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
+        .fetch_one(&conn)
+        .await
+        .unwrap();
+    assert_eq!(user.id, 1);
+    assert_eq!(user.login, "alice");
+}

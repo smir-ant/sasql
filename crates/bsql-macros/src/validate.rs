@@ -498,68 +498,8 @@ pub fn validate_query_with_suggestions(
     }
 }
 
-/// Validate all sort enum variants against PostgreSQL.
-///
-/// For each sort variant, replaces `{SORT}` with the variant's SQL fragment,
-/// then PREPAREs the expanded query. All variants must produce the same columns.
-#[allow(dead_code)]
-pub fn validate_sort_variants(
-    parsed: &ParsedQuery,
-    sort_sqls: &[(&str, &str)], // (variant_name, sql_fragment)
-    rt: &Runtime,
-    client: &Client,
-) -> Result<ValidationResult, String> {
-    if sort_sqls.is_empty() {
-        return Err("sort enum must have at least one variant".into());
-    }
-
-    let mut canonical_result: Option<ValidationResult> = None;
-
-    for (variant_name, sql_fragment) in sort_sqls {
-        let expanded = parsed.positional_sql.replace("{SORT}", sql_fragment);
-
-        let result: Result<ValidationResult, String> = rt.block_on(async {
-            let stmt = client.prepare(&expanded).await.map_err(|e| {
-                let base = format_db_error_base(&e);
-                format!(
-                    "sort variant `{variant_name}` (ORDER BY {sql_fragment}) \
-                         produces invalid SQL:\n  {base}\n  SQL: {expanded}"
-                )
-            })?;
-
-            let param_pg_oids: SmallVec<[u32; 8]> = stmt.params().iter().map(|t| t.oid()).collect();
-            let param_is_pg_enum: SmallVec<[bool; 8]> = stmt
-                .params()
-                .iter()
-                .map(|t| matches!(t.kind(), postgres_types::Kind::Enum(_)))
-                .collect();
-
-            let columns = build_columns(client, stmt.columns()).await?;
-
-            Ok(ValidationResult {
-                columns,
-                param_pg_oids,
-                param_is_pg_enum,
-                #[cfg(feature = "explain")]
-                explain_plan: None,
-            })
-        });
-        let result = result?;
-
-        if let Some(ref canonical) = canonical_result {
-            if result.columns.len() != canonical.columns.len() {
-                return Err(format!(
-                    "sort variant `{variant_name}` returns {} columns, but first \
-                     variant returns {} columns. All sort variants must produce \
-                     the same column set.",
-                    result.columns.len(),
-                    canonical.columns.len()
-                ));
-            }
-        } else {
-            canonical_result = Some(result);
-        }
-    }
-
-    canonical_result.ok_or_else(|| "no sort variants to validate (internal error)".into())
-}
+// NOTE: `validate_sort_variants` was removed in v0.11. The proc macro cannot
+// access sort enum variants (they live in user code), so compile-time validation
+// of individual ORDER BY fragments is not possible without a registry. The query
+// structure is validated with a dummy ORDER BY, but individual sort SQL fragments
+// are verified only at runtime. See sort_enum.rs doc comment for details.
