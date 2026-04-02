@@ -96,12 +96,16 @@ static IS_OFFLINE: LazyLock<bool> = LazyLock::new(|| {
     }
 
     // Auto-fallback: no database URL, but cache exists
-    let has_url = std::env::var("BSQL_DATABASE_URL").is_ok()
-        || std::env::var("DATABASE_URL").is_ok();
+    let has_url =
+        std::env::var("BSQL_DATABASE_URL").is_ok() || std::env::var("DATABASE_URL").is_ok();
     if !has_url {
         // Check if .bsql/ cache directory exists with at least one entry
         if let Ok(dir) = resolve_cache_dir() {
-            if dir.is_dir() && std::fs::read_dir(&dir).map(|mut d| d.next().is_some()).unwrap_or(false) {
+            if dir.is_dir()
+                && std::fs::read_dir(&dir)
+                    .map(|mut d| d.next().is_some())
+                    .unwrap_or(false)
+            {
                 return true;
             }
         }
@@ -668,7 +672,6 @@ mod tests {
         assert_eq!(decoded.columns[0].pg_type_name, "text");
     }
 
-
     #[test]
     fn raw_cached_query_without_envelope_fails() {
         // Bytes encoded directly (no envelope) must not decode as envelope
@@ -684,7 +687,6 @@ mod tests {
             ),
         }
     }
-
 
     #[test]
     fn validate_known_base_types() {
@@ -769,7 +771,6 @@ mod tests {
         assert!(err.contains("unexpected type"), "error: {err}");
     }
 
-
     #[test]
     fn temp_filename_includes_pid() {
         let pid = std::process::id();
@@ -783,7 +784,6 @@ mod tests {
         assert!(tmp_name.ends_with(".bitcode.tmp"));
         assert!(tmp_name.starts_with("000000000000cafe."));
     }
-
 
     #[test]
     fn walk_up_finds_existing_bsql_dir() {

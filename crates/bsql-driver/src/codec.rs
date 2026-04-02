@@ -1485,7 +1485,6 @@ mod tests {
         assert_eq!(&buf[4..], b"hello");
     }
 
-
     #[test]
     fn option_none_is_null() {
         let val: Option<i32> = None;
@@ -1574,7 +1573,11 @@ mod tests {
         buf.clear();
         (-0.0f32).encode_binary(&mut buf);
         let decoded = decode_f32(&buf).unwrap();
-        assert_eq!(decoded.to_bits(), (-0.0f32).to_bits(), "-0.0 bits must match");
+        assert_eq!(
+            decoded.to_bits(),
+            (-0.0f32).to_bits(),
+            "-0.0 bits must match"
+        );
     }
 
     // #4: f64 +0.0 vs -0.0 bit-pattern preservation
@@ -1588,7 +1591,11 @@ mod tests {
         buf.clear();
         (-0.0f64).encode_binary(&mut buf);
         let decoded = decode_f64(&buf).unwrap();
-        assert_eq!(decoded.to_bits(), (-0.0f64).to_bits(), "-0.0 bits must match");
+        assert_eq!(
+            decoded.to_bits(),
+            (-0.0f64).to_bits(),
+            "-0.0 bits must match"
+        );
     }
 
     // #5: i64 boundary values
@@ -2053,7 +2060,14 @@ mod tests {
 
     #[test]
     fn encode_array_f32_multi_boundary() {
-        let arr: &[f32] = &[f32::MIN, -0.0, 0.0, f32::MAX, f32::INFINITY, f32::NEG_INFINITY];
+        let arr: &[f32] = &[
+            f32::MIN,
+            -0.0,
+            0.0,
+            f32::MAX,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ];
         let mut buf = Vec::new();
         arr.encode_binary(&mut buf);
         let decoded = decode_array_f32(&buf).unwrap();
@@ -2096,7 +2110,14 @@ mod tests {
 
     #[test]
     fn encode_array_f64_multi_boundary() {
-        let arr: &[f64] = &[f64::MIN, -0.0, 0.0, f64::MAX, f64::INFINITY, f64::NEG_INFINITY];
+        let arr: &[f64] = &[
+            f64::MIN,
+            -0.0,
+            0.0,
+            f64::MAX,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ];
         let mut buf = Vec::new();
         arr.encode_binary(&mut buf);
         let decoded = decode_array_f64(&buf).unwrap();
@@ -2143,7 +2164,10 @@ mod tests {
         let mut buf = Vec::new();
         arr.encode_binary(&mut buf);
         let decoded = decode_array_str(&buf).unwrap();
-        assert_eq!(decoded, vec!["hello".to_string(), "".to_string(), "world".to_string()]);
+        assert_eq!(
+            decoded,
+            vec!["hello".to_string(), "".to_string(), "world".to_string()]
+        );
     }
 
     #[test]
@@ -2152,7 +2176,10 @@ mod tests {
         let mut buf = Vec::new();
         arr.encode_binary(&mut buf);
         let decoded = decode_array_str(&buf).unwrap();
-        assert_eq!(decoded, vec!["\u{1F600}".to_string(), "\u{00E9}".to_string()]);
+        assert_eq!(
+            decoded,
+            vec!["\u{1F600}".to_string(), "\u{00E9}".to_string()]
+        );
     }
 
     #[test]
@@ -2266,6 +2293,9 @@ mod tests {
         let ndim = i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
         assert_eq!(ndim, 0, "empty array must have ndim=0");
         let elem_oid = i32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
-        assert_eq!(elem_oid, 23, "element OID must be preserved for empty arrays");
+        assert_eq!(
+            elem_oid, 23,
+            "element OID must be preserved for empty arrays"
+        );
     }
 }

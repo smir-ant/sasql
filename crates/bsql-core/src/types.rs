@@ -271,7 +271,7 @@ pub fn is_param_compatible(rust_type: &str, pg_oid: u32) -> bool {
         | ("&[&str]", 1009) | ("&[String]", 1009) | ("Vec<String>", 1009)
         | ("&[&str]", 1015) | ("&[String]", 1015) | ("Vec<String>", 1015)
         | ("&[&str]", 199)  | ("&[String]", 199)  | ("Vec<String>", 199)   // json[]
-        | ("&[&str]", 3807) | ("&[String]", 3807) | ("Vec<String>", 3807)  // jsonb[]
+        | ("&[&str]", 3807) | ("&[String]", 3807) | ("Vec<String>", 3807) // jsonb[]
     )
 }
 

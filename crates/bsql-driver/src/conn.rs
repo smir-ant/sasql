@@ -27,7 +27,6 @@ impl Hasher for IdentityHasher {
     }
     #[inline]
     fn write(&mut self, _: &[u8]) {
-
         // never be hit (IdentityHasher only receives u64 keys from HashMap),
         // but if it somehow is, zero the hash as a safe no-op fallback.
         debug_assert!(false, "IdentityHasher only supports u64 keys");
@@ -67,7 +66,6 @@ impl Stream {
             Stream::Tls(s) => s.write_all(buf).await,
         }
     }
-
 
     async fn flush(&mut self) -> std::io::Result<()> {
         match self {
@@ -174,7 +172,6 @@ impl Config {
                 continue;
             }
             if let Some(val) = param.strip_prefix("sslmode=") {
-
                 // A typo like "sslmode=require" (missing 'e') would go unencrypted.
                 ssl = match val {
                     "disable" => SslMode::Disable,
@@ -382,7 +379,6 @@ impl Connection {
 
         // Set TCP_NODELAY to avoid Nagle delay on pipelined messages
         tcp.set_nodelay(true).map_err(DriverError::Io)?;
-
 
         // Without keepalive, a half-open connection (server crashed, firewall
         // timeout) can hang forever on read.
@@ -717,7 +713,6 @@ impl Connection {
         self.expect_message(|m| matches!(m, BackendMessage::BindComplete))
             .await?;
 
-
         self.streaming_active = true;
 
         Ok((columns, false))
@@ -815,7 +810,6 @@ impl Connection {
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> Result<Arc<[ColumnDesc]>, DriverError> {
-
         debug_assert_eq!(
             hash_sql(sql),
             sql_hash,
@@ -886,7 +880,6 @@ impl Connection {
         params: &[&(dyn Encode + Sync)],
         arena: &mut Arena,
     ) -> Result<QueryResult, DriverError> {
-
         let columns = self.send_pipeline(sql, sql_hash, params).await?;
 
         // Read DataRow messages and CommandComplete.
@@ -984,7 +977,6 @@ impl Connection {
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> Result<u64, DriverError> {
-
         let _columns = self.send_pipeline(sql, sql_hash, params).await?;
 
         // Skip DataRow messages, read until CommandComplete
@@ -1165,7 +1157,6 @@ impl Connection {
     /// Called after query()/execute() to prevent a single large result from
     /// permanently bloating the connection's buffers.
     fn shrink_buffers(&mut self) {
-
         // existing allocation if possible, avoiding a dealloc+alloc pair.
         if self.read_buf.capacity() > 64 * 1024 {
             self.read_buf.clear();
@@ -1515,7 +1506,6 @@ impl<'a> Row<'a> {
         if len < 0 {
             None
         } else {
-
             Some(self.arena.get(offset, len as usize))
         }
     }
@@ -1607,7 +1597,9 @@ fn parse_data_row_flat(
 
     let num_cols_raw = i16::from_be_bytes([data[0], data[1]]);
     if num_cols_raw < 0 {
-        return Err(DriverError::Protocol("DataRow: negative column count".into()));
+        return Err(DriverError::Protocol(
+            "DataRow: negative column count".into(),
+        ));
     }
     let num_cols = num_cols_raw as usize;
     out.reserve(num_cols);
@@ -1631,7 +1623,6 @@ fn parse_data_row_flat(
                     "DataRow column data truncated".into(),
                 ));
             }
-
 
             let offset = arena.alloc_copy(&data[pos..pos + len]);
             out.push((offset, col_len));
@@ -1916,7 +1907,10 @@ mod tests {
         let result = Config::from_url("postgres://u:p@h/d?sslmode=verify-full");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("unknown sslmode"), "should describe unknown sslmode: {err}");
+        assert!(
+            err.contains("unknown sslmode"),
+            "should describe unknown sslmode: {err}"
+        );
     }
 
     // #72: Config URL with multiple query params

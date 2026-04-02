@@ -233,7 +233,6 @@ fn extract_params(sql: &str) -> Result<ExtractResult, String> {
         if b == b'$' && i + 1 < len && bytes[i + 1].is_ascii_alphabetic() {
             let (param, end) = parse_one_param(sql, i)?;
 
-
             if let Some(existing) = params.iter().find(|p| p.name == param.name) {
                 if existing.rust_type != param.rust_type {
                     return Err(format!(
@@ -256,7 +255,6 @@ fn extract_params(sql: &str) -> Result<ExtractResult, String> {
             i = end;
             continue;
         }
-
 
         if b == b'$' && i + 1 < len && bytes[i + 1].is_ascii_digit() {
             return Err(
@@ -1068,7 +1066,6 @@ mod tests {
         assert!(parse_query("ALTER TABLE t ADD COLUMN x int").is_err());
     }
 
-
     #[test]
     fn utf8_cyrillic_in_string_literal() {
         let r = parse_query("SELECT * FROM t WHERE name = 'Москва' AND id = $id: i32").unwrap();
@@ -1110,7 +1107,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn reject_manual_positional_param() {
         let result = parse_query("SELECT id FROM t WHERE id = $1");
@@ -1132,7 +1128,6 @@ mod tests {
             "unexpected error: {err}"
         );
     }
-
 
     #[test]
     fn duplicate_param_same_type_reuses_position() {
@@ -1771,7 +1766,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn e_string_backslash_escape_handled() {
         // E'hello \'world\'' — the \' is an escaped quote, not end of string
@@ -1796,9 +1790,12 @@ mod tests {
         // $name inside E-string should not be treated as a parameter
         let r = parse_query(r"SELECT * FROM t WHERE note = E'costs $100' AND id = $id: i32");
         // $100 would look like $1 + 00, but it's inside E-string so should be ignored
-        assert!(r.is_ok(), "param inside E-string should be ignored: {:?}", r.err());
+        assert!(
+            r.is_ok(),
+            "param inside E-string should be ignored: {:?}",
+            r.err()
+        );
     }
-
 
     #[test]
     fn semicolon_rejected() {
@@ -1814,13 +1811,19 @@ mod tests {
     #[test]
     fn semicolon_in_string_literal_allowed() {
         let r = parse_query("SELECT * FROM t WHERE name = 'hello; world' AND id = $id: i32");
-        assert!(r.is_ok(), "semicolons inside string literals should be allowed");
+        assert!(
+            r.is_ok(),
+            "semicolons inside string literals should be allowed"
+        );
     }
 
     #[test]
     fn semicolon_in_dollar_quote_allowed() {
         let r = parse_query("SELECT $$code; here$$ AS code");
-        assert!(r.is_ok(), "semicolons inside dollar quotes should be allowed");
+        assert!(
+            r.is_ok(),
+            "semicolons inside dollar quotes should be allowed"
+        );
     }
 
     #[test]
@@ -1851,15 +1854,21 @@ mod tests {
     // #101: E-string: E'it\\'s here' correctly skipped
     #[test]
     fn e_string_with_escaped_quote() {
-        let r = parse_query("SELECT * FROM t WHERE name = E'it\\'s here' AND id = $id: i32").unwrap();
-        assert_eq!(r.params.len(), 1, "E-string backslash-escaped quote should not end string");
+        let r =
+            parse_query("SELECT * FROM t WHERE name = E'it\\'s here' AND id = $id: i32").unwrap();
+        assert_eq!(
+            r.params.len(),
+            1,
+            "E-string backslash-escaped quote should not end string"
+        );
         assert_eq!(r.params[0].name, "id");
     }
 
     // #101 extra: E-string with backslash-backslash
     #[test]
     fn e_string_with_double_backslash() {
-        let r = parse_query("SELECT * FROM t WHERE path = E'C:\\\\data' AND id = $id: i32").unwrap();
+        let r =
+            parse_query("SELECT * FROM t WHERE path = E'C:\\\\data' AND id = $id: i32").unwrap();
         assert_eq!(r.params.len(), 1);
     }
 
@@ -1867,7 +1876,10 @@ mod tests {
     #[test]
     fn semicolon_in_string_literal_not_rejected() {
         let r = parse_query("SELECT * FROM t WHERE s = 'hello;world' AND id = $id: i32");
-        assert!(r.is_ok(), "semicolon inside string literal should be allowed");
+        assert!(
+            r.is_ok(),
+            "semicolon inside string literal should be allowed"
+        );
         let parsed = r.unwrap();
         assert_eq!(parsed.params.len(), 1);
     }
@@ -1878,14 +1890,21 @@ mod tests {
         let r = parse_query("SELECT 1; DROP TABLE t");
         assert!(r.is_err());
         let err = r.unwrap_err();
-        assert!(err.contains("multiple statements") || err.contains("Semicolons"), "should reject semicolons: {err}");
+        assert!(
+            err.contains("multiple statements") || err.contains("Semicolons"),
+            "should reject semicolons: {err}"
+        );
     }
 
     // #104: Dollar-quoted string with $param inside: $id NOT extracted
     #[test]
     fn dollar_quoted_param_not_extracted() {
         let r = parse_query("SELECT $$SELECT $id$$").unwrap();
-        assert_eq!(r.params.len(), 0, "$id inside $$ should not be extracted as param");
+        assert_eq!(
+            r.params.len(),
+            0,
+            "$id inside $$ should not be extracted as param"
+        );
     }
 
     // #105: Comment with $param: $id NOT extracted
@@ -1899,14 +1918,22 @@ mod tests {
     #[test]
     fn block_comment_param_not_extracted() {
         let r = parse_query("/* $id: i32 */ SELECT 1").unwrap();
-        assert_eq!(r.params.len(), 0, "$id in block comment should not be extracted");
+        assert_eq!(
+            r.params.len(),
+            0,
+            "$id in block comment should not be extracted"
+        );
     }
 
     // Dollar-quoted string with tag: $func$...$func$
     #[test]
     fn dollar_quoted_with_tag_param_not_extracted() {
         let r = parse_query("SELECT $fn$body with $param: i32$fn$").unwrap();
-        assert_eq!(r.params.len(), 0, "$param inside tagged dollar quote should not be extracted");
+        assert_eq!(
+            r.params.len(),
+            0,
+            "$param inside tagged dollar quote should not be extracted"
+        );
     }
 
     // Standard escaped quote '' in string literal

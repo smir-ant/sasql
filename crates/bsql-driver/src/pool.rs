@@ -93,7 +93,6 @@ impl Pool {
     /// connection is created. If the pool is at max_size, returns
     /// `DriverError::Pool` immediately — no blocking.
     pub async fn acquire(&self) -> Result<PoolGuard, DriverError> {
-
         if self.inner.closed.load(Ordering::Acquire) {
             return Err(DriverError::Pool("pool is closed".into()));
         }
@@ -114,13 +113,9 @@ impl Pool {
         loop {
             let current = self.inner.open_count.load(Ordering::Acquire);
             if current >= self.inner.max_size {
-
                 if let Some(timeout) = self.inner.acquire_timeout {
-                    let result = tokio::time::timeout(
-                        timeout,
-                        self.inner.release_notify.notified(),
-                    )
-                    .await;
+                    let result =
+                        tokio::time::timeout(timeout, self.inner.release_notify.notified()).await;
                     if result.is_err() {
                         return Err(DriverError::Pool(
                             "pool exhausted: acquire timeout expired".into(),
@@ -174,7 +169,6 @@ impl Pool {
     fn try_pop_idle(&self) -> Result<Option<PoolGuard>, DriverError> {
         let mut stack = self.inner.stack.lock().unwrap_or_else(|e| e.into_inner());
         while let Some(conn) = stack.pop() {
-
             if let Some(max_lifetime) = self.inner.max_lifetime {
                 if conn.created_at().elapsed() >= max_lifetime {
                     self.inner.open_count.fetch_sub(1, Ordering::AcqRel);
@@ -359,8 +353,8 @@ impl PoolBuilder {
             url: None,
             max_size: 10,
             max_lifetime: Some(Duration::from_secs(30 * 60)), // 30 min default
-            acquire_timeout: None,                             // fail-fast by default (CREDO #17)
-            min_idle: 0,                                       // no minimum by default
+            acquire_timeout: None,                            // fail-fast by default (CREDO #17)
+            min_idle: 0,                                      // no minimum by default
         }
     }
 
@@ -422,7 +416,6 @@ impl PoolBuilder {
                 warmup_sqls: std::sync::Mutex::new(Arc::from(Vec::<Box<str>>::new())),
             }),
         };
-
 
         if self.min_idle > 0 {
             let inner = pool.inner.clone();
@@ -815,7 +808,9 @@ mod tests {
     // Pool open_count starts at 0
     #[tokio::test]
     async fn pool_open_count_initial() {
-        let pool = Pool::connect("postgres://user:pass@localhost/db").await.unwrap();
+        let pool = Pool::connect("postgres://user:pass@localhost/db")
+            .await
+            .unwrap();
         assert_eq!(pool.open_count(), 0);
     }
 }

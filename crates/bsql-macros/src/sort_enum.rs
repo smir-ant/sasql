@@ -196,8 +196,8 @@ fn validate_sort_fragment(fragment: &str, variant: &syn::Variant) -> Result<(), 
 
     // Check for dangerous keywords (case-insensitive word boundary check)
     const DANGEROUS_KEYWORDS: &[&str] = &[
-        "DROP", "DELETE", "INSERT", "UPDATE", "CREATE", "ALTER",
-        "TRUNCATE", "GRANT", "REVOKE", "EXECUTE", "COPY",
+        "DROP", "DELETE", "INSERT", "UPDATE", "CREATE", "ALTER", "TRUNCATE", "GRANT", "REVOKE",
+        "EXECUTE", "COPY",
     ];
 
     let upper = fragment.to_ascii_uppercase();
@@ -412,7 +412,6 @@ mod tests {
         assert!(result.is_err(), "structs should be rejected");
     }
 
-
     #[test]
     fn sort_fragment_with_semicolon_rejected() {
         let input = quote! {
@@ -493,7 +492,10 @@ mod tests {
             }
         };
         let result = expand_sort_enum(TokenStream::new(), input);
-        assert!(result.is_ok(), "column name containing keyword substring should be OK");
+        assert!(
+            result.is_ok(),
+            "column name containing keyword substring should be OK"
+        );
     }
 
     #[test]
@@ -505,7 +507,10 @@ mod tests {
             }
         };
         let result = expand_sort_enum(TokenStream::new(), input);
-        assert!(result.is_ok(), "valid complex sort fragment should be accepted");
+        assert!(
+            result.is_ok(),
+            "valid complex sort fragment should be accepted"
+        );
     }
 
     // --- Audit gap tests ---
@@ -520,7 +525,10 @@ mod tests {
             }
         };
         let result = expand_sort_enum(TokenStream::new(), input);
-        assert!(result.is_ok(), "created_at DESC NULLS LAST should be accepted");
+        assert!(
+            result.is_ok(),
+            "created_at DESC NULLS LAST should be accepted"
+        );
     }
 
     // #110: Fragment containing keyword substring: `updated_at ASC` accepted
@@ -533,7 +541,10 @@ mod tests {
             }
         };
         let result = expand_sort_enum(TokenStream::new(), input);
-        assert!(result.is_ok(), "updated_at should not be confused with UPDATE keyword");
+        assert!(
+            result.is_ok(),
+            "updated_at should not be confused with UPDATE keyword"
+        );
     }
 
     // Sort fragment with INSERT rejected
@@ -589,7 +600,10 @@ mod tests {
             }
         };
         let result = expand_sort_enum(TokenStream::new(), input);
-        assert!(result.is_ok(), "executed_at should be accepted (EXECUTE is substring, not word)");
+        assert!(
+            result.is_ok(),
+            "executed_at should be accepted (EXECUTE is substring, not word)"
+        );
     }
 
     // Column name containing "created" substring is accepted
@@ -615,6 +629,9 @@ mod tests {
             }
         };
         let result = expand_sort_enum(TokenStream::new(), input);
-        assert!(result.is_ok(), "deleted_at should be accepted (DELETE is substring, not standalone word)");
+        assert!(
+            result.is_ok(),
+            "deleted_at should be accepted (DELETE is substring, not standalone word)"
+        );
     }
 }

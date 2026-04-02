@@ -246,7 +246,6 @@ impl Arena {
     /// Resolve a global offset to (chunk_index, local_offset).
     /// O(log n) using binary search on prefix_sums.
     fn resolve_offset(&self, global_offset: usize) -> (usize, usize) {
-
         // for the common case (most queries fit in one 8KB chunk).
         if self.chunks.len() == 1 {
             debug_assert!(

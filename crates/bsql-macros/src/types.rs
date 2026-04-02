@@ -84,16 +84,16 @@ pub fn resolve_rust_type(oid: u32) -> Result<&'static str, String> {
         }
         // --- JSON / JSONB ---
         // Returned as String; users parse with serde_json or similar
-        114 => Ok("String"),   // json
-        3802 => Ok("String"),  // jsonb
+        114 => Ok("String"),  // json
+        3802 => Ok("String"), // jsonb
         // --- INTERVAL ---
         // Returned as String; PG sends the ISO 8601 text representation
         1186 => Ok("String"),
         // --- INET / CIDR / MACADDR ---
         // Returned as String; PG sends the text representation
-        869 => Ok("String"),   // inet
-        650 => Ok("String"),   // cidr
-        829 => Ok("String"),   // macaddr
+        869 => Ok("String"), // inet
+        650 => Ok("String"), // cidr
+        829 => Ok("String"), // macaddr
         // --- Timestamp/Date/Time arrays ---
         1115 => resolve_array("TIMESTAMP[]", 1114, oid),
         1185 => resolve_array("TIMESTAMPTZ[]", 1184, oid),
@@ -102,14 +102,14 @@ pub fn resolve_rust_type(oid: u32) -> Result<&'static str, String> {
         2951 => resolve_array("UUID[]", 2950, oid),
         1231 => resolve_array("NUMERIC[]", 1700, oid),
         // --- JSON/JSONB arrays ---
-        199 => Ok("Vec<String>"),   // json[]
-        3807 => Ok("Vec<String>"),  // jsonb[]
+        199 => Ok("Vec<String>"),  // json[]
+        3807 => Ok("Vec<String>"), // jsonb[]
         // --- Network type arrays ---
-        1041 => Ok("Vec<String>"),  // inet[]
-        651 => Ok("Vec<String>"),   // cidr[]
-        1040 => Ok("Vec<String>"),  // macaddr[]
+        1041 => Ok("Vec<String>"), // inet[]
+        651 => Ok("Vec<String>"),  // cidr[]
+        1040 => Ok("Vec<String>"), // macaddr[]
         // --- Interval array ---
-        1187 => Ok("Vec<String>"),  // interval[]
+        1187 => Ok("Vec<String>"), // interval[]
         _ => {
             let name = bsql_core::types::pg_name_for_oid(oid).unwrap_or("unknown");
             Err(format!(
@@ -463,7 +463,6 @@ mod tests {
         assert!(!is_known_non_enum_type("MyEnum"));
     }
 
-
     #[test]
     fn json_resolves_to_string() {
         assert_eq!(resolve_rust_type(114).unwrap(), "String");
@@ -483,7 +482,6 @@ mod tests {
     fn jsonb_array_resolves_to_vec_string() {
         assert_eq!(resolve_rust_type(3807).unwrap(), "Vec<String>");
     }
-
 
     #[test]
     fn interval_resolves_to_string() {
@@ -505,7 +503,6 @@ mod tests {
         assert_eq!(resolve_rust_type(829).unwrap(), "String");
     }
 
-
     #[test]
     fn json_param_compat() {
         assert!(is_param_compatible_extended("&str", 114));
@@ -526,7 +523,6 @@ mod tests {
         assert!(is_param_compatible_extended("String", 869));
     }
 
-
     #[test]
     fn inet_array_resolves() {
         assert_eq!(resolve_rust_type(1041).unwrap(), "Vec<String>");
@@ -537,11 +533,13 @@ mod tests {
         assert_eq!(resolve_rust_type(1187).unwrap(), "Vec<String>");
     }
 
-
     #[cfg(feature = "time")]
     #[test]
     fn timestamp_resolves_to_primitive_datetime() {
-        assert_eq!(resolve_rust_type(1114).unwrap(), "::time::PrimitiveDateTime");
+        assert_eq!(
+            resolve_rust_type(1114).unwrap(),
+            "::time::PrimitiveDateTime"
+        );
     }
 
     #[cfg(all(feature = "chrono", not(feature = "time")))]

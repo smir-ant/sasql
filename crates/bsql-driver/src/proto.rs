@@ -227,14 +227,12 @@ pub fn write_bind_params(
         buf.extend_from_slice(&1i16.to_be_bytes()); // binary
     }
 
-
     // Truncation checked at call site via write_bind_params_checked.
     let param_count = params.len().min(i16::MAX as usize) as i16;
 
     // Parameter values — encoded inline, no intermediate Vec<Vec<u8>>
     buf.extend_from_slice(&param_count.to_be_bytes());
     for param in params.iter().take(param_count as usize) {
-
         if param.is_null() {
             // PG binary protocol: NULL = length -1, no data bytes
             buf.extend_from_slice(&(-1i32).to_be_bytes());
@@ -264,7 +262,6 @@ pub fn write_bind_params_checked(
     statement: &str,
     params: &[&(dyn crate::codec::Encode + Sync)],
 ) -> Result<(), DriverError> {
-
     if params.len() > i16::MAX as usize {
         return Err(DriverError::Protocol(format!(
             "parameter count {} exceeds maximum {} for PG wire protocol",
@@ -591,7 +588,6 @@ pub fn parse_row_description(data: &[u8]) -> Result<Vec<crate::conn::ColumnDesc>
         return Err(DriverError::Protocol("RowDescription too short".into()));
     }
 
-
     // A negative i16 from a malicious server would become usize::MAX -> OOM.
     let raw_fields = i16::from_be_bytes([data[0], data[1]]);
     if raw_fields < 0 {
@@ -703,7 +699,6 @@ pub fn parse_error_response(data: &[u8]) -> ErrorFields {
             _ => {} // skip other fields (position, internal query, etc.)
         }
     }
-
 
     // Truncated or malformed error responses should produce a meaningful error.
     if message.is_empty() {
@@ -997,7 +992,6 @@ mod tests {
         assert_eq!(max_rows, 64);
     }
 
-
     #[test]
     fn row_description_negative_field_count() {
         let mut data = Vec::new();
@@ -1013,7 +1007,6 @@ mod tests {
         let result = parse_row_description(&data);
         assert!(result.is_err(), "field count > 2000 should error");
     }
-
 
     #[test]
     fn error_response_empty_produces_synthetic_message() {
@@ -1039,7 +1032,6 @@ mod tests {
         );
         assert!(fields.message.contains("42P01"));
     }
-
 
     #[test]
     fn copy_in_response_rejected() {
@@ -1077,7 +1069,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-
     #[test]
     fn bind_params_checked_rejects_overflow() {
         let mut buf = Vec::new();
@@ -1104,7 +1095,10 @@ mod tests {
         let result = parse_backend_message(b'R', &payload);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("unsupported auth type"), "unexpected error: {err}");
+        assert!(
+            err.contains("unsupported auth type"),
+            "unexpected error: {err}"
+        );
     }
 
     // #30: Auth message too short
@@ -1187,8 +1181,8 @@ mod tests {
     fn notification_parses() {
         let mut payload = Vec::new();
         payload.extend_from_slice(&42i32.to_be_bytes()); // pid
-        payload.extend_from_slice(b"my_channel\0");       // channel
-        payload.extend_from_slice(b"hello\0");             // payload
+        payload.extend_from_slice(b"my_channel\0"); // channel
+        payload.extend_from_slice(b"hello\0"); // payload
         let msg = parse_backend_message(b'A', &payload).unwrap();
         match msg {
             BackendMessage::NotificationResponse {
@@ -1231,7 +1225,10 @@ mod tests {
         let result = parse_backend_message(b'G', &[]);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("CopyInResponse"), "should name CopyInResponse: {err}");
+        assert!(
+            err.contains("CopyInResponse"),
+            "should name CopyInResponse: {err}"
+        );
     }
 
     // #43: CopyOutResponse proper error message
@@ -1240,7 +1237,10 @@ mod tests {
         let result = parse_backend_message(b'H', &[]);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("CopyOutResponse"), "should name CopyOutResponse: {err}");
+        assert!(
+            err.contains("CopyOutResponse"),
+            "should name CopyOutResponse: {err}"
+        );
     }
 
     // #44: Command tag "CREATE TABLE" -> 0 affected rows

@@ -231,10 +231,7 @@ fn validate_savepoint_name(name: &str) -> BsqlResult<()> {
             "savepoint name must start with a letter or underscore",
         ));
     }
-    if !name
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-    {
+    if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
         return Err(ConnectError::create(
             "savepoint name must contain only ASCII letters, digits, and underscores",
         ));
@@ -295,17 +292,11 @@ mod tests {
             IsolationLevel::ReadUncommitted.to_string(),
             "READ UNCOMMITTED"
         );
-        assert_eq!(
-            IsolationLevel::ReadCommitted.to_string(),
-            "READ COMMITTED"
-        );
+        assert_eq!(IsolationLevel::ReadCommitted.to_string(), "READ COMMITTED");
         assert_eq!(
             IsolationLevel::RepeatableRead.to_string(),
             "REPEATABLE READ"
         );
-        assert_eq!(
-            IsolationLevel::Serializable.to_string(),
-            "SERIALIZABLE"
-        );
+        assert_eq!(IsolationLevel::Serializable.to_string(), "SERIALIZABLE");
     }
 }

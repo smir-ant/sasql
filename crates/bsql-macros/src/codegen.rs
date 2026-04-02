@@ -137,7 +137,11 @@ pub fn generate_sort_query_code(
     // cached in a static map keyed by the &'static str fragment pointer.
     let sort_parts: Vec<&str> = sql_template.split("{SORT}").collect();
     let sql_prefix = sort_parts[0];
-    let sql_suffix = if sort_parts.len() > 1 { sort_parts[1] } else { "" };
+    let sql_suffix = if sort_parts.len() > 1 {
+        sort_parts[1]
+    } else {
+        ""
+    };
 
     // Pre-compute the prefix/suffix for the LIMIT 2 variant
     let needs_limit = has_columns
@@ -1244,21 +1248,23 @@ fn gen_feature_gated_decode(idx: usize, rust_type: &str) -> TokenStream {
                 })
             } },
         ),
-        "Vec<::chrono::DateTime<::chrono::Utc>>" | "Vec<chrono::DateTime<chrono::Utc>>" => gen_decode_match(
-            idx,
-            "timestamptz[]",
-            quote! { {
-                let raw = row.get_raw(#idx).unwrap_or_default();
-                ::bsql_core::driver::decode_array_i64(raw).and_then(|micros_vec| {
-                    let mut out = Vec::with_capacity(micros_vec.len());
-                    for micros in micros_vec {
-                        let buf = micros.to_be_bytes();
-                        out.push(::bsql_core::driver::decode_timestamptz_chrono(&buf)?);
-                    }
-                    Ok(out)
-                })
-            } },
-        ),
+        "Vec<::chrono::DateTime<::chrono::Utc>>" | "Vec<chrono::DateTime<chrono::Utc>>" => {
+            gen_decode_match(
+                idx,
+                "timestamptz[]",
+                quote! { {
+                    let raw = row.get_raw(#idx).unwrap_or_default();
+                    ::bsql_core::driver::decode_array_i64(raw).and_then(|micros_vec| {
+                        let mut out = Vec::with_capacity(micros_vec.len());
+                        for micros in micros_vec {
+                            let buf = micros.to_be_bytes();
+                            out.push(::bsql_core::driver::decode_timestamptz_chrono(&buf)?);
+                        }
+                        Ok(out)
+                    })
+                } },
+            )
+        }
         "Vec<::chrono::NaiveDateTime>" | "Vec<chrono::NaiveDateTime>" => gen_decode_match(
             idx,
             "timestamp[]",
@@ -1750,13 +1756,11 @@ mod tests {
         assert_eq!(sanitize_param_name("id"), "id");
     }
 
-
     #[test]
     fn sanitize_raw_keyword() {
         assert_eq!(sanitize_param_name("raw"), "raw_");
         assert_eq!(sanitize_column_name("raw", 0), "raw_");
     }
-
 
     #[test]
     fn not_null_decode_uses_ok_or_else() {
@@ -1775,7 +1779,6 @@ mod tests {
             "should use ok_or_else for NOT NULL decode: {code_str}"
         );
     }
-
 
     #[test]
     fn timestamp_decode_has_primitive_date_time() {

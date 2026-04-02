@@ -203,7 +203,6 @@ impl ScramClient {
         // Expected = HMAC(ServerKey, AuthMessage)
         let expected = hmac_sha256(&server_key, self.auth_message.as_bytes())?;
 
-
         // handles mismatched lengths without leaking timing information.
         if !constant_time_eq(&server_sig, &expected) {
             return Err(DriverError::Auth("server signature mismatch".into()));
@@ -440,7 +439,10 @@ mod tests {
         let result = client.process_server_first(server_first.as_bytes());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("iterations"), "should mention iterations: {err}");
+        assert!(
+            err.contains("iterations"),
+            "should mention iterations: {err}"
+        );
     }
 
     // #49: SCRAM non-numeric iteration count
@@ -465,7 +467,10 @@ mod tests {
         let result = client.process_server_first(server_first.as_bytes());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("base64") || err.contains("salt"), "should mention base64 or salt: {err}");
+        assert!(
+            err.contains("base64") || err.contains("salt"),
+            "should mention base64 or salt: {err}"
+        );
     }
 
     // #51: SCRAM verify_server_final signature mismatch
@@ -476,7 +481,9 @@ mod tests {
         let server_nonce = format!("{}serverpart", client.nonce);
         let salt = B64.encode(b"salt1234salt5678");
         let server_first = format!("r={server_nonce},s={salt},i=4096");
-        client.process_server_first(server_first.as_bytes()).unwrap();
+        client
+            .process_server_first(server_first.as_bytes())
+            .unwrap();
         let _final_msg = client.client_final_message().unwrap();
 
         // Provide a wrong server signature
@@ -496,12 +503,17 @@ mod tests {
         let server_nonce = format!("{}serverpart", client.nonce);
         let salt = B64.encode(b"salt1234salt5678");
         let server_first = format!("r={server_nonce},s={salt},i=4096");
-        client.process_server_first(server_first.as_bytes()).unwrap();
+        client
+            .process_server_first(server_first.as_bytes())
+            .unwrap();
 
         let result = client.verify_server_final(b"no_v_prefix_here");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("v="), "should mention missing v= prefix: {err}");
+        assert!(
+            err.contains("v="),
+            "should mention missing v= prefix: {err}"
+        );
     }
 
     // #53: constant_time_eq with empty inputs

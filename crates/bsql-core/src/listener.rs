@@ -430,10 +430,7 @@ async fn reconnect_with_backoff(
         match bsql_driver::Connection::connect(config).await {
             Ok(mut new_conn) => {
                 // Re-subscribe to all tracked channels
-                let channel_set = channels
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
+                let channel_set = channels.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
                 for channel in &channel_set {
                     match quote_ident(channel) {
@@ -458,9 +455,7 @@ async fn reconnect_with_backoff(
                 return Some(new_conn);
             }
             Err(e) => {
-                eprintln!(
-                    "bsql: listener reconnect attempt {attempt}/{max_attempts} failed: {e}"
-                );
+                eprintln!("bsql: listener reconnect attempt {attempt}/{max_attempts} failed: {e}");
                 delay = std::cmp::min(delay * 2, max_delay);
             }
         }
@@ -536,7 +531,10 @@ mod tests {
 
     #[test]
     fn quote_ident_with_unicode() {
-        assert_eq!(quote_ident("channel_\u{00e9}").unwrap(), "\"channel_\u{00e9}\"");
+        assert_eq!(
+            quote_ident("channel_\u{00e9}").unwrap(),
+            "\"channel_\u{00e9}\""
+        );
     }
 
     #[test]
