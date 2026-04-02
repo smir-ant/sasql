@@ -72,17 +72,56 @@ pub fn did_you_mean<'a>(target: &str, candidates: &[&'a str]) -> Option<&'a str>
         .map(|(c, _)| c)
 }
 
-/// Query the database for available table names in the public schema.
+/// Query the database for available table names across all user schemas.
 ///
-/// Used to generate "did you mean?" suggestions when a table is not found.
+/// Returns schema-qualified names for non-public schemas and unqualified
+/// names for public schema tables.
 pub fn fetch_table_names(
     rt: &tokio::runtime::Runtime,
     client: &tokio_postgres::Client,
 ) -> Vec<String> {
-    let query = "SELECT table_name FROM information_schema.tables \
-                 WHERE table_schema = 'public' ORDER BY table_name";
+    let query = "SELECT table_schema, table_name FROM information_schema.tables \
+                 WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
+                 ORDER BY table_schema, table_name";
     match rt.block_on(client.query(query, &[])) {
-        Ok(rows) => rows.iter().map(|r| r.get::<_, String>(0)).collect(),
+        Ok(rows) => rows
+            .iter()
+            .map(|r| {
+                let schema: String = r.get(0);
+                let table: String = r.get(1);
+                if schema == "public" {
+                    table
+                } else {
+                    format!("{schema}.{table}")
+                }
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Query the database for all column names across all user tables in a single
+/// batch query. Returns (schema, table, column) triples.
+///
+/// Used to generate "did you mean?" suggestions without N+1 round-trips.
+pub fn fetch_all_columns(
+    rt: &tokio::runtime::Runtime,
+    client: &tokio_postgres::Client,
+) -> Vec<(String, String, String)> {
+    let query = "SELECT table_schema, table_name, column_name \
+                 FROM information_schema.columns \
+                 WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
+                 ORDER BY table_schema, table_name, ordinal_position";
+    match rt.block_on(client.query(query, &[])) {
+        Ok(rows) => rows
+            .iter()
+            .map(|r| {
+                let schema: String = r.get(0);
+                let table: String = r.get(1);
+                let column: String = r.get(2);
+                (schema, table, column)
+            })
+            .collect(),
         Err(_) => Vec::new(),
     }
 }
@@ -95,9 +134,16 @@ pub fn fetch_column_names(
     client: &tokio_postgres::Client,
     table_name: &str,
 ) -> Vec<String> {
+    // Support schema-qualified names (e.g., "myschema.mytable")
+    let (schema, table) = if let Some(dot_pos) = table_name.find('.') {
+        (&table_name[..dot_pos], &table_name[dot_pos + 1..])
+    } else {
+        ("public", table_name)
+    };
+
     let query = "SELECT column_name FROM information_schema.columns \
-                 WHERE table_name = $1 ORDER BY ordinal_position";
-    match rt.block_on(client.query(query, &[&table_name])) {
+                 WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position";
+    match rt.block_on(client.query(query, &[&schema, &table])) {
         Ok(rows) => rows.iter().map(|r| r.get::<_, String>(0)).collect(),
         Err(_) => Vec::new(),
     }
@@ -150,16 +196,21 @@ pub fn enhance_error(
             }
         }
 
-        // No table in the error — try all public tables
-        let tables = fetch_table_names(rt, client);
-        for tbl in &tables {
-            let columns = fetch_column_names(rt, client, tbl);
-            let col_refs: Vec<&str> = columns.iter().map(|s| s.as_str()).collect();
-            if let Some(suggestion) = did_you_mean(&column, &col_refs) {
-                return Some(format!(
-                    "\n  did you mean \"{suggestion}\"? (in table \"{tbl}\")"
-                ));
+        // No table in the error — batch-fetch all columns and compute distances in Rust
+        let all_columns = fetch_all_columns(rt, client);
+        let mut best: Option<(&str, &str, usize)> = None;
+        for (_schema, table, col_name) in &all_columns {
+            let dist = levenshtein(&column, col_name);
+            if dist > 0 && dist <= 3 && (best.is_none() || dist < best.unwrap().2) {
+                let tbl = table.as_str();
+                best = Some((col_name.as_str(), tbl, dist));
             }
+        }
+
+        if let Some((suggestion, tbl, _)) = best {
+            return Some(format!(
+                "\n  did you mean \"{suggestion}\"? (in table \"{tbl}\")"
+            ));
         }
 
         // No close match in any table — give a generic hint

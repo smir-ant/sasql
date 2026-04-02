@@ -47,6 +47,8 @@ pub struct DecodeError {
     pub column: Cow<'static, str>,
     pub expected: &'static str,
     pub actual: Cow<'static, str>,
+    /// Optional underlying error that caused the decode failure.
+    pub(crate) source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
 /// Initial connection failure.
@@ -108,7 +110,7 @@ impl std::error::Error for BsqlError {
         match self {
             Self::Pool(e) => e.source(),
             Self::Query(e) => e.source(),
-            Self::Decode(_) => None,
+            Self::Decode(e) => e.source(),
             Self::Connect(e) => e.source(),
         }
     }
@@ -126,7 +128,11 @@ impl std::error::Error for QueryError {
     }
 }
 
-impl std::error::Error for DecodeError {}
+impl std::error::Error for DecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        boxed_source(&self.source)
+    }
+}
 
 impl std::error::Error for ConnectError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
@@ -139,6 +145,40 @@ fn boxed_source(
 ) -> Option<&(dyn std::error::Error + 'static)> {
     src.as_ref()
         .map(|e| &**e as &(dyn std::error::Error + 'static))
+}
+
+// --- Query helpers ---
+
+impl BsqlError {
+    /// Whether this error is a PostgreSQL query cancellation / statement timeout
+    /// (SQLSTATE 57014).
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, BsqlError::Query(q) if q.pg_code.as_deref() == Some("57014"))
+    }
+
+    /// Whether this error is a serialization failure (SQLSTATE 40001).
+    ///
+    /// When using `SERIALIZABLE` isolation, PostgreSQL may abort a transaction
+    /// with this code. The correct response is to retry the entire transaction.
+    pub fn is_serialization_failure(&self) -> bool {
+        matches!(self, BsqlError::Query(q) if q.pg_code.as_deref() == Some("40001"))
+    }
+
+    /// Convert a `DriverError` that occurred during query execution.
+    ///
+    /// Unlike the blanket `From<DriverError>` impl (which maps `Io` to `Connect`),
+    /// this maps `Io` errors to `Query` — because a network failure mid-query is
+    /// a query error, not a connection error.
+    pub fn from_driver_query(e: bsql_driver::DriverError) -> Self {
+        match e {
+            bsql_driver::DriverError::Io(io_err) => BsqlError::Query(QueryError {
+                message: Cow::Owned(format!("I/O error during query: {io_err}")),
+                pg_code: None,
+                source: Some(Box::new(io_err)),
+            }),
+            other => BsqlError::from(other),
+        }
+    }
 }
 
 // --- From conversions ---
@@ -181,7 +221,7 @@ impl From<bsql_driver::DriverError> for BsqlError {
                 };
                 BsqlError::Query(QueryError {
                     message: msg,
-                    pg_code: Some(code.into()),
+                    pg_code: Some(code),
                     source: None,
                 })
             }
@@ -233,6 +273,23 @@ impl QueryError {
     }
 }
 
+impl DecodeError {
+    /// Create a decode error with an underlying cause.
+    pub fn with_source(
+        column: impl Into<Cow<'static, str>>,
+        expected: &'static str,
+        actual: impl Into<Cow<'static, str>>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> BsqlError {
+        BsqlError::Decode(DecodeError {
+            column: column.into(),
+            expected,
+            actual: actual.into(),
+            source: Some(Box::new(source)),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,6 +329,7 @@ mod tests {
             column: Cow::Borrowed("age"),
             expected: "i32",
             actual: Cow::Borrowed("text"),
+            source: None,
         });
         assert_eq!(
             e.to_string(),
@@ -400,7 +458,87 @@ mod tests {
             column: Cow::Borrowed("col"),
             expected: "i32",
             actual: Cow::Borrowed("text"),
+            source: None,
         });
         assert!(e.source().is_none());
+    }
+
+    #[test]
+    fn decode_error_with_source_chain() {
+        let inner = std::io::Error::new(std::io::ErrorKind::InvalidData, "bad utf-8");
+        let e = DecodeError::with_source("name", "String", "invalid bytes", inner);
+        assert!(e.source().is_some());
+        match &e {
+            BsqlError::Decode(d) => {
+                assert_eq!(d.column, "name");
+                assert_eq!(d.expected, "String");
+            }
+            other => panic!("expected Decode, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn is_timeout_true_for_57014() {
+        let e = BsqlError::Query(QueryError {
+            message: Cow::Borrowed("canceling statement due to statement timeout"),
+            pg_code: Some(Box::from("57014")),
+            source: None,
+        });
+        assert!(e.is_timeout());
+    }
+
+    #[test]
+    fn is_timeout_false_for_other_codes() {
+        let e = BsqlError::Query(QueryError {
+            message: Cow::Borrowed("unique violation"),
+            pg_code: Some(Box::from("23505")),
+            source: None,
+        });
+        assert!(!e.is_timeout());
+    }
+
+    #[test]
+    fn is_timeout_false_for_non_query() {
+        let e = PoolError::exhausted();
+        assert!(!e.is_timeout());
+    }
+
+    #[test]
+    fn is_serialization_failure_true_for_40001() {
+        let e = BsqlError::Query(QueryError {
+            message: Cow::Borrowed("could not serialize access"),
+            pg_code: Some(Box::from("40001")),
+            source: None,
+        });
+        assert!(e.is_serialization_failure());
+    }
+
+    #[test]
+    fn is_serialization_failure_false_for_other_codes() {
+        let e = BsqlError::Query(QueryError {
+            message: Cow::Borrowed("timeout"),
+            pg_code: Some(Box::from("57014")),
+            source: None,
+        });
+        assert!(!e.is_serialization_failure());
+    }
+
+    #[test]
+    fn from_driver_query_maps_io_to_query() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pipe broke");
+        let e = BsqlError::from_driver_query(bsql_driver::DriverError::Io(io_err));
+        match &e {
+            BsqlError::Query(q) => {
+                assert!(q.message.contains("I/O error during query"));
+                assert!(q.source.is_some());
+            }
+            other => panic!("expected Query, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_driver_query_non_io_delegates_to_from() {
+        let e = BsqlError::from_driver_query(bsql_driver::DriverError::Pool("test".into()));
+        assert!(matches!(e, BsqlError::Pool(_)));
     }
 }

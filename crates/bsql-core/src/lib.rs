@@ -46,7 +46,7 @@ pub use executor::Executor;
 pub use listener::{Listener, Notification};
 pub use pool::{Pool, PoolBuilder, PoolConnection, PoolStatus};
 pub use stream::QueryStream;
-pub use transaction::Transaction;
+pub use transaction::{IsolationLevel, Transaction};
 
 /// Hash a string using rapidhash. Used by singleflight, statement naming,
 /// and offline cache keys. Not part of the public API.

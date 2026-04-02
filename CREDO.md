@@ -180,6 +180,7 @@ Every public API has a doc-test. The doc-test compiles, runs, and demonstrates c
 - The `examples/` directory is generated from doc-tests. Not the other way around.
 - CI runs `cargo test --doc` on every commit. A doc-test failure blocks the merge.
 - Doc-tests use real PostgreSQL (via testcontainers or the CI database). No mocking.
+- The `.bsql/` query cache is committed to the repository. Cloned repos and local builds without a running database auto-fallback to this cache, so doc-tests compile everywhere. Online builds refresh the cache automatically.
 
 ---
 

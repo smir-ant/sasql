@@ -8,7 +8,8 @@
 //!
 //! If a `Transaction` is dropped without calling [`commit()`](Transaction::commit)
 //! or [`rollback()`](Transaction::rollback), the driver discards the connection
-//! from the pool. PostgreSQL auto-rollbacks when the connection closes.
+//! from the pool. PostgreSQL auto-rollbacks when the connection closes. A warning
+//! is emitted via `eprintln!` to help detect forgotten commits during development.
 
 use std::fmt;
 
@@ -16,40 +17,142 @@ use bsql_driver::arena::acquire_arena;
 use bsql_driver::codec::Encode;
 use tokio::sync::Mutex;
 
-use crate::error::{BsqlError, BsqlResult};
+use crate::error::{BsqlError, BsqlResult, ConnectError};
 use crate::executor::OwnedResult;
+
+/// Transaction isolation levels supported by PostgreSQL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationLevel {
+    ReadUncommitted,
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
+}
+
+impl IsolationLevel {
+    /// SQL representation for `SET TRANSACTION ISOLATION LEVEL ...`.
+    fn as_sql(&self) -> &'static str {
+        match self {
+            IsolationLevel::ReadUncommitted => "READ UNCOMMITTED",
+            IsolationLevel::ReadCommitted => "READ COMMITTED",
+            IsolationLevel::RepeatableRead => "REPEATABLE READ",
+            IsolationLevel::Serializable => "SERIALIZABLE",
+        }
+    }
+}
+
+impl fmt::Display for IsolationLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_sql())
+    }
+}
 
 /// A database transaction.
 ///
 /// Created by [`Pool::begin()`](crate::pool::Pool::begin). Must be explicitly
 /// committed via [`commit()`](Transaction::commit). If dropped without
-/// `commit()`, the connection is discarded from the pool.
+/// `commit()`, the connection is discarded from the pool and a warning is logged.
+///
+/// Uses `tokio::sync::Mutex` for interior mutability because the driver's
+/// `Transaction` requires `&mut self` but the `Executor` trait takes `&self`.
+/// The mutex is uncontended in practice — a transaction is used by one task
+/// at a time. `tokio::sync::Mutex` (over `RefCell`) is required because the
+/// future holding the lock must be `Send` for tokio task migration.
 pub struct Transaction {
-    inner: Mutex<bsql_driver::Transaction>,
+    inner: Mutex<Option<bsql_driver::Transaction>>,
+    /// Set to true when commit() or rollback() is called.
+    finished: bool,
 }
 
 impl Transaction {
     /// Wrap a driver-level transaction.
     pub(crate) fn from_driver(tx: bsql_driver::Transaction) -> Self {
         Self {
-            inner: Mutex::new(tx),
+            inner: Mutex::new(Some(tx)),
+            finished: false,
         }
     }
 
     /// Commit the transaction and return the connection to the pool.
     ///
     /// Consumes `self` — the transaction cannot be used after commit.
-    pub async fn commit(self) -> BsqlResult<()> {
-        let tx = self.inner.into_inner();
+    pub async fn commit(mut self) -> BsqlResult<()> {
+        self.finished = true;
+        let tx = self
+            .inner
+            .lock()
+            .await
+            .take()
+            .expect("transaction already consumed");
         tx.commit().await.map_err(BsqlError::from)
     }
 
     /// Explicitly roll back the transaction and return the connection to the pool.
     ///
     /// Consumes `self` — the transaction cannot be used after rollback.
-    pub async fn rollback(self) -> BsqlResult<()> {
-        let tx = self.inner.into_inner();
+    pub async fn rollback(mut self) -> BsqlResult<()> {
+        self.finished = true;
+        let tx = self
+            .inner
+            .lock()
+            .await
+            .take()
+            .expect("transaction already consumed");
         tx.rollback().await.map_err(BsqlError::from)
+    }
+
+    /// Create a savepoint within the transaction.
+    ///
+    /// The `name` must be a valid SQL identifier: ASCII alphanumeric and
+    /// underscores only, starting with a letter or underscore. Maximum 63 characters.
+    pub async fn savepoint(&self, name: &str) -> BsqlResult<()> {
+        validate_savepoint_name(name)?;
+        let sql = format!("SAVEPOINT {name}");
+        let mut guard = self.inner.lock().await;
+        let tx = guard.as_mut().expect("transaction already consumed");
+        tx.simple_query(&sql)
+            .await
+            .map_err(BsqlError::from_driver_query)
+    }
+
+    /// Release (destroy) a savepoint, keeping its effects.
+    ///
+    /// The `name` must match a previously created savepoint.
+    pub async fn release_savepoint(&self, name: &str) -> BsqlResult<()> {
+        validate_savepoint_name(name)?;
+        let sql = format!("RELEASE SAVEPOINT {name}");
+        let mut guard = self.inner.lock().await;
+        let tx = guard.as_mut().expect("transaction already consumed");
+        tx.simple_query(&sql)
+            .await
+            .map_err(BsqlError::from_driver_query)
+    }
+
+    /// Roll back to a savepoint, undoing changes made after it was created.
+    ///
+    /// The savepoint remains valid after this call (can be rolled back to again).
+    pub async fn rollback_to(&self, name: &str) -> BsqlResult<()> {
+        validate_savepoint_name(name)?;
+        let sql = format!("ROLLBACK TO SAVEPOINT {name}");
+        let mut guard = self.inner.lock().await;
+        let tx = guard.as_mut().expect("transaction already consumed");
+        tx.simple_query(&sql)
+            .await
+            .map_err(BsqlError::from_driver_query)
+    }
+
+    /// Set the isolation level for this transaction.
+    ///
+    /// Must be called before the first query in the transaction (immediately
+    /// after `begin()`). PostgreSQL rejects `SET TRANSACTION` after any
+    /// data-modifying statement.
+    pub async fn set_isolation(&self, level: IsolationLevel) -> BsqlResult<()> {
+        let sql = format!("SET TRANSACTION ISOLATION LEVEL {}", level.as_sql());
+        let mut guard = self.inner.lock().await;
+        let tx = guard.as_mut().expect("transaction already consumed");
+        tx.simple_query(&sql)
+            .await
+            .map_err(BsqlError::from_driver_query)
     }
 
     /// Execute a query within the transaction (used by Executor impl).
@@ -59,12 +162,13 @@ impl Transaction {
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<OwnedResult> {
-        let mut tx = self.inner.lock().await;
+        let mut guard = self.inner.lock().await;
+        let tx = guard.as_mut().expect("transaction already consumed");
         let mut arena = acquire_arena();
         let result = tx
             .query(sql, sql_hash, params, &mut arena)
             .await
-            .map_err(BsqlError::from)?;
+            .map_err(BsqlError::from_driver_query)?;
         Ok(OwnedResult::new(result, arena))
     }
 
@@ -75,15 +179,133 @@ impl Transaction {
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<u64> {
-        let mut tx = self.inner.lock().await;
+        let mut guard = self.inner.lock().await;
+        let tx = guard.as_mut().expect("transaction already consumed");
         tx.execute(sql, sql_hash, params)
             .await
-            .map_err(BsqlError::from)
+            .map_err(BsqlError::from_driver_query)
     }
 }
 
 impl fmt::Debug for Transaction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Transaction").finish()
+        f.debug_struct("Transaction")
+            .field("finished", &self.finished)
+            .finish()
+    }
+}
+
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        if !self.finished {
+            // The transaction was dropped without commit() or rollback().
+            // The driver-level Transaction::drop discards the connection from the
+            // pool — PG server auto-rollbacks when it sees the disconnect.
+            // Log a warning to help catch forgotten commits during development.
+            eprintln!(
+                "bsql: Transaction dropped without commit() or rollback() — \
+                 connection discarded from pool. This is safe but wasteful."
+            );
+        }
+    }
+}
+
+/// Validate a savepoint name: must be a valid SQL identifier.
+///
+/// Rules:
+/// - Non-empty, at most 63 characters (PG's `NAMEDATALEN - 1`)
+/// - Starts with an ASCII letter or underscore
+/// - Contains only ASCII letters, digits, and underscores
+fn validate_savepoint_name(name: &str) -> BsqlResult<()> {
+    if name.is_empty() {
+        return Err(ConnectError::create("savepoint name must not be empty"));
+    }
+    if name.len() > 63 {
+        return Err(ConnectError::create(
+            "savepoint name must not exceed 63 characters",
+        ));
+    }
+    let first = name.as_bytes()[0];
+    if !first.is_ascii_alphabetic() && first != b'_' {
+        return Err(ConnectError::create(
+            "savepoint name must start with a letter or underscore",
+        ));
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return Err(ConnectError::create(
+            "savepoint name must contain only ASCII letters, digits, and underscores",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_savepoint_name_valid() {
+        assert!(validate_savepoint_name("sp1").is_ok());
+        assert!(validate_savepoint_name("_sp").is_ok());
+        assert!(validate_savepoint_name("my_savepoint_123").is_ok());
+    }
+
+    #[test]
+    fn validate_savepoint_name_empty() {
+        assert!(validate_savepoint_name("").is_err());
+    }
+
+    #[test]
+    fn validate_savepoint_name_too_long() {
+        let long = "a".repeat(64);
+        assert!(validate_savepoint_name(&long).is_err());
+    }
+
+    #[test]
+    fn validate_savepoint_name_max_length() {
+        let max = "a".repeat(63);
+        assert!(validate_savepoint_name(&max).is_ok());
+    }
+
+    #[test]
+    fn validate_savepoint_name_starts_with_digit() {
+        assert!(validate_savepoint_name("1sp").is_err());
+    }
+
+    #[test]
+    fn validate_savepoint_name_starts_with_underscore() {
+        assert!(validate_savepoint_name("_sp").is_ok());
+    }
+
+    #[test]
+    fn validate_savepoint_name_special_chars() {
+        assert!(validate_savepoint_name("sp-1").is_err());
+        assert!(validate_savepoint_name("sp.1").is_err());
+        assert!(validate_savepoint_name("sp 1").is_err());
+        assert!(validate_savepoint_name("sp;1").is_err());
+        assert!(validate_savepoint_name("sp'1").is_err());
+    }
+
+    #[test]
+    fn isolation_level_display() {
+        assert_eq!(
+            IsolationLevel::ReadUncommitted.to_string(),
+            "READ UNCOMMITTED"
+        );
+        assert_eq!(
+            IsolationLevel::ReadCommitted.to_string(),
+            "READ COMMITTED"
+        );
+        assert_eq!(
+            IsolationLevel::RepeatableRead.to_string(),
+            "REPEATABLE READ"
+        );
+        assert_eq!(
+            IsolationLevel::Serializable.to_string(),
+            "SERIALIZABLE"
+        );
     }
 }

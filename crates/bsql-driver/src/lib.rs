@@ -54,7 +54,7 @@ pub use arena::Arena;
 pub use codec::Encode;
 pub use conn::hash_sql;
 pub use conn::{ColumnDesc, Config, Connection, QueryResult, Row, SslMode};
-pub use pool::{Pool, PoolBuilder, PoolGuard, Transaction};
+pub use pool::{Pool, PoolBuilder, PoolGuard, PoolStatus, Transaction};
 
 // --- DriverError ---
 

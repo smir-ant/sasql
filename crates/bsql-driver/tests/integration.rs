@@ -1096,7 +1096,7 @@ async fn streaming_1000_rows() {
 
     loop {
         let num_cols = columns.len();
-        let mut col_offsets: Vec<(u32, i32)> = Vec::new();
+        let mut col_offsets: Vec<(usize, i32)> = Vec::new();
 
         if !first_chunk {
             conn.streaming_send_execute(64).await.unwrap();
@@ -1157,7 +1157,7 @@ async fn streaming_chunk_boundary_exact() {
         .unwrap();
 
     let num_cols = columns.len();
-    let mut col_offsets: Vec<(u32, i32)> = Vec::new();
+    let mut col_offsets: Vec<(usize, i32)> = Vec::new();
     let more = conn
         .streaming_next_chunk(&mut arena, &mut col_offsets)
         .await
@@ -1203,7 +1203,7 @@ async fn streaming_zero_rows() {
         .unwrap();
 
     let num_cols = columns.len();
-    let mut col_offsets: Vec<(u32, i32)> = Vec::new();
+    let mut col_offsets: Vec<(usize, i32)> = Vec::new();
     let more = conn
         .streaming_next_chunk(&mut arena, &mut col_offsets)
         .await
@@ -1234,7 +1234,7 @@ async fn streaming_single_row() {
         .unwrap();
 
     let num_cols = columns.len();
-    let mut col_offsets: Vec<(u32, i32)> = Vec::new();
+    let mut col_offsets: Vec<(usize, i32)> = Vec::new();
     let more = conn
         .streaming_next_chunk(&mut arena, &mut col_offsets)
         .await
@@ -1268,7 +1268,7 @@ async fn streaming_early_drop() {
         .await
         .unwrap();
 
-    let mut col_offsets: Vec<(u32, i32)> = Vec::new();
+    let mut col_offsets: Vec<(usize, i32)> = Vec::new();
     let more = guard
         .streaming_next_chunk(&mut arena, &mut col_offsets)
         .await

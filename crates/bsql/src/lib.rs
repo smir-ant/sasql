@@ -13,7 +13,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! bsql = "0.10"
+//! bsql = "0.13"
 //! tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 //! ```
 //!
@@ -72,7 +72,7 @@ pub use bsql_core::executor::{Executor, OwnedResult};
 pub use bsql_core::listener::{Listener, Notification};
 pub use bsql_core::pool::{Pool, PoolBuilder, PoolConnection, PoolStatus};
 pub use bsql_core::stream::QueryStream;
-pub use bsql_core::transaction::Transaction;
+pub use bsql_core::transaction::{IsolationLevel, Transaction};
 
 // Re-export driver types used by generated code
 #[doc(hidden)]

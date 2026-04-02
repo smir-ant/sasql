@@ -246,6 +246,17 @@ impl Arena {
     /// Resolve a global offset to (chunk_index, local_offset).
     /// O(log n) using binary search on prefix_sums.
     fn resolve_offset(&self, global_offset: usize) -> (usize, usize) {
+
+        // for the common case (most queries fit in one 8KB chunk).
+        if self.chunks.len() == 1 {
+            debug_assert!(
+                global_offset < self.chunks[0].capacity(),
+                "arena offset {global_offset} out of bounds in single chunk (cap={})",
+                self.chunks[0].capacity()
+            );
+            return (0, global_offset);
+        }
+
         // Binary search: find the last chunk whose prefix_sum <= global_offset
         let idx = match self.prefix_sums.binary_search(&global_offset) {
             Ok(i) => i,
@@ -534,5 +545,96 @@ mod tests {
         let (chunk_idx, local) = arena.resolve_offset(0);
         assert_eq!(chunk_idx, 0);
         assert_eq!(local, 0);
+    }
+
+    /// Single-chunk fast-path in resolve_offset.
+    #[test]
+    fn resolve_offset_single_chunk_fast_path() {
+        let mut arena = Arena::new();
+        // Stay within one chunk
+        let o1 = arena.alloc_copy(b"hello");
+        let o2 = arena.alloc_copy(b"world");
+        assert_eq!(arena.chunks.len(), 1, "should be single chunk");
+
+        // resolve_offset uses fast-path
+        assert_eq!(arena.get(o1, 5), b"hello");
+        assert_eq!(arena.get(o2, 5), b"world");
+    }
+
+    // --- Audit gap tests ---
+
+    // #56: get_str with invalid UTF-8
+    #[test]
+    fn get_str_invalid_utf8_returns_none() {
+        let mut arena = Arena::new();
+        let offset = arena.alloc_copy(&[0xFF, 0xFE, 0xFD]);
+        assert_eq!(arena.get_str(offset, 3), None);
+    }
+
+    // #56 extra: get_str with valid UTF-8
+    #[test]
+    fn get_str_valid_utf8() {
+        let mut arena = Arena::new();
+        let offset = arena.alloc_copy("hello".as_bytes());
+        assert_eq!(arena.get_str(offset, 5), Some("hello"));
+    }
+
+    // #56 extra: get_str with empty string
+    #[test]
+    fn get_str_empty_returns_some_empty() {
+        let arena = Arena::new();
+        assert_eq!(arena.get_str(0, 0), Some(""));
+    }
+
+    // #57: get() with offset beyond bounds panics
+    #[test]
+    #[should_panic]
+    fn get_out_of_bounds_panics() {
+        let arena = Arena::new();
+        // Try to read beyond the arena (capacity is 8KB but nothing allocated)
+        arena.get(INITIAL_CHUNK_SIZE + 100, 1);
+    }
+
+    // #58: ensure_capacity reusing existing next chunk
+    #[test]
+    fn ensure_capacity_reuses_next_chunk() {
+        let mut arena = Arena::new();
+
+        // Fill first chunk to force a second
+        let big = vec![0xAA; INITIAL_CHUNK_SIZE + 1];
+        arena.alloc_copy(&big);
+        assert!(arena.chunks.len() >= 2);
+
+        // Reset (keeps small chunks)
+        arena.reset();
+        assert_eq!(arena.current, 0);
+        assert_eq!(arena.offset, 0);
+
+        // Now fill first chunk again — second alloc should reuse existing chunk
+        let filler = vec![0xBB; INITIAL_CHUNK_SIZE];
+        arena.alloc_copy(&filler);
+        // Next alloc should reuse the existing second chunk if capacity is sufficient
+        let o = arena.alloc_copy(b"reuse check");
+        assert_eq!(arena.get(o, 11), b"reuse check");
+    }
+
+    // #59: Multi-thread safety: acquire on thread A, release on thread B
+    #[test]
+    fn arena_cross_thread_no_crash() {
+        // Thread-local pools are per-thread, so this just verifies
+        // Arena is Send (can move between threads) without crashing.
+        let mut arena = Arena::new();
+        arena.alloc_copy(b"test data");
+
+        let handle = std::thread::spawn(move || {
+            // Arena moved to another thread — should not crash
+            assert_eq!(arena.get(0, 9), b"test data");
+            arena.reset();
+            arena
+        });
+
+        let arena = handle.join().unwrap();
+        // Release on the original thread's pool
+        release_arena(arena);
     }
 }

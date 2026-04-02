@@ -28,7 +28,7 @@ pub fn md5_password(user: &str, password: &str, salt: &[u8; 4]) -> [u8; 36] {
 
     // Step 2: md5(hex_inner + salt)
     let mut hasher = Md5::new();
-    hasher.update(&inner);
+    hasher.update(inner);
     hasher.update(salt);
     let outer = hex_encode_fixed(&hasher.finalize());
 
@@ -203,7 +203,9 @@ impl ScramClient {
         // Expected = HMAC(ServerKey, AuthMessage)
         let expected = hmac_sha256(&server_key, self.auth_message.as_bytes())?;
 
-        if server_sig.len() != expected.len() || !constant_time_eq(&server_sig, &expected) {
+
+        // handles mismatched lengths without leaking timing information.
+        if !constant_time_eq(&server_sig, &expected) {
             return Err(DriverError::Auth("server signature mismatch".into()));
         }
 
@@ -233,14 +235,20 @@ fn generate_nonce() -> Result<String, DriverError> {
 /// Constant-time comparison to prevent timing attacks on auth signatures.
 /// `#[inline(never)]` prevents the compiler from optimizing the XOR loop
 /// into an early-exit comparison.
+///
+/// For SCRAM verification, both inputs should always be 32 bytes
+/// (SHA-256 output). We still handle the general case by processing up to
+/// the longer length, avoiding an early return that leaks length information.
 #[inline(never)]
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
+    let max_len = a.len().max(b.len());
+    let mut diff: u32 = 0;
+    // Length mismatch is itself a diff — use u32 to avoid truncation for lengths > 255
+    diff |= (a.len() ^ b.len()) as u32;
+    for i in 0..max_len {
+        let x = if i < a.len() { a[i] } else { 0 };
+        let y = if i < b.len() { b[i] } else { 0 };
+        diff |= (x ^ y) as u32;
     }
     diff == 0
 }
@@ -383,5 +391,139 @@ mod tests {
         let _first = client.client_first_message();
         let result = client.process_server_first(b"r=wrongnonce,s=c2FsdA==,i=4096");
         assert!(result.is_err());
+    }
+
+    /// constant_time_eq with different lengths does not leak via early return.
+    #[test]
+    fn constant_time_eq_different_lengths() {
+        // Should return false without leaking length information
+        assert!(!constant_time_eq(b"ab", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(!constant_time_eq(b"", b"a"));
+        assert!(!constant_time_eq(b"a", b""));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    /// 32-byte SHA-256 outputs should compare correctly.
+    #[test]
+    fn constant_time_eq_sha256_length() {
+        let a = [0xAAu8; 32];
+        let b = [0xAAu8; 32];
+        let c = [0xBBu8; 32];
+        assert!(constant_time_eq(&a, &b));
+        assert!(!constant_time_eq(&a, &c));
+    }
+
+    // --- Audit gap tests ---
+
+    // #47: SCRAM missing salt in server_first
+    #[test]
+    fn scram_missing_salt_error() {
+        let mut client = ScramClient::new("user", "pass").unwrap();
+        let _first = client.client_first_message();
+        let server_nonce = format!("{}serverpart", client.nonce);
+        let server_first = format!("r={server_nonce},i=4096"); // missing s=
+        let result = client.process_server_first(server_first.as_bytes());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("salt"), "should mention salt: {err}");
+    }
+
+    // #48: SCRAM missing iteration count
+    #[test]
+    fn scram_missing_iterations_error() {
+        let mut client = ScramClient::new("user", "pass").unwrap();
+        let _first = client.client_first_message();
+        let server_nonce = format!("{}serverpart", client.nonce);
+        let salt = B64.encode(b"salt1234");
+        let server_first = format!("r={server_nonce},s={salt}"); // missing i=
+        let result = client.process_server_first(server_first.as_bytes());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("iterations"), "should mention iterations: {err}");
+    }
+
+    // #49: SCRAM non-numeric iteration count
+    #[test]
+    fn scram_non_numeric_iterations_error() {
+        let mut client = ScramClient::new("user", "pass").unwrap();
+        let _first = client.client_first_message();
+        let server_nonce = format!("{}serverpart", client.nonce);
+        let salt = B64.encode(b"salt1234");
+        let server_first = format!("r={server_nonce},s={salt},i=notanumber");
+        let result = client.process_server_first(server_first.as_bytes());
+        assert!(result.is_err());
+    }
+
+    // #50: SCRAM invalid base64 salt
+    #[test]
+    fn scram_invalid_base64_salt_error() {
+        let mut client = ScramClient::new("user", "pass").unwrap();
+        let _first = client.client_first_message();
+        let server_nonce = format!("{}serverpart", client.nonce);
+        let server_first = format!("r={server_nonce},s=!@#$not_base64,i=4096");
+        let result = client.process_server_first(server_first.as_bytes());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("base64") || err.contains("salt"), "should mention base64 or salt: {err}");
+    }
+
+    // #51: SCRAM verify_server_final signature mismatch
+    #[test]
+    fn scram_verify_server_final_mismatch() {
+        let mut client = ScramClient::new("user", "pencil").unwrap();
+        let _first = client.client_first_message();
+        let server_nonce = format!("{}serverpart", client.nonce);
+        let salt = B64.encode(b"salt1234salt5678");
+        let server_first = format!("r={server_nonce},s={salt},i=4096");
+        client.process_server_first(server_first.as_bytes()).unwrap();
+        let _final_msg = client.client_final_message().unwrap();
+
+        // Provide a wrong server signature
+        let wrong_sig = B64.encode(b"wrongwrongwrongwrongwrongwrongww"); // 32 bytes
+        let server_final = format!("v={wrong_sig}");
+        let result = client.verify_server_final(server_final.as_bytes());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("mismatch"), "should mention mismatch: {err}");
+    }
+
+    // #52: SCRAM verify_server_final missing v= prefix
+    #[test]
+    fn scram_verify_server_final_missing_prefix() {
+        let mut client = ScramClient::new("user", "pencil").unwrap();
+        let _first = client.client_first_message();
+        let server_nonce = format!("{}serverpart", client.nonce);
+        let salt = B64.encode(b"salt1234salt5678");
+        let server_first = format!("r={server_nonce},s={salt},i=4096");
+        client.process_server_first(server_first.as_bytes()).unwrap();
+
+        let result = client.verify_server_final(b"no_v_prefix_here");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("v="), "should mention missing v= prefix: {err}");
+    }
+
+    // #53: constant_time_eq with empty inputs
+    #[test]
+    fn constant_time_eq_both_empty_true() {
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    // #54: constant_time_eq with different lengths
+    #[test]
+    fn constant_time_eq_diff_lengths_false() {
+        assert!(!constant_time_eq(b"a", b"ab"));
+        assert!(!constant_time_eq(b"ab", b"a"));
+        assert!(!constant_time_eq(b"", b"x"));
+    }
+
+    // #55: parse_sasl_mechanisms with only unsupported mechanisms
+    #[test]
+    fn parse_sasl_mechanisms_unsupported_only() {
+        let data = b"SCRAM-SHA-512\0SCRAM-SHA-256-PLUS\0\0";
+        let mechs = parse_sasl_mechanisms(data);
+        assert_eq!(mechs.len(), 2);
+        assert!(!mechs.contains(&"SCRAM-SHA-256"));
     }
 }

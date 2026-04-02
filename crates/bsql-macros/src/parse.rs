@@ -91,6 +91,10 @@ pub fn parse_query(sql: &str) -> Result<ParsedQuery, String> {
     let comment_stripped = strip_comments(sql);
     let (positional_sql, params, optional_clauses, sort_placeholder) =
         extract_params(&comment_stripped)?;
+
+    // Reject unquoted semicolons — multiple statements are not allowed.
+    check_no_unquoted_semicolons(&positional_sql)?;
+
     let normalized_sql = normalize_sql(&positional_sql);
     let kind = detect_query_kind(&normalized_sql)?;
 
@@ -130,17 +134,14 @@ pub fn parse_query(sql: &str) -> Result<ParsedQuery, String> {
 /// Uses `char_indices()` for iteration so multi-byte UTF-8 inside string
 /// literals is preserved verbatim (we slice the original `&str` by byte
 /// offset, never interpreting individual bytes as chars).
-fn extract_params(
-    sql: &str,
-) -> Result<
-    (
-        String,
-        SmallVec<[Param; 4]>,
-        SmallVec<[OptionalClause; 4]>,
-        Option<SortPlaceholder>,
-    ),
+type ExtractResult = (
     String,
-> {
+    SmallVec<[Param; 4]>,
+    SmallVec<[OptionalClause; 4]>,
+    Option<SortPlaceholder>,
+);
+
+fn extract_params(sql: &str) -> Result<ExtractResult, String> {
     let mut out = String::with_capacity(sql.len());
     let mut params: SmallVec<[Param; 4]> = SmallVec::new();
     let mut optional_clauses: SmallVec<[OptionalClause; 4]> = SmallVec::new();
@@ -232,7 +233,7 @@ fn extract_params(
         if b == b'$' && i + 1 < len && bytes[i + 1].is_ascii_alphabetic() {
             let (param, end) = parse_one_param(sql, i)?;
 
-            // FIX 7: allow duplicate parameter names if types match
+
             if let Some(existing) = params.iter().find(|p| p.name == param.name) {
                 if existing.rust_type != param.rust_type {
                     return Err(format!(
@@ -256,7 +257,7 @@ fn extract_params(
             continue;
         }
 
-        // FIX 3: reject manual positional parameters ($1, $2, ...)
+
         if b == b'$' && i + 1 < len && bytes[i + 1].is_ascii_digit() {
             return Err(
                 "manual positional parameters ($1, $2, ...) are not allowed \
@@ -265,15 +266,16 @@ fn extract_params(
             );
         }
 
-        // Outside of string literals, SQL is ASCII. Copy one byte.
-        out.push(b as char);
-        i += 1;
+        // Advance by the full UTF-8 character width to preserve multi-byte sequences.
+        let ch = sql[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
     }
 
-    if optional_clauses.len() > 8 {
+    if optional_clauses.len() > 10 {
         return Err(format!(
-            "query has {} optional clauses ({} variants) — maximum is 8 (256 variants). \
-             Split the query into smaller queries with fewer optional filters.",
+            "too many optional clauses ({}, producing {} variants) — maximum is 10 \
+             (1024 variants). Consider splitting into multiple queries.",
             optional_clauses.len(),
             1u32 << optional_clauses.len()
         ));
@@ -513,8 +515,10 @@ fn parse_optional_clause(
             );
         }
 
-        clause_sql.push(b as char);
-        i += 1;
+        // Advance by the full UTF-8 character width to preserve multi-byte sequences.
+        let ch = sql[i..].chars().next().unwrap();
+        clause_sql.push(ch);
+        i += ch.len_utf8();
     }
 
     Err("unclosed optional clause — missing `]`".into())
@@ -686,11 +690,23 @@ fn strip_comments(sql: &str) -> String {
 }
 
 /// Skip a single-quoted string literal starting at `start` (the `'` byte).
-/// Handles `''` escaped quotes. Returns the byte position after the closing `'`.
+/// Handles `''` escaped quotes and E-string (backslash-escape) rules.
+///
+/// When the character before the opening `'` is `E` or `e`, PostgreSQL uses
+/// C-style backslash escapes: `\'` is an escaped quote (not end of string),
+/// `\\` is an escaped backslash.
 fn skip_string_literal(bytes: &[u8], start: usize) -> usize {
     let len = bytes.len();
+    // Detect E-string prefix: E'...' uses backslash escape rules
+    let is_e_string = start > 0 && matches!(bytes[start - 1], b'E' | b'e');
+
     let mut i = start + 1;
     while i < len {
+        if is_e_string && bytes[i] == b'\\' {
+            // Backslash escape: skip the next byte regardless of what it is
+            i += 2;
+            continue;
+        }
         if bytes[i] == b'\'' {
             i += 1;
             // Escaped quote '' — continue the literal
@@ -736,6 +752,46 @@ fn skip_dollar_quote(bytes: &[u8], start: usize) -> Option<usize> {
     }
 
     None
+}
+
+/// Scan for unquoted semicolons in the SQL. Multiple statements are not allowed.
+///
+/// Skips single-quoted string literals and dollar-quoted strings so that
+/// semicolons inside those contexts are not rejected.
+fn check_no_unquoted_semicolons(sql: &str) -> Result<(), String> {
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        match bytes[i] {
+            // Skip string literals
+            b'\'' => {
+                i = skip_string_literal(bytes, i);
+            }
+            // Skip dollar-quoted strings
+            b'$' => {
+                if let Some(end) = skip_dollar_quote(bytes, i) {
+                    i = end;
+                } else {
+                    i += 1;
+                }
+            }
+            // Reject unquoted semicolons
+            b';' => {
+                return Err(
+                    "multiple statements not allowed — use separate query! calls. \
+                     Semicolons are not permitted in bsql queries."
+                        .into(),
+                );
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Safety gate: UPDATE/DELETE without WHERE is almost always a mistake.
@@ -1012,7 +1068,6 @@ mod tests {
         assert!(parse_query("ALTER TABLE t ADD COLUMN x int").is_err());
     }
 
-    // --- FIX 1: UTF-8 preservation ---
 
     #[test]
     fn utf8_cyrillic_in_string_literal() {
@@ -1055,7 +1110,6 @@ mod tests {
         );
     }
 
-    // --- FIX 3: reject manual positional parameters ---
 
     #[test]
     fn reject_manual_positional_param() {
@@ -1079,7 +1133,6 @@ mod tests {
         );
     }
 
-    // --- FIX 7: duplicate parameter names ---
 
     #[test]
     fn duplicate_param_same_type_reuses_position() {
@@ -1412,8 +1465,8 @@ mod tests {
 
     #[test]
     fn too_many_optional_clauses_rejected() {
-        // 9 optional clauses should be rejected (max 8)
-        let clauses: Vec<String> = (0..9)
+        // 11 optional clauses should be rejected (max 10)
+        let clauses: Vec<String> = (0..11)
             .map(|i| format!("[AND c{i} = $c{i}: Option<i32>]"))
             .collect();
         let sql = format!("SELECT id FROM t WHERE 1 = 1 {}", clauses.join(" "));
@@ -1421,7 +1474,7 @@ mod tests {
         assert!(r.is_err());
         let err = r.unwrap_err();
         assert!(
-            err.contains("9 optional clauses") && err.contains("maximum is 8"),
+            err.contains("11") && err.contains("maximum is 10"),
             "should mention limit: {err}"
         );
     }
@@ -1716,5 +1769,174 @@ mod tests {
             err.contains("DELETE without WHERE"),
             "CTE DELETE without WHERE should be rejected: {err}"
         );
+    }
+
+
+    #[test]
+    fn e_string_backslash_escape_handled() {
+        // E'hello \'world\'' — the \' is an escaped quote, not end of string
+        let r = parse_query(r"SELECT * FROM t WHERE name = E'hello \'world\'' AND id = $id: i32");
+        assert!(r.is_ok(), "E-string should be parsed: {:?}", r.err());
+        let parsed = r.unwrap();
+        assert_eq!(parsed.params.len(), 1);
+        assert_eq!(parsed.params[0].name, "id");
+    }
+
+    #[test]
+    fn e_string_backslash_backslash_handled() {
+        // E'path\\to\\file' — \\ is escaped backslash
+        let r = parse_query(r"SELECT * FROM t WHERE path = E'C:\\data\\file' AND id = $id: i32");
+        assert!(r.is_ok(), "E-string backslash should work: {:?}", r.err());
+        let parsed = r.unwrap();
+        assert_eq!(parsed.params.len(), 1);
+    }
+
+    #[test]
+    fn e_string_param_inside_not_extracted() {
+        // $name inside E-string should not be treated as a parameter
+        let r = parse_query(r"SELECT * FROM t WHERE note = E'costs $100' AND id = $id: i32");
+        // $100 would look like $1 + 00, but it's inside E-string so should be ignored
+        assert!(r.is_ok(), "param inside E-string should be ignored: {:?}", r.err());
+    }
+
+
+    #[test]
+    fn semicolon_rejected() {
+        let r = parse_query("SELECT 1; SELECT 2");
+        assert!(r.is_err());
+        let err = r.unwrap_err();
+        assert!(
+            err.contains("multiple statements") || err.contains("Semicolons"),
+            "should reject semicolons: {err}"
+        );
+    }
+
+    #[test]
+    fn semicolon_in_string_literal_allowed() {
+        let r = parse_query("SELECT * FROM t WHERE name = 'hello; world' AND id = $id: i32");
+        assert!(r.is_ok(), "semicolons inside string literals should be allowed");
+    }
+
+    #[test]
+    fn semicolon_in_dollar_quote_allowed() {
+        let r = parse_query("SELECT $$code; here$$ AS code");
+        assert!(r.is_ok(), "semicolons inside dollar quotes should be allowed");
+    }
+
+    #[test]
+    fn trailing_semicolon_rejected() {
+        let r = parse_query("SELECT 1;");
+        assert!(r.is_err());
+        let err = r.unwrap_err();
+        assert!(
+            err.contains("multiple statements") || err.contains("Semicolons"),
+            "trailing semicolons should be rejected: {err}"
+        );
+    }
+
+    // --- 10 optional clauses now accepted (limit raised from 8 to 10) ---
+
+    #[test]
+    fn ten_optional_clauses_accepted() {
+        let clauses: Vec<String> = (0..10)
+            .map(|i| format!("[AND c{i} = $c{i}: Option<i32>]"))
+            .collect();
+        let sql = format!("SELECT id FROM t WHERE 1 = 1 {}", clauses.join(" "));
+        let r = parse_query(&sql).unwrap();
+        assert_eq!(r.optional_clauses.len(), 10);
+    }
+
+    // --- Audit gap tests ---
+
+    // #101: E-string: E'it\\'s here' correctly skipped
+    #[test]
+    fn e_string_with_escaped_quote() {
+        let r = parse_query("SELECT * FROM t WHERE name = E'it\\'s here' AND id = $id: i32").unwrap();
+        assert_eq!(r.params.len(), 1, "E-string backslash-escaped quote should not end string");
+        assert_eq!(r.params[0].name, "id");
+    }
+
+    // #101 extra: E-string with backslash-backslash
+    #[test]
+    fn e_string_with_double_backslash() {
+        let r = parse_query("SELECT * FROM t WHERE path = E'C:\\\\data' AND id = $id: i32").unwrap();
+        assert_eq!(r.params.len(), 1);
+    }
+
+    // #102: Semicolon inside string literal not rejected
+    #[test]
+    fn semicolon_in_string_literal_not_rejected() {
+        let r = parse_query("SELECT * FROM t WHERE s = 'hello;world' AND id = $id: i32");
+        assert!(r.is_ok(), "semicolon inside string literal should be allowed");
+        let parsed = r.unwrap();
+        assert_eq!(parsed.params.len(), 1);
+    }
+
+    // #103: Unquoted semicolon rejected
+    #[test]
+    fn unquoted_semicolon_rejected() {
+        let r = parse_query("SELECT 1; DROP TABLE t");
+        assert!(r.is_err());
+        let err = r.unwrap_err();
+        assert!(err.contains("multiple statements") || err.contains("Semicolons"), "should reject semicolons: {err}");
+    }
+
+    // #104: Dollar-quoted string with $param inside: $id NOT extracted
+    #[test]
+    fn dollar_quoted_param_not_extracted() {
+        let r = parse_query("SELECT $$SELECT $id$$").unwrap();
+        assert_eq!(r.params.len(), 0, "$id inside $$ should not be extracted as param");
+    }
+
+    // #105: Comment with $param: $id NOT extracted
+    #[test]
+    fn comment_param_not_extracted() {
+        let r = parse_query("-- $id: i32\nSELECT 1").unwrap();
+        assert_eq!(r.params.len(), 0, "$id in comment should not be extracted");
+    }
+
+    // #105 extra: Block comment with $param not extracted
+    #[test]
+    fn block_comment_param_not_extracted() {
+        let r = parse_query("/* $id: i32 */ SELECT 1").unwrap();
+        assert_eq!(r.params.len(), 0, "$id in block comment should not be extracted");
+    }
+
+    // Dollar-quoted string with tag: $func$...$func$
+    #[test]
+    fn dollar_quoted_with_tag_param_not_extracted() {
+        let r = parse_query("SELECT $fn$body with $param: i32$fn$").unwrap();
+        assert_eq!(r.params.len(), 0, "$param inside tagged dollar quote should not be extracted");
+    }
+
+    // Standard escaped quote '' in string literal
+    #[test]
+    fn standard_escaped_quote_in_string() {
+        let r = parse_query("SELECT * FROM t WHERE name = 'it''s fine' AND id = $id: i32").unwrap();
+        assert_eq!(r.params.len(), 1);
+        assert_eq!(r.params[0].name, "id");
+    }
+
+    // Sort placeholder parse
+    #[test]
+    fn sort_placeholder_parsed() {
+        let r = parse_query("SELECT id FROM t ORDER BY $[sort: TicketSort]").unwrap();
+        assert!(r.sort_placeholder.is_some());
+        assert_eq!(r.sort_placeholder.unwrap().enum_name, "TicketSort");
+    }
+
+    // Only one sort placeholder allowed
+    #[test]
+    fn multiple_sort_placeholders_rejected() {
+        let r = parse_query("SELECT id FROM t ORDER BY $[sort: A], $[sort: B]");
+        assert!(r.is_err());
+    }
+
+    // Option type in optional clause
+    #[test]
+    fn optional_clause_with_option_type() {
+        let r = parse_query("SELECT id FROM t WHERE 1=1 [AND name = $name: Option<&str>]").unwrap();
+        assert_eq!(r.optional_clauses.len(), 1);
+        assert_eq!(r.optional_clauses[0].params.len(), 1);
     }
 }

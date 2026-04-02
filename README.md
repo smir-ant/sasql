@@ -31,7 +31,7 @@ What bsql does differently:
 - **Inline SQL** — the query is where it's used. No jumping between files. Code review sees SQL and Rust in the same diff.
 - **No unchecked path** — not "be disciplined and use the safe function". There is only one function. It is safe.
 - **Dynamic queries** — optional clauses `[AND col = $param]` expand to every combination at compile time. Each combination is validated. No string concatenation.
-- **Built for performance** — optimized connection pooling, prepared statement caching, fail-fast error handling. Architecture designed for arena allocation, binary protocol, and SIMD (planned).
+- **Built for performance** — optimized connection pooling, prepared statement caching, fail-fast error handling. Arena allocation, binary protocol, and SIMD UTF-8 validation.
 
 ## What Gets Checked at Compile Time
 
@@ -41,8 +41,8 @@ What bsql does differently:
 | Column doesn't exist | `column "naem" not found in table "users"` |
 | Wrong parameter type | `expected i32, found &str for column "users.id"` |
 | Nullable column | Automatically becomes `Option<T>` — you can't forget to handle NULL |
-| `UPDATE` without `WHERE` | Compile warning — flags accidental full-table updates (planned) |
-| `DELETE` without `WHERE` | Compile warning — same protection (planned) |
+| `UPDATE` without `WHERE` | Compile error — flags accidental full-table updates |
+| `DELETE` without `WHERE` | Compile error — same protection |
 | SQL syntax error | PostgreSQL's own error message, at compile time |
 | Typo in table/column name | Levenshtein-based "did you mean?" suggestions at compile time |
 
@@ -51,7 +51,7 @@ What bsql does differently:
 `Cargo.toml`:
 ```toml
 [dependencies]
-bsql = { version = "0.12", features = ["time", "uuid"] }
+bsql = { version = "0.13", features = ["time", "uuid"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -83,7 +83,7 @@ async fn main() -> Result<(), bsql::BsqlError> {
 Out of the box, bsql works with basic types: integers, floats, booleans, strings, byte arrays. This is enough for most queries. For specialized PostgreSQL types like timestamps or UUIDs, enable the corresponding feature:
 
 ```toml
-bsql = { version = "0.12", features = ["time", "uuid", "decimal"] }
+bsql = { version = "0.13", features = ["time", "uuid", "decimal"] }
 ```
 
 | Feature | PostgreSQL types | Rust types |
@@ -100,7 +100,7 @@ If your query touches a column that needs a feature you haven't enabled, you get
 Enable the `explain` feature to see the query plan at compile time:
 
 ```toml
-bsql = { version = "0.12", features = ["explain"] }
+bsql = { version = "0.13", features = ["explain"] }
 ```
 
 When enabled, bsql runs `EXPLAIN` on every query during compilation and embeds the plan as a doc comment on the generated result struct. Hover over any query result type in your IDE to see the plan — no round-trip to `psql` needed.
@@ -149,22 +149,6 @@ Type-safe PG enum mapping. Only accepts the specific PostgreSQL enum type it was
 **Server-side dynamic SQL.** `DO $$ BEGIN EXECUTE format(...); END $$` — PostgreSQL validates the outer `DO` block at `PREPARE` time but does not validate the dynamically constructed SQL inside `EXECUTE format(...)`. It runs only at execution time.
 
 Migrations, admin panels, and multi-tenant dynamic tables are infrastructure — they don't belong in application business logic. bsql secures the 95% that does. For the remaining 5%, use `tokio-postgres` alongside bsql — two tools, each for its purpose.
-
-## Roadmap
-
-| Version | Status | What |
-|---------|--------|------|
-| v0.1 | Released | `query!` macro, compile-time validation, base types, pool |
-| v0.2 | Released | `time`, `uuid`, `decimal`, `chrono`, PG enums, CI on PG 15-18 |
-| v0.3 | Released | Dynamic queries: `[optional clauses]`, sort enums |
-| v0.4 | Released | Offline mode: bitcode cache, auto-populated during build |
-| v0.5 | Released | Transactions: `begin()`, `commit()`, `rollback()`, auto-rollback on drop |
-| v0.6 | Released | Streaming results, LISTEN/NOTIFY |
-| v0.7 | Released | Singleflight request coalescing, read/write splitting, EXPLAIN at compile time |
-| v0.8 | Released | TLS support, SmallVec optimizations |
-| v0.9 | Released | Connection warmup, safety gates (UPDATE/DELETE without WHERE) |
-| v0.10 | Released | Custom PG wire protocol driver (bsql-driver): binary protocol, arena allocation, zero-copy decoding, built-in pool, pipelining |
-| v0.11 | **Current** | Warmup prepare-only, sort+optional clause guard, Levenshtein suggestions, audit fixes |
 
 ## About the Development Process
 

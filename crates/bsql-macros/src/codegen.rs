@@ -132,35 +132,97 @@ pub fn generate_sort_query_code(
     let sql_template = &parsed.positional_sql;
     let has_columns = !validation.columns.is_empty();
 
+    // Split the SQL template at {SORT} to enable zero-allocation concatenation.
+    // The sort fragment is spliced between prefix and suffix, and the result is
+    // cached in a static map keyed by the &'static str fragment pointer.
+    let sort_parts: Vec<&str> = sql_template.split("{SORT}").collect();
+    let sql_prefix = sort_parts[0];
+    let sql_suffix = if sort_parts.len() > 1 { sort_parts[1] } else { "" };
+
+    // Pre-compute the prefix/suffix for the LIMIT 2 variant
+    let needs_limit = has_columns
+        && is_select
+        && !parsed.normalized_sql.contains(" limit ")
+        && !parsed.normalized_sql.contains(" for ");
+
+    let limited_suffix = if needs_limit {
+        format!("{sql_suffix} LIMIT 2")
+    } else {
+        sql_suffix.to_owned()
+    };
+    let limited_suffix_lit = &limited_suffix;
+
+    // Generate the sort SQL lookup helper that caches (String, u64) per sort fragment.
+    // Uses a static mutex-free DashMap-like approach: since sort enums have a small
+    // finite number of variants and sort.sql() returns &'static str, we cache using
+    // the pointer value as key. First call per variant allocates once; all subsequent
+    // calls return (&str, u64) with zero allocation.
+    let build_sql = quote! {
+        // Cache: maps sort fragment &'static str pointer -> (full SQL, hash)
+        static SORT_SQL_CACHE: ::std::sync::OnceLock<::std::sync::Mutex<Vec<(usize, String, u64)>>> = ::std::sync::OnceLock::new();
+        let sort_fragment: &'static str = self.sort.sql();
+        let cache = SORT_SQL_CACHE.get_or_init(|| ::std::sync::Mutex::new(Vec::new()));
+        let key = sort_fragment.as_ptr() as usize;
+        let (sql, sql_hash) = {
+            let guard = cache.lock().unwrap();
+            if let Some(entry) = guard.iter().find(|e| e.0 == key) {
+                (entry.1.as_str() as *const str, entry.2)
+            } else {
+                drop(guard);
+                let built = format!("{}{}{}", #sql_prefix, sort_fragment, #sql_suffix);
+                let hash = ::bsql_core::driver::hash_sql(&built);
+                let mut guard = cache.lock().unwrap();
+                // Double-check after re-acquiring lock
+                if let Some(entry) = guard.iter().find(|e| e.0 == key) {
+                    (entry.1.as_str() as *const str, entry.2)
+                } else {
+                    guard.push((key, built, hash));
+                    let entry = guard.last().unwrap();
+                    (entry.1.as_str() as *const str, entry.2)
+                }
+            }
+        };
+        // SAFETY: the str is stored in the static Vec and never removed/moved because
+        // Vec only appends and lives for 'static. The pointer remains valid.
+        let sql: &str = unsafe { &*sql };
+    };
+
+    let build_limited_sql = if needs_limit {
+        quote! {
+            static SORT_LIMITED_SQL_CACHE: ::std::sync::OnceLock<::std::sync::Mutex<Vec<(usize, String, u64)>>> = ::std::sync::OnceLock::new();
+            let sort_fragment: &'static str = self.sort.sql();
+            let cache = SORT_LIMITED_SQL_CACHE.get_or_init(|| ::std::sync::Mutex::new(Vec::new()));
+            let key = sort_fragment.as_ptr() as usize;
+            let (sql, sql_hash) = {
+                let guard = cache.lock().unwrap();
+                if let Some(entry) = guard.iter().find(|e| e.0 == key) {
+                    (entry.1.as_str() as *const str, entry.2)
+                } else {
+                    drop(guard);
+                    let built = format!("{}{}{}", #sql_prefix, sort_fragment, #limited_suffix_lit);
+                    let hash = ::bsql_core::driver::hash_sql(&built);
+                    let mut guard = cache.lock().unwrap();
+                    if let Some(entry) = guard.iter().find(|e| e.0 == key) {
+                        (entry.1.as_str() as *const str, entry.2)
+                    } else {
+                        guard.push((key, built, hash));
+                        let entry = guard.last().unwrap();
+                        (entry.1.as_str() as *const str, entry.2)
+                    }
+                }
+            };
+            let sql: &str = unsafe { &*sql };
+        }
+    } else {
+        build_sql.clone()
+    };
+
     let fetch_methods = if has_columns {
         let result_name = result_struct_name(parsed);
         let stream_name = stream_struct_name(parsed);
         let row_decode = gen_row_decode(validation);
 
-        let needs_limit = has_columns
-            && is_select
-            && !parsed.normalized_sql.contains(" limit ")
-            && !parsed.normalized_sql.contains(" for ");
-
         let qm = &query_method;
-
-        // For sort queries, build SQL at runtime from the template + sort.sql()
-        let build_sql = quote! {
-            let sort_fragment = self.sort.sql();
-            let sql = #sql_template.replace("{SORT}", sort_fragment);
-            let sql_hash = ::bsql_core::driver::hash_sql(&sql);
-        };
-
-        let build_limited_sql = if needs_limit {
-            quote! {
-                let sort_fragment = self.sort.sql();
-                let base = #sql_template.replace("{SORT}", sort_fragment);
-                let sql = format!("{} LIMIT 2", base);
-                let sql_hash = ::bsql_core::driver::hash_sql(&sql);
-            }
-        } else {
-            build_sql.clone()
-        };
 
         quote! {
             #[allow(non_camel_case_types)]
@@ -195,7 +257,7 @@ pub fn generate_sort_query_code(
                     executor: &E,
                 ) -> ::bsql_core::BsqlResult<#result_name> {
                     #build_limited_sql
-                    let owned = executor.#qm(&sql, sql_hash, #params_slice).await?;
+                    let owned = executor.#qm(sql, sql_hash, #params_slice).await?;
                     if owned.len() != 1 {
                         return Err(::bsql_core::error::QueryError::row_count(
                             "exactly 1 row",
@@ -211,7 +273,7 @@ pub fn generate_sort_query_code(
                     executor: &E,
                 ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
                     #build_sql
-                    let owned = executor.#qm(&sql, sql_hash, #params_slice).await?;
+                    let owned = executor.#qm(sql, sql_hash, #params_slice).await?;
                     owned.iter().map(|row| Ok(#result_name { #row_decode })).collect::<::bsql_core::BsqlResult<Vec<_>>>()
                 }
 
@@ -220,7 +282,7 @@ pub fn generate_sort_query_code(
                     executor: &E,
                 ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
                     #build_limited_sql
-                    let owned = executor.#qm(&sql, sql_hash, #params_slice).await?;
+                    let owned = executor.#qm(sql, sql_hash, #params_slice).await?;
                     match owned.len() {
                         0 => Ok(None),
                         1 => {
@@ -239,7 +301,7 @@ pub fn generate_sort_query_code(
                     pool: &::bsql_core::Pool,
                 ) -> ::bsql_core::BsqlResult<#stream_name> {
                     #build_sql
-                    let inner = pool.query_stream(&sql, sql_hash, #params_slice).await?;
+                    let inner = pool.query_stream(sql, sql_hash, #params_slice).await?;
                     Ok(#stream_name { inner })
                 }
 
@@ -248,18 +310,12 @@ pub fn generate_sort_query_code(
                     executor: &E,
                 ) -> ::bsql_core::BsqlResult<u64> {
                     #build_sql
-                    executor.execute_raw(&sql, sql_hash, #params_slice).await
+                    executor.execute_raw(sql, sql_hash, #params_slice).await
                 }
             }
         }
     } else {
         // Execute-only (no result columns)
-        let build_sql = quote! {
-            let sort_fragment = self.sort.sql();
-            let sql = #sql_template.replace("{SORT}", sort_fragment);
-            let sql_hash = ::bsql_core::driver::hash_sql(&sql);
-        };
-
         quote! {
             #[allow(non_camel_case_types)]
             impl<'_bsql> #executor_name<'_bsql> {
@@ -268,7 +324,7 @@ pub fn generate_sort_query_code(
                     executor: &E,
                 ) -> ::bsql_core::BsqlResult<u64> {
                     #build_sql
-                    executor.execute_raw(&sql, sql_hash, #params_slice).await
+                    executor.execute_raw(sql, sql_hash, #params_slice).await
                 }
             }
         }
@@ -866,20 +922,65 @@ fn gen_column_decode(idx: usize, rust_type: &str) -> TokenStream {
     }
 }
 
+/// Generate a decode error for a NOT NULL column that received NULL/invalid data.
+///
+/// Uses `DecodeError::with_source` since `DecodeError`'s `source` field is
+/// `pub(crate)` and cannot be set from user code via struct literal.
+fn gen_not_null_decode_error(col_idx: &str, type_name: &str) -> TokenStream {
+    quote! {
+        ::bsql_core::error::DecodeError::with_source(
+            #col_idx,
+            #type_name,
+            "NULL or invalid data",
+            ::std::io::Error::new(::std::io::ErrorKind::InvalidData, concat!("expected NOT NULL ", #type_name)),
+        )
+    }
+}
+
 /// Generate decode for a NOT NULL column.
+///
+/// Uses `.ok_or_else(|| ...)` instead of `.unwrap_or_default()` so that
+/// corrupt/invalid data is propagated as an error rather than silently
+/// returning zero/false/"".
 fn gen_not_null_decode(idx: usize, rust_type: &str) -> TokenStream {
+    let col_idx = idx.to_string();
     match rust_type {
-        "bool" => quote! { row.get_bool(#idx).unwrap_or_default() },
-        "i16" => quote! { row.get_i16(#idx).unwrap_or_default() },
-        "i32" => quote! { row.get_i32(#idx).unwrap_or_default() },
-        "i64" => quote! { row.get_i64(#idx).unwrap_or_default() },
-        "f32" => quote! { row.get_f32(#idx).unwrap_or_default() },
-        "f64" => quote! { row.get_f64(#idx).unwrap_or_default() },
-        "String" => quote! { row.get_str(#idx).unwrap_or_default().to_owned() },
-        "Vec<u8>" => quote! { row.get_bytes(#idx).unwrap_or_default().to_vec() },
+        "bool" => {
+            let err = gen_not_null_decode_error(&col_idx, "bool");
+            quote! { row.get_bool(#idx).ok_or_else(|| #err)? }
+        }
+        "i16" => {
+            let err = gen_not_null_decode_error(&col_idx, "i16");
+            quote! { row.get_i16(#idx).ok_or_else(|| #err)? }
+        }
+        "i32" => {
+            let err = gen_not_null_decode_error(&col_idx, "i32");
+            quote! { row.get_i32(#idx).ok_or_else(|| #err)? }
+        }
+        "i64" => {
+            let err = gen_not_null_decode_error(&col_idx, "i64");
+            quote! { row.get_i64(#idx).ok_or_else(|| #err)? }
+        }
+        "f32" => {
+            let err = gen_not_null_decode_error(&col_idx, "f32");
+            quote! { row.get_f32(#idx).ok_or_else(|| #err)? }
+        }
+        "f64" => {
+            let err = gen_not_null_decode_error(&col_idx, "f64");
+            quote! { row.get_f64(#idx).ok_or_else(|| #err)? }
+        }
+        "String" => {
+            let err = gen_not_null_decode_error(&col_idx, "String");
+            quote! { row.get_str(#idx).ok_or_else(|| #err)?.to_owned() }
+        }
+        "Vec<u8>" => {
+            let err = gen_not_null_decode_error(&col_idx, "Vec<u8>");
+            quote! { row.get_bytes(#idx).ok_or_else(|| #err)?.to_vec() }
+        }
         "u32" => {
             // OID type: decode as i32 then cast
-            quote! { row.get_i32(#idx).unwrap_or_default() as u32 }
+            let err = gen_not_null_decode_error(&col_idx, "u32");
+            quote! { row.get_i32(#idx).ok_or_else(|| #err)? as u32 }
         }
         "()" => quote! { () },
         _ => gen_feature_gated_decode(idx, rust_type),
@@ -889,17 +990,19 @@ fn gen_not_null_decode(idx: usize, rust_type: &str) -> TokenStream {
 /// Wrap a fallible decode expression in a match that converts `Err(DriverError)`
 /// to `Err(BsqlError::Decode)` instead of panicking.
 ///
-/// Generates: `match <expr> { Ok(v) => v, Err(_) => return Err(BsqlError::Decode(...)) }`
+/// Uses `DecodeError::with_source` to construct the error, since `DecodeError`'s
+/// `source` field is `pub(crate)` and cannot be set from user code via struct literal.
 fn gen_decode_match(idx: usize, type_name: &str, decode_expr: TokenStream) -> TokenStream {
     let col_idx = idx.to_string();
     quote! {
         match #decode_expr {
             Ok(v) => v,
-            Err(_) => return Err(::bsql_core::BsqlError::Decode(::bsql_core::error::DecodeError {
-                column: ::std::borrow::Cow::Borrowed(#col_idx),
-                expected: #type_name,
-                actual: ::std::borrow::Cow::Borrowed("undecoded bytes"),
-            })),
+            Err(e) => return Err(::bsql_core::error::DecodeError::with_source(
+                #col_idx,
+                #type_name,
+                "invalid data",
+                e,
+            )),
         }
     }
 }
@@ -927,6 +1030,17 @@ fn gen_feature_gated_decode(idx: usize, rust_type: &str) -> TokenStream {
                 ::bsql_core::driver::decode_timestamptz_time(
                     row.get_raw(#idx).unwrap_or_default()
                 )
+            },
+        ),
+        // TIMESTAMP (without tz) -> PrimitiveDateTime: same binary format as timestamptz,
+        // strip the UTC offset to get date + time without timezone
+        "::time::PrimitiveDateTime" | "time::PrimitiveDateTime" => gen_decode_match(
+            idx,
+            "timestamp",
+            quote! {
+                ::bsql_core::driver::decode_timestamptz_time(
+                    row.get_raw(#idx).unwrap_or_default()
+                ).map(|odt| ::time::PrimitiveDateTime::new(odt.date(), odt.time()))
             },
         ),
         "::time::Date" | "time::Date" => gen_decode_match(
@@ -957,6 +1071,17 @@ fn gen_feature_gated_decode(idx: usize, rust_type: &str) -> TokenStream {
                 ::bsql_core::driver::decode_timestamptz_chrono(
                     row.get_raw(#idx).unwrap_or_default()
                 )
+            },
+        ),
+        // TIMESTAMP (without tz) -> NaiveDateTime: same binary format as timestamptz,
+        // strip the UTC offset via .naive_utc()
+        "::chrono::NaiveDateTime" | "chrono::NaiveDateTime" => gen_decode_match(
+            idx,
+            "timestamp",
+            quote! {
+                ::bsql_core::driver::decode_timestamptz_chrono(
+                    row.get_raw(#idx).unwrap_or_default()
+                ).map(|dt| dt.naive_utc())
             },
         ),
         "::chrono::NaiveDate" | "chrono::NaiveDate" => gen_decode_match(
@@ -1027,6 +1152,129 @@ fn gen_feature_gated_decode(idx: usize, rust_type: &str) -> TokenStream {
                 row.get_raw(#idx).unwrap_or_default()
             ).unwrap_or_default()
         },
+        // Feature-gated array types: decode each element using the scalar decode fn.
+        // For timestamp/date/time arrays, we reuse the existing scalar decode functions
+        // by converting each i64 element back to an 8-byte big-endian buffer.
+        "Vec<::time::OffsetDateTime>" | "Vec<time::OffsetDateTime>" => gen_decode_match(
+            idx,
+            "timestamptz[]",
+            quote! { {
+                let raw = row.get_raw(#idx).unwrap_or_default();
+                ::bsql_core::driver::decode_array_i64(raw).and_then(|micros_vec| {
+                    let mut out = Vec::with_capacity(micros_vec.len());
+                    for micros in micros_vec {
+                        let buf = micros.to_be_bytes();
+                        out.push(::bsql_core::driver::decode_timestamptz_time(&buf)?);
+                    }
+                    Ok(out)
+                })
+            } },
+        ),
+        "Vec<::time::PrimitiveDateTime>" | "Vec<time::PrimitiveDateTime>" => gen_decode_match(
+            idx,
+            "timestamp[]",
+            quote! { {
+                let raw = row.get_raw(#idx).unwrap_or_default();
+                ::bsql_core::driver::decode_array_i64(raw).and_then(|micros_vec| {
+                    let mut out = Vec::with_capacity(micros_vec.len());
+                    for micros in micros_vec {
+                        let buf = micros.to_be_bytes();
+                        let odt = ::bsql_core::driver::decode_timestamptz_time(&buf)?;
+                        out.push(::time::PrimitiveDateTime::new(odt.date(), odt.time()));
+                    }
+                    Ok(out)
+                })
+            } },
+        ),
+        "Vec<::time::Date>" | "Vec<time::Date>" => gen_decode_match(
+            idx,
+            "date[]",
+            quote! { {
+                let raw = row.get_raw(#idx).unwrap_or_default();
+                ::bsql_core::driver::decode_array_i32(raw).and_then(|days_vec| {
+                    let mut out = Vec::with_capacity(days_vec.len());
+                    for days in days_vec {
+                        let buf = days.to_be_bytes();
+                        out.push(::bsql_core::driver::decode_date_time(&buf)?);
+                    }
+                    Ok(out)
+                })
+            } },
+        ),
+        "Vec<::time::Time>" | "Vec<time::Time>" => gen_decode_match(
+            idx,
+            "time[]",
+            quote! { {
+                let raw = row.get_raw(#idx).unwrap_or_default();
+                ::bsql_core::driver::decode_array_i64(raw).and_then(|micros_vec| {
+                    let mut out = Vec::with_capacity(micros_vec.len());
+                    for micros in micros_vec {
+                        let buf = micros.to_be_bytes();
+                        out.push(::bsql_core::driver::decode_time_time(&buf)?);
+                    }
+                    Ok(out)
+                })
+            } },
+        ),
+        "Vec<::uuid::Uuid>" | "Vec<uuid::Uuid>" => gen_decode_match(
+            idx,
+            "uuid[]",
+            quote! { {
+                let raw = row.get_raw(#idx).unwrap_or_default();
+                ::bsql_core::driver::decode_array_bytea(raw).and_then(|elements| {
+                    let mut out = Vec::with_capacity(elements.len());
+                    for bytes in &elements {
+                        out.push(::bsql_core::driver::decode_uuid_type(bytes)?);
+                    }
+                    Ok(out)
+                })
+            } },
+        ),
+        "Vec<::rust_decimal::Decimal>" | "Vec<rust_decimal::Decimal>" => gen_decode_match(
+            idx,
+            "numeric[]",
+            quote! { {
+                let raw = row.get_raw(#idx).unwrap_or_default();
+                ::bsql_core::driver::decode_array_bytea(raw).and_then(|elements| {
+                    let mut out = Vec::with_capacity(elements.len());
+                    for bytes in &elements {
+                        out.push(::bsql_core::driver::decode_numeric_decimal(bytes)?);
+                    }
+                    Ok(out)
+                })
+            } },
+        ),
+        "Vec<::chrono::DateTime<::chrono::Utc>>" | "Vec<chrono::DateTime<chrono::Utc>>" => gen_decode_match(
+            idx,
+            "timestamptz[]",
+            quote! { {
+                let raw = row.get_raw(#idx).unwrap_or_default();
+                ::bsql_core::driver::decode_array_i64(raw).and_then(|micros_vec| {
+                    let mut out = Vec::with_capacity(micros_vec.len());
+                    for micros in micros_vec {
+                        let buf = micros.to_be_bytes();
+                        out.push(::bsql_core::driver::decode_timestamptz_chrono(&buf)?);
+                    }
+                    Ok(out)
+                })
+            } },
+        ),
+        "Vec<::chrono::NaiveDateTime>" | "Vec<chrono::NaiveDateTime>" => gen_decode_match(
+            idx,
+            "timestamp[]",
+            quote! { {
+                let raw = row.get_raw(#idx).unwrap_or_default();
+                ::bsql_core::driver::decode_array_i64(raw).and_then(|micros_vec| {
+                    let mut out = Vec::with_capacity(micros_vec.len());
+                    for micros in micros_vec {
+                        let buf = micros.to_be_bytes();
+                        let dt = ::bsql_core::driver::decode_timestamptz_chrono(&buf)?;
+                        out.push(dt.naive_utc());
+                    }
+                    Ok(out)
+                })
+            } },
+        ),
         _ => {
             // Unknown type -- fall back. This should not happen for known PG types.
             quote! { {
@@ -1163,12 +1411,12 @@ fn stream_struct_name(parsed: &ParsedQuery) -> proc_macro2::Ident {
     format_ident!("BsqlStream_{}", &parsed.statement_name)
 }
 
-/// Rust keywords (2021 edition) that cannot be used as bare identifiers.
+/// Rust keywords (2024 edition) that cannot be used as bare identifiers.
 const RUST_KEYWORDS: &[&str] = &[
     "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
     "false", "fn", "for", "gen", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut",
-    "pub", "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
-    "unsafe", "use", "where", "while", "yield",
+    "pub", "raw", "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true",
+    "type", "unsafe", "use", "where", "while", "yield",
 ];
 
 /// Sanitize a user-declared parameter name into a valid Rust identifier.
@@ -1500,5 +1748,66 @@ mod tests {
     #[test]
     fn sanitize_param_non_keyword() {
         assert_eq!(sanitize_param_name("id"), "id");
+    }
+
+
+    #[test]
+    fn sanitize_raw_keyword() {
+        assert_eq!(sanitize_param_name("raw"), "raw_");
+        assert_eq!(sanitize_column_name("raw", 0), "raw_");
+    }
+
+
+    #[test]
+    fn not_null_decode_uses_ok_or_else() {
+        let parsed = parse_query("SELECT id FROM t WHERE 1 = $a: i32").unwrap();
+        let validation = make_validation(vec![col("id", "i32")]);
+        let code = generate_query_code(&parsed, &validation);
+        let code_str = code.to_string();
+
+        // Should NOT use unwrap_or_default — should use ok_or_else
+        assert!(
+            !code_str.contains("unwrap_or_default"),
+            "should not use unwrap_or_default for NOT NULL decode: {code_str}"
+        );
+        assert!(
+            code_str.contains("ok_or_else"),
+            "should use ok_or_else for NOT NULL decode: {code_str}"
+        );
+    }
+
+
+    #[test]
+    fn timestamp_decode_has_primitive_date_time() {
+        let parsed = parse_query("SELECT ts FROM t WHERE 1 = $a: i32").unwrap();
+        let validation = make_validation(vec![col("ts", "::time::PrimitiveDateTime")]);
+        let code = generate_query_code(&parsed, &validation);
+        let code_str = code.to_string();
+
+        assert!(
+            code_str.contains("decode_timestamptz_time"),
+            "PrimitiveDateTime should use timestamptz decode: {code_str}"
+        );
+        assert!(
+            code_str.contains("PrimitiveDateTime"),
+            "should reference PrimitiveDateTime: {code_str}"
+        );
+    }
+
+    #[test]
+    fn timestamp_decode_has_naive_date_time() {
+        let parsed = parse_query("SELECT ts FROM t WHERE 1 = $a: i32").unwrap();
+        let validation = make_validation(vec![col("ts", "::chrono::NaiveDateTime")]);
+        let code = generate_query_code(&parsed, &validation);
+        let code_str = code.to_string();
+
+        assert!(
+            code_str.contains("decode_timestamptz_chrono"),
+            "NaiveDateTime should use timestamptz decode: {code_str}"
+        );
+        assert!(
+            code_str.contains("naive_utc"),
+            "should convert to naive_utc: {code_str}"
+        );
     }
 }

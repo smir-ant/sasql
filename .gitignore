@@ -1,5 +1,4 @@
 /target
-.bsql/
 *.swp
 *.swo
 .DS_Store

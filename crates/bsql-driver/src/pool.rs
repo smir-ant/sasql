@@ -13,7 +13,8 @@
 
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use tokio::sync::Notify;
 
@@ -50,6 +51,17 @@ struct PoolInner {
     open_count: AtomicUsize,
     config: Config,
     connecting: Notify,
+    /// Notified when a connection is returned to the pool.
+    release_notify: Notify,
+    /// When true, no new acquires are accepted.
+    closed: AtomicBool,
+    /// Maximum lifetime of a connection. Connections older than this
+    /// are discarded when popped from the pool. Default: 30 minutes.
+    max_lifetime: Option<Duration>,
+    /// Maximum time to wait for a connection. Default: 5 seconds.
+    acquire_timeout: Option<Duration>,
+    /// Minimum number of idle connections to maintain. Default: 0.
+    min_idle: usize,
     /// SQL statements to PREPARE on new connections (warmup).
     ///
     /// When a new connection is created, these are pre-prepared via the
@@ -81,6 +93,11 @@ impl Pool {
     /// connection is created. If the pool is at max_size, returns
     /// `DriverError::Pool` immediately — no blocking.
     pub async fn acquire(&self) -> Result<PoolGuard, DriverError> {
+
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(DriverError::Pool("pool is closed".into()));
+        }
+
         // Try to pop an idle connection (fast path).
         // std::sync::Mutex — trivial critical section (no I/O), safe to unwrap
         // because we never panic while holding this lock.
@@ -88,19 +105,8 @@ impl Pool {
         // If the connection has been idle > 30s, its TCP socket may be dead
         // (half-open, firewall timeout, PG idle reaper). Discard it and try
         // the next one. This is cheaper than a health-check roundtrip.
-        {
-            let mut stack = self.inner.stack.lock().unwrap_or_else(|e| e.into_inner());
-            while let Some(conn) = stack.pop() {
-                if conn.idle_duration() < std::time::Duration::from_secs(30) {
-                    return Ok(PoolGuard {
-                        conn: Some(conn),
-                        pool: self.inner.clone(),
-                        discard: false,
-                    });
-                }
-                // Stale connection — drop it, free the slot
-                self.inner.open_count.fetch_sub(1, Ordering::AcqRel);
-            }
+        if let Some(guard) = self.try_pop_idle()? {
+            return Ok(guard);
         }
 
         // No idle connections — try to claim a slot with a proper CAS loop.
@@ -108,6 +114,25 @@ impl Pool {
         loop {
             let current = self.inner.open_count.load(Ordering::Acquire);
             if current >= self.inner.max_size {
+
+                if let Some(timeout) = self.inner.acquire_timeout {
+                    let result = tokio::time::timeout(
+                        timeout,
+                        self.inner.release_notify.notified(),
+                    )
+                    .await;
+                    if result.is_err() {
+                        return Err(DriverError::Pool(
+                            "pool exhausted: acquire timeout expired".into(),
+                        ));
+                    }
+                    // A connection was returned — try again
+                    if let Some(guard) = self.try_pop_idle()? {
+                        return Ok(guard);
+                    }
+                    // Popped nothing — retry CAS
+                    continue;
+                }
                 return Err(DriverError::Pool(
                     "pool exhausted: all connections in use".into(),
                 ));
@@ -145,6 +170,30 @@ impl Pool {
         }
     }
 
+    /// Try to pop a valid idle connection from the stack.
+    fn try_pop_idle(&self) -> Result<Option<PoolGuard>, DriverError> {
+        let mut stack = self.inner.stack.lock().unwrap_or_else(|e| e.into_inner());
+        while let Some(conn) = stack.pop() {
+
+            if let Some(max_lifetime) = self.inner.max_lifetime {
+                if conn.created_at().elapsed() >= max_lifetime {
+                    self.inner.open_count.fetch_sub(1, Ordering::AcqRel);
+                    continue;
+                }
+            }
+            if conn.idle_duration() < Duration::from_secs(30) {
+                return Ok(Some(PoolGuard {
+                    conn: Some(conn),
+                    pool: self.inner.clone(),
+                    discard: false,
+                }));
+            }
+            // Stale connection — drop it, free the slot
+            self.inner.open_count.fetch_sub(1, Ordering::AcqRel);
+        }
+        Ok(None)
+    }
+
     /// Begin a transaction. Acquires a connection and sends BEGIN.
     pub async fn begin(&self) -> Result<Transaction, DriverError> {
         let mut guard = self.acquire().await?;
@@ -163,6 +212,24 @@ impl Pool {
     /// Maximum pool size.
     pub fn max_size(&self) -> usize {
         self.inner.max_size
+    }
+
+    /// Pool status metrics.
+    pub fn status(&self) -> PoolStatus {
+        let idle = self
+            .inner
+            .stack
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        let open = self.inner.open_count.load(Ordering::Relaxed);
+        let active = open.saturating_sub(idle);
+        PoolStatus {
+            idle,
+            active,
+            open,
+            max_size: self.inner.max_size,
+        }
     }
 
     /// Pre-PREPARE warmup statements on a new connection.
@@ -217,6 +284,28 @@ impl Pool {
     /// # Ok(())
     /// # }
     /// ```
+    /// Close the pool. No new acquires are accepted. All idle connections
+    /// are sent Terminate and dropped.
+    pub async fn close(&self) {
+        self.inner.closed.store(true, Ordering::Release);
+        // Drain and close all idle connections
+        let conns: Vec<Connection> = {
+            let mut stack = self.inner.stack.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *stack)
+        };
+        for conn in conns {
+            self.inner.open_count.fetch_sub(1, Ordering::AcqRel);
+            let _ = conn.close().await;
+        }
+        // Notify any waiters so they get the "pool is closed" error
+        self.inner.release_notify.notify_waiters();
+    }
+
+    /// Whether the pool has been closed.
+    pub fn is_closed(&self) -> bool {
+        self.inner.closed.load(Ordering::Acquire)
+    }
+
     pub fn set_warmup_sqls(&self, sqls: &[&str]) {
         let boxed: Arc<[Box<str>]> = sqls.iter().map(|s| (*s).into()).collect::<Vec<_>>().into();
         *self
@@ -235,12 +324,33 @@ impl Clone for Pool {
     }
 }
 
+// --- PoolStatus ( ---
+
+/// Pool status metrics.
+#[derive(Debug, Clone, Copy)]
+pub struct PoolStatus {
+    /// Number of idle connections in the pool.
+    pub idle: usize,
+    /// Number of connections currently in use.
+    pub active: usize,
+    /// Total open connections (idle + active).
+    pub open: usize,
+    /// Maximum pool size.
+    pub max_size: usize,
+}
+
 // --- PoolBuilder ---
 
 /// Builder for configuring a connection pool.
 pub struct PoolBuilder {
     url: Option<String>,
     max_size: usize,
+    /// Maximum lifetime of a connection.
+    max_lifetime: Option<Duration>,
+    /// Maximum time to wait for a connection when pool is exhausted.
+    acquire_timeout: Option<Duration>,
+    /// Minimum number of idle connections to maintain.
+    min_idle: usize,
 }
 
 impl PoolBuilder {
@@ -248,6 +358,9 @@ impl PoolBuilder {
         Self {
             url: None,
             max_size: 10,
+            max_lifetime: Some(Duration::from_secs(30 * 60)), // 30 min default
+            acquire_timeout: None,                             // fail-fast by default (CREDO #17)
+            min_idle: 0,                                       // no minimum by default
         }
     }
 
@@ -265,6 +378,27 @@ impl PoolBuilder {
         self
     }
 
+    /// Set the maximum lifetime of a connection. Default: 30 minutes.
+    /// Set to None for unlimited lifetime.
+    pub fn max_lifetime(mut self, lifetime: Option<Duration>) -> Self {
+        self.max_lifetime = lifetime;
+        self
+    }
+
+    /// Set the acquire timeout. Default: 5 seconds.
+    /// Set to None for fail-fast (no waiting).
+    pub fn acquire_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.acquire_timeout = timeout;
+        self
+    }
+
+    /// Set the minimum number of idle connections. Default: 0.
+    /// When > 0, a background task maintains this many idle connections.
+    pub fn min_idle(mut self, count: usize) -> Self {
+        self.min_idle = count;
+        self
+    }
+
     /// Build the pool. Validates the URL but does not open connections.
     pub async fn build(self) -> Result<Pool, DriverError> {
         let url = self
@@ -273,16 +407,73 @@ impl PoolBuilder {
 
         let config = Config::from_url(&url)?;
 
-        Ok(Pool {
+        let pool = Pool {
             inner: Arc::new(PoolInner {
                 stack: std::sync::Mutex::new(Vec::with_capacity(self.max_size)),
                 max_size: self.max_size,
                 open_count: AtomicUsize::new(0),
                 config,
                 connecting: Notify::new(),
+                release_notify: Notify::new(),
+                closed: AtomicBool::new(false),
+                max_lifetime: self.max_lifetime,
+                acquire_timeout: self.acquire_timeout,
+                min_idle: self.min_idle,
                 warmup_sqls: std::sync::Mutex::new(Arc::from(Vec::<Box<str>>::new())),
             }),
-        })
+        };
+
+
+        if self.min_idle > 0 {
+            let inner = pool.inner.clone();
+            tokio::spawn(async move {
+                maintain_min_idle(inner).await;
+            });
+        }
+
+        Ok(pool)
+    }
+}
+
+/// Background task that maintains min_idle connections.
+async fn maintain_min_idle(inner: Arc<PoolInner>) {
+    loop {
+        if inner.closed.load(Ordering::Acquire) {
+            return;
+        }
+
+        let idle_count = inner.stack.lock().unwrap_or_else(|e| e.into_inner()).len();
+        let needed = inner.min_idle.saturating_sub(idle_count);
+
+        for _ in 0..needed {
+            if inner.closed.load(Ordering::Acquire) {
+                return;
+            }
+            let current = inner.open_count.load(Ordering::Acquire);
+            if current >= inner.max_size {
+                break;
+            }
+            if inner
+                .open_count
+                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+            match Connection::connect(&inner.config).await {
+                Ok(conn) => {
+                    let mut stack = inner.stack.lock().unwrap_or_else(|e| e.into_inner());
+                    stack.push(conn);
+                    inner.release_notify.notify_one();
+                }
+                Err(_) => {
+                    inner.open_count.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+        }
+
+        // Check every 5 seconds
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
 
@@ -330,8 +521,18 @@ impl PoolGuard {
 impl Drop for PoolGuard {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
-            // Discard if: failed transaction, or explicitly marked
-            if self.discard || conn.is_in_failed_transaction() {
+            // + Discard if:
+            //   - explicitly marked for discard
+            //   - in a failed transaction (tx_status == 'E')
+            //   - in an active transaction (tx_status == 'T') — uncommitted tx
+            //   - streaming query in progress — connection in indeterminate state
+            //   - pool is closed
+            if self.discard
+                || conn.is_in_failed_transaction()
+                || conn.is_in_transaction()
+                || conn.is_streaming()
+                || self.pool.closed.load(Ordering::Acquire)
+            {
                 self.pool.open_count.fetch_sub(1, Ordering::AcqRel);
                 return;
             }
@@ -339,8 +540,12 @@ impl Drop for PoolGuard {
             // Return to pool synchronously. The critical section is trivial
             // (Vec::push — no I/O), so std::sync::Mutex is appropriate here
             // and avoids spawning an async task in Drop.
-            let mut stack = self.pool.stack.lock().unwrap_or_else(|e| e.into_inner());
-            stack.push(conn);
+            {
+                let mut stack = self.pool.stack.lock().unwrap_or_else(|e| e.into_inner());
+                stack.push(conn);
+            }
+
+            self.pool.release_notify.notify_one();
         }
     }
 }
@@ -487,5 +692,130 @@ mod tests {
 
         let pool2 = pool.clone();
         assert_eq!(pool.max_size(), pool2.max_size());
+    }
+
+    // --- Audit gap tests ---
+
+    // #60: max_lifetime is configurable
+    #[tokio::test]
+    async fn pool_builder_max_lifetime() {
+        let pool = PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .max_lifetime(Some(Duration::from_secs(60)))
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(pool.inner.max_lifetime, Some(Duration::from_secs(60)));
+    }
+
+    // #60: max_lifetime None
+    #[tokio::test]
+    async fn pool_builder_max_lifetime_none() {
+        let pool = PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .max_lifetime(None)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(pool.inner.max_lifetime, None);
+    }
+
+    // #62: acquire_timeout set to None (fail-fast)
+    #[tokio::test]
+    async fn pool_builder_acquire_timeout_none() {
+        let pool = PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .acquire_timeout(None)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(pool.inner.acquire_timeout, None);
+    }
+
+    // #62: acquire_timeout custom value
+    #[tokio::test]
+    async fn pool_builder_acquire_timeout_custom() {
+        let pool = PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .acquire_timeout(Some(Duration::from_secs(10)))
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(pool.inner.acquire_timeout, Some(Duration::from_secs(10)));
+    }
+
+    // #63: min_idle setting
+    #[tokio::test]
+    async fn pool_builder_min_idle() {
+        let pool = PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .min_idle(2)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(pool.inner.min_idle, 2);
+    }
+
+    // #64: Pool close marks pool as closed
+    #[tokio::test]
+    async fn pool_close_marks_closed() {
+        let pool = PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .max_size(5)
+            .build()
+            .await
+            .unwrap();
+
+        assert!(!pool.is_closed());
+        pool.close().await;
+        assert!(pool.is_closed());
+
+        // New acquires should fail
+        let result = pool.acquire().await;
+        assert!(result.is_err());
+        match result {
+            Err(DriverError::Pool(msg)) => assert!(msg.contains("closed")),
+            Err(e) => panic!("expected Pool(closed) error, got: {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    // #67: PoolStatus idle/active counts
+    #[tokio::test]
+    async fn pool_status_initial() {
+        let pool = PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .max_size(10)
+            .build()
+            .await
+            .unwrap();
+
+        let status = pool.status();
+        assert_eq!(status.idle, 0);
+        assert_eq!(status.active, 0);
+        assert_eq!(status.open, 0);
+        assert_eq!(status.max_size, 10);
+    }
+
+    // Default pool builder values
+    #[tokio::test]
+    async fn pool_builder_defaults() {
+        let pool = PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(pool.max_size(), 10);
+        assert_eq!(pool.inner.max_lifetime, Some(Duration::from_secs(30 * 60)));
+        assert_eq!(pool.inner.acquire_timeout, None); // fail-fast by default (CREDO #17)
+        assert_eq!(pool.inner.min_idle, 0);
+    }
+
+    // Pool open_count starts at 0
+    #[tokio::test]
+    async fn pool_open_count_initial() {
+        let pool = Pool::connect("postgres://user:pass@localhost/db").await.unwrap();
+        assert_eq!(pool.open_count(), 0);
     }
 }

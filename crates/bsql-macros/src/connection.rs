@@ -3,6 +3,19 @@
 //! Uses `LazyLock` to maintain a single connection across all `query!`
 //! invocations within one `cargo build`. The first invocation pays ~5ms
 //! for the connection. Subsequent invocations reuse it at ~0 cost.
+//!
+//! # TLS support
+//!
+//! When the `tls` feature is enabled on `bsql`, the compile-time connection
+//! uses `rustls` for encrypted connections. The connection URL can include
+//! `?sslmode=require` to enforce TLS:
+//!
+//! ```text
+//! BSQL_DATABASE_URL=postgres://user:pass@host/db?sslmode=require
+//! ```
+//!
+//! Without the `tls` feature, connections use `NoTls` and `sslmode=require`
+//! will fail with a connection error.
 
 use std::sync::LazyLock;
 use tokio::runtime::Runtime;

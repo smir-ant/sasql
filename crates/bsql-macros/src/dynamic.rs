@@ -38,12 +38,12 @@ pub fn expand_variants(parsed: &ParsedQuery) -> Result<Vec<QueryVariant>, String
         }]);
     }
 
-    // n <= 8 enforced by parser, but guard here too
-    if n > 8 {
+    // Hard limit: 2^N variants must not explode compile times.
+    // n <= 10 enforced by parser, but guard here too.
+    if n > 10 {
         return Err(format!(
-            "query has {} optional clauses ({} variants) — maximum is 8 (256 variants). \
-             Split the query into smaller queries with fewer optional filters.",
-            n,
+            "too many optional clauses ({n}, producing {} variants) — maximum is 10 \
+             (1024 variants). Consider splitting into multiple queries.",
             1u32 << n
         ));
     }
@@ -95,7 +95,8 @@ fn build_variant(parsed: &ParsedQuery, mask: u32) -> Result<QueryVariant, String
                 });
             }
 
-            // Single-pass: scan clause SQL for ${P_N} placeholders
+            // Single-pass: scan clause SQL for ${P_N} placeholders.
+            // Uses &str slicing (not byte-by-byte) to preserve multi-byte UTF-8.
             let frag = &clause.sql_fragment;
             let mut clause_sql = String::with_capacity(frag.len());
             let frag_bytes = frag.as_bytes();
@@ -125,8 +126,11 @@ fn build_variant(parsed: &ParsedQuery, mask: u32) -> Result<QueryVariant, String
                         }
                     }
                 }
-                clause_sql.push(frag_bytes[j] as char);
-                j += 1;
+                // Advance by the full UTF-8 character width, slicing from the
+                // original &str to avoid corrupting multi-byte sequences.
+                let ch = frag[j..].chars().next().unwrap();
+                clause_sql.push(ch);
+                j += ch.len_utf8();
             }
 
             sql = sql.replace(&placeholder, &format!(" {clause_sql} "));

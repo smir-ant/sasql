@@ -82,11 +82,18 @@ pub fn resolve_rust_type(oid: u32) -> Result<&'static str, String> {
                 Err(feature_error("NUMERIC", oid, &["decimal"]))
             }
         }
+        // --- JSON / JSONB ---
+        // Returned as String; users parse with serde_json or similar
+        114 => Ok("String"),   // json
+        3802 => Ok("String"),  // jsonb
         // --- INTERVAL ---
-        1186 => Err(format!(
-            "column type is INTERVAL (OID {oid}) which is not yet supported by bsql. \
-                 Cast to a supported type or track the bsql issue for INTERVAL support."
-        )),
+        // Returned as String; PG sends the ISO 8601 text representation
+        1186 => Ok("String"),
+        // --- INET / CIDR / MACADDR ---
+        // Returned as String; PG sends the text representation
+        869 => Ok("String"),   // inet
+        650 => Ok("String"),   // cidr
+        829 => Ok("String"),   // macaddr
         // --- Timestamp/Date/Time arrays ---
         1115 => resolve_array("TIMESTAMP[]", 1114, oid),
         1185 => resolve_array("TIMESTAMPTZ[]", 1184, oid),
@@ -94,6 +101,15 @@ pub fn resolve_rust_type(oid: u32) -> Result<&'static str, String> {
         1183 => resolve_array("TIME[]", 1083, oid),
         2951 => resolve_array("UUID[]", 2950, oid),
         1231 => resolve_array("NUMERIC[]", 1700, oid),
+        // --- JSON/JSONB arrays ---
+        199 => Ok("Vec<String>"),   // json[]
+        3807 => Ok("Vec<String>"),  // jsonb[]
+        // --- Network type arrays ---
+        1041 => Ok("Vec<String>"),  // inet[]
+        651 => Ok("Vec<String>"),   // cidr[]
+        1040 => Ok("Vec<String>"),  // macaddr[]
+        // --- Interval array ---
+        1187 => Ok("Vec<String>"),  // interval[]
         _ => {
             let name = bsql_core::types::pg_name_for_oid(oid).unwrap_or("unknown");
             Err(format!(
@@ -209,6 +225,14 @@ pub fn is_param_compatible_extended(rust_type: &str, pg_oid: u32) -> bool {
         ("::rust_decimal::Decimal" | "rust_decimal::Decimal" | "Decimal", 1700) => {
             cfg!(feature = "decimal")
         }
+
+        // --- JSON / JSONB ---
+        // Accept &str and String for json/jsonb params
+        ("&str" | "String", 114 | 3802) => true,
+
+        // --- INTERVAL / INET / CIDR / MACADDR ---
+        // Accept &str and String for text-represented types
+        ("&str" | "String", 1186 | 869 | 650 | 829) => true,
 
         _ => false,
     }
@@ -437,5 +461,164 @@ mod tests {
     fn unknown_custom_type_not_known_non_enum() {
         assert!(!is_known_non_enum_type("TicketStatus"));
         assert!(!is_known_non_enum_type("MyEnum"));
+    }
+
+
+    #[test]
+    fn json_resolves_to_string() {
+        assert_eq!(resolve_rust_type(114).unwrap(), "String");
+    }
+
+    #[test]
+    fn jsonb_resolves_to_string() {
+        assert_eq!(resolve_rust_type(3802).unwrap(), "String");
+    }
+
+    #[test]
+    fn json_array_resolves_to_vec_string() {
+        assert_eq!(resolve_rust_type(199).unwrap(), "Vec<String>");
+    }
+
+    #[test]
+    fn jsonb_array_resolves_to_vec_string() {
+        assert_eq!(resolve_rust_type(3807).unwrap(), "Vec<String>");
+    }
+
+
+    #[test]
+    fn interval_resolves_to_string() {
+        assert_eq!(resolve_rust_type(1186).unwrap(), "String");
+    }
+
+    #[test]
+    fn inet_resolves_to_string() {
+        assert_eq!(resolve_rust_type(869).unwrap(), "String");
+    }
+
+    #[test]
+    fn cidr_resolves_to_string() {
+        assert_eq!(resolve_rust_type(650).unwrap(), "String");
+    }
+
+    #[test]
+    fn macaddr_resolves_to_string() {
+        assert_eq!(resolve_rust_type(829).unwrap(), "String");
+    }
+
+
+    #[test]
+    fn json_param_compat() {
+        assert!(is_param_compatible_extended("&str", 114));
+        assert!(is_param_compatible_extended("String", 114));
+        assert!(is_param_compatible_extended("&str", 3802));
+        assert!(is_param_compatible_extended("String", 3802));
+    }
+
+    #[test]
+    fn interval_param_compat() {
+        assert!(is_param_compatible_extended("&str", 1186));
+        assert!(is_param_compatible_extended("String", 1186));
+    }
+
+    #[test]
+    fn inet_param_compat() {
+        assert!(is_param_compatible_extended("&str", 869));
+        assert!(is_param_compatible_extended("String", 869));
+    }
+
+
+    #[test]
+    fn inet_array_resolves() {
+        assert_eq!(resolve_rust_type(1041).unwrap(), "Vec<String>");
+    }
+
+    #[test]
+    fn interval_array_resolves() {
+        assert_eq!(resolve_rust_type(1187).unwrap(), "Vec<String>");
+    }
+
+
+    #[cfg(feature = "time")]
+    #[test]
+    fn timestamp_resolves_to_primitive_datetime() {
+        assert_eq!(resolve_rust_type(1114).unwrap(), "::time::PrimitiveDateTime");
+    }
+
+    #[cfg(all(feature = "chrono", not(feature = "time")))]
+    #[test]
+    fn timestamp_resolves_to_naive_datetime() {
+        assert_eq!(resolve_rust_type(1114).unwrap(), "::chrono::NaiveDateTime");
+    }
+
+    // --- Audit gap tests ---
+
+    // #111: OID 114 (json) resolves to String via resolve_rust_type
+    #[test]
+    fn resolve_json_oid_114() {
+        assert_eq!(resolve_rust_type(114).unwrap(), "String");
+    }
+
+    // #113: Array OIDs resolve correctly
+    #[test]
+    fn resolve_inet_array_oid() {
+        assert_eq!(resolve_rust_type(1041).unwrap(), "Vec<String>");
+    }
+
+    #[test]
+    fn resolve_cidr_array_oid() {
+        assert_eq!(resolve_rust_type(651).unwrap(), "Vec<String>");
+    }
+
+    #[test]
+    fn resolve_macaddr_array_oid() {
+        assert_eq!(resolve_rust_type(1040).unwrap(), "Vec<String>");
+    }
+
+    #[test]
+    fn resolve_interval_array_oid() {
+        assert_eq!(resolve_rust_type(1187).unwrap(), "Vec<String>");
+    }
+
+    #[test]
+    fn resolve_json_array_oid() {
+        assert_eq!(resolve_rust_type(199).unwrap(), "Vec<String>");
+    }
+
+    #[test]
+    fn resolve_jsonb_array_oid() {
+        assert_eq!(resolve_rust_type(3807).unwrap(), "Vec<String>");
+    }
+
+    // TIMETZ (1266) is unsupported
+    #[test]
+    fn timetz_oid_unsupported() {
+        let err = resolve_rust_type(1266).unwrap_err();
+        assert!(err.contains("TIMETZ"), "should mention TIMETZ: {err}");
+    }
+
+    // cidr and macaddr resolve to String
+    #[test]
+    fn resolve_cidr_oid() {
+        assert_eq!(resolve_rust_type(650).unwrap(), "String");
+    }
+
+    #[test]
+    fn resolve_macaddr_oid() {
+        assert_eq!(resolve_rust_type(829).unwrap(), "String");
+    }
+
+    // is_known_non_enum_type: &[u8] is known non-enum
+    #[test]
+    fn known_non_enum_byteslice() {
+        assert!(is_known_non_enum_type("&[u8]"));
+    }
+
+    // is_param_compatible_extended for interval/inet/cidr/macaddr
+    #[test]
+    fn param_compat_extended_network_types() {
+        assert!(is_param_compatible_extended("&str", 869)); // inet
+        assert!(is_param_compatible_extended("String", 650)); // cidr
+        assert!(is_param_compatible_extended("&str", 829)); // macaddr
+        assert!(is_param_compatible_extended("String", 1186)); // interval
     }
 }

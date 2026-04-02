@@ -3,6 +3,8 @@
 //! Delegates all connection management, fail-fast semantics, and LIFO ordering
 //! to the driver. This layer adds only the bsql error type conversions.
 
+use std::time::Duration;
+
 use bsql_driver::arena::acquire_arena;
 use bsql_driver::codec::Encode;
 use tokio::sync::Mutex;
@@ -22,6 +24,9 @@ pub struct Pool {
 pub struct PoolBuilder {
     url: Option<String>,
     max_size: usize,
+    max_lifetime: Option<Option<Duration>>,
+    acquire_timeout: Option<Option<Duration>>,
+    min_idle: Option<usize>,
 }
 
 impl PoolBuilder {
@@ -38,18 +43,54 @@ impl PoolBuilder {
         self
     }
 
+    /// Set the maximum lifetime of a connection. Connections older than this
+    /// are discarded when returned to the pool. Default: 30 minutes.
+    ///
+    /// Pass `None` for unlimited lifetime.
+    pub fn max_lifetime(mut self, d: Option<Duration>) -> Self {
+        self.max_lifetime = Some(d);
+        self
+    }
+
+    /// Set the maximum time to wait for a connection when the pool is
+    /// exhausted. Default: 5 seconds.
+    ///
+    /// Pass `None` for fail-fast behavior (no waiting, immediate error).
+    pub fn acquire_timeout(mut self, d: Option<Duration>) -> Self {
+        self.acquire_timeout = Some(d);
+        self
+    }
+
+    /// Set the minimum number of idle connections to maintain. Default: 0.
+    ///
+    /// When greater than 0, a background task creates connections as needed
+    /// to maintain this idle floor.
+    pub fn min_idle(mut self, n: usize) -> Self {
+        self.min_idle = Some(n);
+        self
+    }
+
     pub async fn build(self) -> BsqlResult<Pool> {
         let url = self.url.ok_or_else(|| {
             BsqlError::from(bsql_driver::DriverError::Pool(
                 "pool builder requires a URL".into(),
             ))
         })?;
-        let inner = bsql_driver::Pool::builder()
+        let mut builder = bsql_driver::Pool::builder()
             .url(&url)
-            .max_size(self.max_size)
-            .build()
-            .await
-            .map_err(BsqlError::from)?;
+            .max_size(self.max_size);
+
+        if let Some(lt) = self.max_lifetime {
+            builder = builder.max_lifetime(lt);
+        }
+        if let Some(at) = self.acquire_timeout {
+            builder = builder.acquire_timeout(at);
+        }
+        if let Some(mi) = self.min_idle {
+            builder = builder.min_idle(mi);
+        }
+
+        let inner = builder.build().await.map_err(BsqlError::from)?;
         Ok(Pool { inner })
     }
 }
@@ -70,13 +111,16 @@ impl Pool {
         PoolBuilder {
             url: None,
             max_size: 10,
+            max_lifetime: None,
+            acquire_timeout: None,
+            min_idle: None,
         }
     }
 
     /// Acquire a connection from the pool.
     ///
     /// **Fail-fast**: returns `BsqlError::Pool` immediately if no connections
-    /// are available. Does not wait.
+    /// are available (unless `acquire_timeout` is configured).
     pub async fn acquire(&self) -> BsqlResult<PoolConnection> {
         let guard = self.inner.acquire().await.map_err(BsqlError::from)?;
         Ok(PoolConnection {
@@ -118,7 +162,7 @@ impl Pool {
             .map_err(BsqlError::from)?;
 
         let num_cols = columns.len();
-        let mut all_col_offsets: Vec<(u32, i32)> =
+        let mut all_col_offsets: Vec<(usize, i32)> =
             Vec::with_capacity(num_cols * CHUNK_SIZE as usize);
 
         let more = guard
@@ -143,12 +187,31 @@ impl Pool {
         self.inner.set_warmup_sqls(sqls);
     }
 
-    /// Current pool status: open connections and max size.
+    /// Pool status metrics: idle, active, open, and max_size.
+    ///
+    /// Returns detailed pool utilization metrics from the driver.
     pub fn status(&self) -> PoolStatus {
+        let driver_status = self.inner.status();
         PoolStatus {
-            size: self.inner.open_count(),
-            max_size: self.inner.max_size(),
+            idle: driver_status.idle,
+            active: driver_status.active,
+            open: driver_status.open,
+            max_size: driver_status.max_size,
         }
+    }
+
+    /// Gracefully close the pool.
+    ///
+    /// No new connections can be acquired after this call. All idle connections
+    /// are closed immediately. Active connections are closed when returned to
+    /// the pool.
+    pub async fn close(&self) {
+        self.inner.close().await;
+    }
+
+    /// Whether the pool has been closed.
+    pub fn is_closed(&self) -> bool {
+        self.inner.is_closed()
     }
 }
 
@@ -172,8 +235,10 @@ impl std::fmt::Debug for Pool {
 ///
 /// Uses `tokio::sync::Mutex` for interior mutability because the driver's
 /// `Connection` requires `&mut self` for queries, but the `Executor` trait
-/// takes `&self`. The mutex is uncontended in practice (a single connection
-/// is never shared between concurrent tasks).
+/// takes `&self`. The mutex is uncontended in practice — a single connection
+/// is used by one task at a time, never shared between concurrent tasks.
+/// `tokio::sync::Mutex` is needed (over `RefCell`) because the future holding
+/// the guard must be `Send` for tokio task migration between worker threads.
 ///
 /// Returned to the pool when dropped.
 pub struct PoolConnection {
@@ -183,7 +248,13 @@ pub struct PoolConnection {
 /// Snapshot of pool utilization.
 #[derive(Debug, Clone, Copy)]
 pub struct PoolStatus {
-    pub size: usize,
+    /// Number of idle connections in the pool.
+    pub idle: usize,
+    /// Number of connections currently in use.
+    pub active: usize,
+    /// Total open connections (idle + active).
+    pub open: usize,
+    /// Maximum pool size.
     pub max_size: usize,
 }
 
@@ -195,5 +266,38 @@ mod tests {
     fn builder_defaults() {
         let b = Pool::builder();
         assert_eq!(b.max_size, 10);
+        assert!(b.max_lifetime.is_none());
+        assert!(b.acquire_timeout.is_none());
+        assert!(b.min_idle.is_none());
+    }
+
+    #[test]
+    fn builder_max_lifetime() {
+        let b = Pool::builder().max_lifetime(Some(Duration::from_secs(60)));
+        assert_eq!(b.max_lifetime, Some(Some(Duration::from_secs(60))));
+    }
+
+    #[test]
+    fn builder_max_lifetime_none_disables() {
+        let b = Pool::builder().max_lifetime(None);
+        assert_eq!(b.max_lifetime, Some(None));
+    }
+
+    #[test]
+    fn builder_acquire_timeout() {
+        let b = Pool::builder().acquire_timeout(Some(Duration::from_secs(3)));
+        assert_eq!(b.acquire_timeout, Some(Some(Duration::from_secs(3))));
+    }
+
+    #[test]
+    fn builder_acquire_timeout_none_disables() {
+        let b = Pool::builder().acquire_timeout(None);
+        assert_eq!(b.acquire_timeout, Some(None));
+    }
+
+    #[test]
+    fn builder_min_idle() {
+        let b = Pool::builder().min_idle(5);
+        assert_eq!(b.min_idle, Some(5));
     }
 }

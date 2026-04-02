@@ -136,6 +136,11 @@ fn parse_sort_variants(input: &syn::ItemEnum) -> Result<Vec<SortVariant>, syn::E
 
     for variant in &input.variants {
         let sql_fragment = extract_sql_attr(variant)?;
+
+        // Validate: sort fragments must not contain SQL injection patterns.
+        // Since sort SQL is spliced verbatim into ORDER BY, we reject dangerous content.
+        validate_sort_fragment(&sql_fragment, variant)?;
+
         variants.push(SortVariant {
             ident: variant.ident.clone(),
             sql_fragment,
@@ -158,6 +163,68 @@ fn parse_sort_variants(input: &syn::ItemEnum) -> Result<Vec<SortVariant>, syn::E
     }
 
     Ok(variants)
+}
+
+/// Validate that a sort SQL fragment does not contain dangerous patterns.
+///
+/// Sort fragments are spliced verbatim into the ORDER BY clause. Without
+/// compile-time PG validation of individual fragments (which would require
+/// the full query context), we defensively reject patterns that could be
+/// used for SQL injection: semicolons, comments, and DML/DDL keywords.
+fn validate_sort_fragment(fragment: &str, variant: &syn::Variant) -> Result<(), syn::Error> {
+    // Check for semicolons
+    if fragment.contains(';') {
+        return Err(syn::Error::new_spanned(
+            variant,
+            format!(
+                "sort SQL fragment contains a semicolon, which is not allowed: \"{}\"",
+                fragment
+            ),
+        ));
+    }
+
+    // Check for SQL comments
+    if fragment.contains("--") || fragment.contains("/*") {
+        return Err(syn::Error::new_spanned(
+            variant,
+            format!(
+                "sort SQL fragment contains a SQL comment, which is not allowed: \"{}\"",
+                fragment
+            ),
+        ));
+    }
+
+    // Check for dangerous keywords (case-insensitive word boundary check)
+    const DANGEROUS_KEYWORDS: &[&str] = &[
+        "DROP", "DELETE", "INSERT", "UPDATE", "CREATE", "ALTER",
+        "TRUNCATE", "GRANT", "REVOKE", "EXECUTE", "COPY",
+    ];
+
+    let upper = fragment.to_ascii_uppercase();
+    for keyword in DANGEROUS_KEYWORDS {
+        // Check for the keyword as a standalone word (not part of a column name)
+        for (pos, _) in upper.match_indices(keyword) {
+            let before_ok = pos == 0
+                || !upper.as_bytes()[pos - 1].is_ascii_alphanumeric()
+                    && upper.as_bytes()[pos - 1] != b'_';
+            let after_pos = pos + keyword.len();
+            let after_ok = after_pos >= upper.len()
+                || !upper.as_bytes()[after_pos].is_ascii_alphanumeric()
+                    && upper.as_bytes()[after_pos] != b'_';
+            if before_ok && after_ok {
+                return Err(syn::Error::new_spanned(
+                    variant,
+                    format!(
+                        "sort SQL fragment contains disallowed keyword `{keyword}`: \"{fragment}\". \
+                         Sort fragments must contain only ORDER BY expressions (column references, \
+                         ASC/DESC, NULLS FIRST/LAST)."
+                    ),
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Extract the SQL fragment from `#[sql("fragment")]` on a variant.
@@ -343,5 +410,211 @@ mod tests {
         };
         let result = expand_sort_enum(TokenStream::new(), input);
         assert!(result.is_err(), "structs should be rejected");
+    }
+
+
+    #[test]
+    fn sort_fragment_with_semicolon_rejected() {
+        let input = quote! {
+            enum Sort {
+                #[sql("id ASC; DROP TABLE users")]
+                Bad,
+            }
+        };
+        let result = expand_sort_enum(TokenStream::new(), input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("semicolon"), "should mention semicolon: {err}");
+    }
+
+    #[test]
+    fn sort_fragment_with_comment_rejected() {
+        let input = quote! {
+            enum Sort {
+                #[sql("id ASC -- sneaky")]
+                Bad,
+            }
+        };
+        let result = expand_sort_enum(TokenStream::new(), input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("comment"), "should mention comment: {err}");
+    }
+
+    #[test]
+    fn sort_fragment_with_block_comment_rejected() {
+        let input = quote! {
+            enum Sort {
+                #[sql("id ASC /* hidden */")]
+                Bad,
+            }
+        };
+        let result = expand_sort_enum(TokenStream::new(), input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("comment"), "should mention comment: {err}");
+    }
+
+    #[test]
+    fn sort_fragment_with_drop_rejected() {
+        let input = quote! {
+            enum Sort {
+                #[sql("(SELECT DROP FROM evil)")]
+                Bad,
+            }
+        };
+        let result = expand_sort_enum(TokenStream::new(), input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("DROP"), "should mention DROP: {err}");
+    }
+
+    #[test]
+    fn sort_fragment_with_delete_rejected() {
+        let input = quote! {
+            enum Sort {
+                #[sql("DELETE FROM users")]
+                Bad,
+            }
+        };
+        let result = expand_sort_enum(TokenStream::new(), input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("DELETE"), "should mention DELETE: {err}");
+    }
+
+    #[test]
+    fn sort_fragment_keyword_in_column_name_accepted() {
+        // "updated_at" contains "update" as a substring but not as a standalone word
+        let input = quote! {
+            enum Sort {
+                #[sql("updated_at DESC")]
+                UpdatedAt,
+            }
+        };
+        let result = expand_sort_enum(TokenStream::new(), input);
+        assert!(result.is_ok(), "column name containing keyword substring should be OK");
+    }
+
+    #[test]
+    fn sort_fragment_valid_complex_accepted() {
+        let input = quote! {
+            enum Sort {
+                #[sql("t.deadline ASC NULLS LAST, t.id ASC")]
+                Deadline,
+            }
+        };
+        let result = expand_sort_enum(TokenStream::new(), input);
+        assert!(result.is_ok(), "valid complex sort fragment should be accepted");
+    }
+
+    // --- Audit gap tests ---
+
+    // #109: Valid complex fragment: `created_at DESC NULLS LAST`
+    #[test]
+    fn sort_fragment_created_at_desc_nulls_last() {
+        let input = quote! {
+            enum Sort {
+                #[sql("created_at DESC NULLS LAST")]
+                CreatedAt,
+            }
+        };
+        let result = expand_sort_enum(TokenStream::new(), input);
+        assert!(result.is_ok(), "created_at DESC NULLS LAST should be accepted");
+    }
+
+    // #110: Fragment containing keyword substring: `updated_at ASC` accepted
+    #[test]
+    fn sort_fragment_updated_at_asc_not_confused_with_update() {
+        let input = quote! {
+            enum Sort {
+                #[sql("updated_at ASC")]
+                UpdatedAt,
+            }
+        };
+        let result = expand_sort_enum(TokenStream::new(), input);
+        assert!(result.is_ok(), "updated_at should not be confused with UPDATE keyword");
+    }
+
+    // Sort fragment with INSERT rejected
+    #[test]
+    fn sort_fragment_insert_rejected() {
+        let input = quote! {
+            enum Sort {
+                #[sql("INSERT INTO t VALUES (1)")]
+                Bad,
+            }
+        };
+        let result = expand_sort_enum(TokenStream::new(), input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("INSERT"), "should mention INSERT: {err}");
+    }
+
+    // Sort fragment with UPDATE as standalone word rejected
+    #[test]
+    fn sort_fragment_standalone_update_rejected() {
+        let input = quote! {
+            enum Sort {
+                #[sql("UPDATE t SET x = 1")]
+                Bad,
+            }
+        };
+        let result = expand_sort_enum(TokenStream::new(), input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("UPDATE"), "should mention UPDATE: {err}");
+    }
+
+    // Sort fragment with TRUNCATE rejected
+    #[test]
+    fn sort_fragment_truncate_rejected() {
+        let input = quote! {
+            enum Sort {
+                #[sql("TRUNCATE users")]
+                Bad,
+            }
+        };
+        let result = expand_sort_enum(TokenStream::new(), input);
+        assert!(result.is_err());
+    }
+
+    // Column name containing "execute" substring is accepted
+    #[test]
+    fn sort_fragment_execute_substring_in_column_accepted() {
+        let input = quote! {
+            enum Sort {
+                #[sql("executed_at DESC")]
+                ExecutedAt,
+            }
+        };
+        let result = expand_sort_enum(TokenStream::new(), input);
+        assert!(result.is_ok(), "executed_at should be accepted (EXECUTE is substring, not word)");
+    }
+
+    // Column name containing "created" substring is accepted
+    #[test]
+    fn sort_fragment_created_substring_accepted() {
+        let input = quote! {
+            enum Sort {
+                #[sql("created_by ASC")]
+                CreatedBy,
+            }
+        };
+        let result = expand_sort_enum(TokenStream::new(), input);
+        assert!(result.is_ok(), "created_by should be accepted");
+    }
+
+    // Column name "deleted_at" accepted (contains DELETE substring)
+    #[test]
+    fn sort_fragment_deleted_at_accepted() {
+        let input = quote! {
+            enum Sort {
+                #[sql("deleted_at DESC NULLS LAST")]
+                DeletedAt,
+            }
+        };
+        let result = expand_sort_enum(TokenStream::new(), input);
+        assert!(result.is_ok(), "deleted_at should be accepted (DELETE is substring, not standalone word)");
     }
 }

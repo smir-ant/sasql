@@ -109,7 +109,7 @@ impl Executor for Pool {
         let result = guard
             .query(sql, sql_hash, params, &mut arena)
             .await
-            .map_err(BsqlError::from)?;
+            .map_err(BsqlError::from_driver_query)?;
         Ok(OwnedResult::new(result, arena))
     }
 
@@ -132,7 +132,7 @@ impl Executor for Pool {
         guard
             .execute(sql, sql_hash, params)
             .await
-            .map_err(BsqlError::from)
+            .map_err(BsqlError::from_driver_query)
     }
 }
 
@@ -148,7 +148,7 @@ impl Executor for PoolConnection {
         let result = guard
             .query(sql, sql_hash, params, &mut arena)
             .await
-            .map_err(BsqlError::from)?;
+            .map_err(BsqlError::from_driver_query)?;
         Ok(OwnedResult::new(result, arena))
     }
 
@@ -171,7 +171,7 @@ impl Executor for PoolConnection {
         guard
             .execute(sql, sql_hash, params)
             .await
-            .map_err(BsqlError::from)
+            .map_err(BsqlError::from_driver_query)
     }
 }
 

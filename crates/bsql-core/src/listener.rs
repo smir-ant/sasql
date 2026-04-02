@@ -15,11 +15,21 @@
 //! `tokio::select!` to multiplex between:
 //!
 //! 1. **Commands** from the caller (listen/unlisten/notify) delivered via
-//!    an unbounded mpsc channel.
+//!    a bounded mpsc channel (capacity 64 — commands are rare).
 //! 2. **Notifications** from PostgreSQL read via `Connection::wait_for_notification()`,
 //!    forwarded to the caller through a bounded mpsc channel.
 //!
-//! This avoids splitting `&mut Connection` between two tasks.
+//! # Reconnection
+//!
+//! When the background task detects a connection loss, it attempts to
+//! reconnect with exponential backoff (100ms, 200ms, 400ms, ... up to 5s).
+//! On successful reconnect, all previously subscribed channels are
+//! re-subscribed automatically. A special notification with channel
+//! `"_bsql_reconnected"` is sent so the application knows some notifications
+//! may have been lost during the outage.
+
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 
@@ -27,6 +37,13 @@ use crate::error::{BsqlError, BsqlResult, ConnectError};
 
 /// Buffer capacity for the notification channel.
 const NOTIFICATION_BUFFER_SIZE: usize = 1024;
+
+/// Buffer capacity for the command channel. Commands (listen/unlisten/notify)
+/// are rare relative to notifications, so 64 slots is ample.
+const COMMAND_BUFFER_SIZE: usize = 64;
+
+/// PostgreSQL's maximum NOTIFY payload size in bytes.
+const PG_MAX_PAYLOAD_SIZE: usize = 7999;
 
 /// A notification received from PostgreSQL via LISTEN/NOTIFY.
 #[derive(Debug, Clone)]
@@ -57,6 +74,7 @@ enum Command {
         String,
         tokio::sync::oneshot::Sender<Result<(), bsql_driver::DriverError>>,
     ),
+    UnlistenAll(tokio::sync::oneshot::Sender<Result<(), bsql_driver::DriverError>>),
     Notify(
         String,
         tokio::sync::oneshot::Sender<Result<(), bsql_driver::DriverError>>,
@@ -67,6 +85,12 @@ enum Command {
 ///
 /// Created via [`Listener::connect`]. This is NOT a pooled connection --
 /// it opens a fresh TCP connection that persists for the listener's lifetime.
+///
+/// # Reconnection
+///
+/// On connection loss, the listener automatically reconnects with exponential
+/// backoff and re-subscribes to all channels. A notification on channel
+/// `"_bsql_reconnected"` is emitted after successful reconnection.
 ///
 /// # Example
 ///
@@ -82,9 +106,11 @@ enum Command {
 /// }
 /// ```
 pub struct Listener {
-    cmd_tx: mpsc::UnboundedSender<Command>,
+    cmd_tx: mpsc::Sender<Command>,
     rx: mpsc::Receiver<Notification>,
     _task_handle: tokio::task::JoinHandle<()>,
+    /// Tracked subscribed channels for reconnection.
+    channels: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Drop for Listener {
@@ -95,8 +121,14 @@ impl Drop for Listener {
 
 impl std::fmt::Debug for Listener {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let channel_count = self
+            .channels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
         f.debug_struct("Listener")
             .field("active", &!self._task_handle.is_finished())
+            .field("channels", &channel_count)
             .finish()
     }
 }
@@ -119,14 +151,22 @@ impl Listener {
             .map_err(|e| ConnectError::create(format!("listener connect failed: {e}")))?;
 
         let (notif_tx, rx) = mpsc::channel(NOTIFICATION_BUFFER_SIZE);
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_BUFFER_SIZE);
+        let channels: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
-        let handle = tokio::spawn(drive_listener(conn, cmd_rx, notif_tx));
+        let handle = tokio::spawn(drive_listener(
+            conn,
+            listener_config,
+            cmd_rx,
+            notif_tx,
+            Arc::clone(&channels),
+        ));
 
         Ok(Listener {
             cmd_tx,
             rx,
             _task_handle: handle,
+            channels,
         })
     }
 
@@ -142,7 +182,7 @@ impl Listener {
         }
         let quoted = quote_ident(channel)?;
         let sql = format!("LISTEN {quoted}");
-        self.send_command_listen(sql).await
+        self.send_command_listen(channel.to_owned(), sql).await
     }
 
     /// Unsubscribe from a named notification channel.
@@ -154,12 +194,26 @@ impl Listener {
         }
         let quoted = quote_ident(channel)?;
         let sql = format!("UNLISTEN {quoted}");
-        self.send_command_unlisten(sql).await
+        self.send_command_unlisten(channel.to_owned(), sql).await
     }
 
     /// Unsubscribe from all channels.
     pub async fn unlisten_all(&self) -> BsqlResult<()> {
-        self.send_command_unlisten("UNLISTEN *".to_owned()).await
+        // Clear the tracked set
+        self.channels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(Command::UnlistenAll(resp_tx))
+            .await
+            .map_err(|_| ConnectError::create("listener background task exited"))?;
+        resp_rx
+            .await
+            .map_err(|_| ConnectError::create("listener background task exited"))?
+            .map_err(BsqlError::from)
     }
 
     /// Receive the next notification.
@@ -174,6 +228,8 @@ impl Listener {
     }
 
     /// Send a NOTIFY on a channel with a payload.
+    ///
+    /// The payload must not exceed 7999 bytes (PostgreSQL's limit).
     pub async fn notify(&self, channel: &str, payload: &str) -> BsqlResult<()> {
         if channel.is_empty() {
             return Err(ConnectError::create(
@@ -185,6 +241,13 @@ impl Listener {
                 "NOTIFY payload must not contain null bytes",
             ));
         }
+        if payload.len() > PG_MAX_PAYLOAD_SIZE {
+            return Err(ConnectError::create(format!(
+                "NOTIFY payload exceeds PostgreSQL's {PG_MAX_PAYLOAD_SIZE}-byte limit \
+                 (got {} bytes)",
+                payload.len()
+            )));
+        }
         let quoted_channel = quote_ident(channel)?;
         let escaped_payload = payload.replace('\'', "''");
         let sql = format!("NOTIFY {quoted_channel}, '{escaped_payload}'");
@@ -192,35 +255,64 @@ impl Listener {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
             .send(Command::Notify(sql, resp_tx))
+            .await
             .map_err(|_| ConnectError::create("listener background task exited"))?;
         resp_rx
             .await
             .map_err(|_| ConnectError::create("listener background task exited"))?
             .map_err(BsqlError::from)
+    }
+
+    /// The set of currently subscribed channels.
+    pub fn subscribed_channels(&self) -> Vec<String> {
+        self.channels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// Send a LISTEN command to the background task and wait for the response.
-    async fn send_command_listen(&self, sql: String) -> BsqlResult<()> {
+    async fn send_command_listen(&self, channel: String, sql: String) -> BsqlResult<()> {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
             .send(Command::Listen(sql, resp_tx))
+            .await
             .map_err(|_| ConnectError::create("listener background task exited"))?;
-        resp_rx
+        let result = resp_rx
             .await
             .map_err(|_| ConnectError::create("listener background task exited"))?
-            .map_err(BsqlError::from)
+            .map_err(BsqlError::from);
+
+        if result.is_ok() {
+            self.channels
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(channel);
+        }
+        result
     }
 
     /// Send an UNLISTEN command to the background task and wait for the response.
-    async fn send_command_unlisten(&self, sql: String) -> BsqlResult<()> {
+    async fn send_command_unlisten(&self, channel: String, sql: String) -> BsqlResult<()> {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
             .send(Command::Unlisten(sql, resp_tx))
+            .await
             .map_err(|_| ConnectError::create("listener background task exited"))?;
-        resp_rx
+        let result = resp_rx
             .await
             .map_err(|_| ConnectError::create("listener background task exited"))?
-            .map_err(BsqlError::from)
+            .map_err(BsqlError::from);
+
+        if result.is_ok() {
+            self.channels
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&channel);
+        }
+        result
     }
 }
 
@@ -245,11 +337,20 @@ fn quote_ident(name: &str) -> BsqlResult<String> {
 
 /// Background task that owns the Connection and multiplexes between
 /// reading commands from the API and waiting for PostgreSQL notifications.
+///
+/// On connection loss, attempts reconnection with exponential backoff and
+/// re-subscribes to all tracked channels.
 async fn drive_listener(
     mut conn: bsql_driver::Connection,
-    mut cmd_rx: mpsc::UnboundedReceiver<Command>,
+    config: bsql_driver::Config,
+    mut cmd_rx: mpsc::Receiver<Command>,
     notif_tx: mpsc::Sender<Notification>,
+    channels: Arc<Mutex<HashSet<String>>>,
 ) {
+    /// Counter for dropped notifications (buffer full).
+    static DROPPED_NOTIFICATIONS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
     loop {
         tokio::select! {
             // Branch 1: Commands from the Listener API
@@ -263,6 +364,10 @@ async fn drive_listener(
                         let result = conn.simple_query(&sql).await;
                         let _ = resp.send(result);
                     }
+                    Some(Command::UnlistenAll(resp)) => {
+                        let result = conn.simple_query("UNLISTEN *").await;
+                        let _ = resp.send(result);
+                    }
                     Some(Command::Notify(sql, resp)) => {
                         let result = conn.simple_query(&sql).await;
                         let _ = resp.send(result);
@@ -274,15 +379,94 @@ async fn drive_listener(
             notif = conn.wait_for_notification() => {
                 match notif {
                     Ok((channel, payload)) => {
-                        // try_send: drop notification if buffer is full rather than
-                        // blocking the reader (which would prevent processing commands)
-                        let _ = notif_tx.try_send(Notification { channel, payload });
+                        if notif_tx.try_send(Notification { channel: channel.clone(), payload }).is_err() {
+                            let count = DROPPED_NOTIFICATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                            eprintln!(
+                                "bsql: notification buffer full, dropped notification on channel \
+                                 \"{channel}\" (total dropped: {count})"
+                            );
+                        }
                     }
-                    Err(_) => break, // Connection error, exit task
+                    Err(_) => {
+                        // Connection lost — attempt reconnection
+                        eprintln!("bsql: listener connection lost, attempting reconnect...");
+                        match reconnect_with_backoff(&config, &channels).await {
+                            Some(new_conn) => {
+                                conn = new_conn;
+                                // Notify application that reconnection occurred
+                                let _ = notif_tx.try_send(Notification {
+                                    channel: "_bsql_reconnected".to_owned(),
+                                    payload: "connection was lost and re-established; \
+                                              some notifications may have been missed"
+                                        .to_owned(),
+                                });
+                                eprintln!("bsql: listener reconnected successfully");
+                            }
+                            None => {
+                                eprintln!("bsql: listener reconnection failed, task exiting");
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         }
     }
+}
+
+/// Attempt to reconnect with exponential backoff: 100ms, 200ms, 400ms, ... up to 5s.
+/// Gives up after 10 consecutive failures.
+async fn reconnect_with_backoff(
+    config: &bsql_driver::Config,
+    channels: &Arc<Mutex<HashSet<String>>>,
+) -> Option<bsql_driver::Connection> {
+    let mut delay = std::time::Duration::from_millis(100);
+    let max_delay = std::time::Duration::from_secs(5);
+    let max_attempts = 10;
+
+    for attempt in 1..=max_attempts {
+        tokio::time::sleep(delay).await;
+
+        match bsql_driver::Connection::connect(config).await {
+            Ok(mut new_conn) => {
+                // Re-subscribe to all tracked channels
+                let channel_set = channels
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+
+                for channel in &channel_set {
+                    match quote_ident(channel) {
+                        Ok(quoted) => {
+                            let sql = format!("LISTEN {quoted}");
+                            if let Err(e) = new_conn.simple_query(&sql).await {
+                                eprintln!(
+                                    "bsql: failed to re-subscribe to channel \"{channel}\" \
+                                     after reconnect: {e}"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "bsql: failed to quote channel \"{channel}\" for \
+                                 re-subscribe: {e}"
+                            );
+                        }
+                    }
+                }
+
+                return Some(new_conn);
+            }
+            Err(e) => {
+                eprintln!(
+                    "bsql: listener reconnect attempt {attempt}/{max_attempts} failed: {e}"
+                );
+                delay = std::cmp::min(delay * 2, max_delay);
+            }
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -326,5 +510,49 @@ mod tests {
     fn quote_ident_rejects_null_bytes() {
         let result = quote_ident("chan\0nel");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn pg_max_payload_constant() {
+        assert_eq!(PG_MAX_PAYLOAD_SIZE, 7999);
+    }
+
+    // --- Audit gap tests ---
+
+    // #94: Notification payload > 7999 validation
+    // (This is validated in Listener::notify, which requires async + connection.
+    //  We test the constant and the quote_ident utility instead.)
+
+    // #95: quote_ident with various special characters
+    #[test]
+    fn quote_ident_with_backslash() {
+        assert_eq!(quote_ident("chan\\nel").unwrap(), "\"chan\\nel\"");
+    }
+
+    #[test]
+    fn quote_ident_with_single_quote() {
+        assert_eq!(quote_ident("it's").unwrap(), "\"it's\"");
+    }
+
+    #[test]
+    fn quote_ident_with_unicode() {
+        assert_eq!(quote_ident("channel_\u{00e9}").unwrap(), "\"channel_\u{00e9}\"");
+    }
+
+    #[test]
+    fn quote_ident_with_newline() {
+        assert_eq!(quote_ident("chan\nnel").unwrap(), "\"chan\nnel\"");
+    }
+
+    #[test]
+    fn quote_ident_with_tab() {
+        assert_eq!(quote_ident("chan\tnel").unwrap(), "\"chan\tnel\"");
+    }
+
+    #[test]
+    fn quote_ident_with_mixed_special() {
+        let result = quote_ident("a\"b'c;d").unwrap();
+        // Double quotes are doubled
+        assert_eq!(result, "\"a\"\"b'c;d\"");
     }
 }

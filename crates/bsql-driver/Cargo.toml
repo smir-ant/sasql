@@ -21,6 +21,11 @@ rapidhash = { workspace = true }
 simdutf8 = { version = "0.1", default-features = false, features = ["std"] }
 smallvec = { workspace = true }
 
+# TCP keepalive (FIX 25)
+socket2 = { version = "0.5", default-features = false }
+# Password zeroization (FIX 32) — already a transitive dep via crypto crates
+zeroize = { version = "1", default-features = false }
+
 # Auth
 sha2 = { version = "0.10", default-features = false }
 hmac = { version = "0.12", default-features = false }

@@ -61,7 +61,7 @@ pub async fn try_upgrade(
             let tls_stream = connector
                 .connect(server_name, tcp)
                 .await
-                .map_err(|e| DriverError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+                .map_err(|e| DriverError::Io(std::io::Error::other(e)))?;
 
             Ok(tls_stream)
         }

@@ -27,6 +27,20 @@ const STREAM_CHUNK_SIZE: i32 = 64;
 ///
 /// The `PoolGuard` is held until the stream is fully consumed or dropped.
 /// Rows are fetched in chunks of 64 via `Execute(max_rows=64)`.
+///
+/// # Usage
+///
+/// Use [`advance()`](QueryStream::advance) + [`next_row()`](QueryStream::next_row)
+/// for row-by-row async iteration:
+///
+/// ```rust,ignore
+/// let mut stream = pool.query_stream(sql, hash, &[]).await?;
+/// while stream.advance().await? {
+///     let row = stream.next_row().unwrap();
+///     let id: i32 = row.get_i32(0).unwrap();
+///     // decode before next advance() — row borrows from arena
+/// }
+/// ```
 pub struct QueryStream {
     /// Held to keep the connection alive while streaming.
     guard: Option<bsql_driver::PoolGuard>,
@@ -35,7 +49,9 @@ pub struct QueryStream {
     current_result: Option<QueryResult>,
     /// Position within the current chunk.
     position: usize,
-    /// Column descriptors (shared across all chunks).
+    /// Column descriptors (shared across all chunks via Arc).
+    /// Passed by reference to `QueryResult::from_parts` to avoid Arc
+    /// refcount increments per chunk.
     columns: Arc<[ColumnDesc]>,
     /// Whether all rows have been consumed from the server.
     finished: bool,
@@ -69,9 +85,12 @@ impl QueryStream {
         }
     }
 
-    /// Get the next row from the stream.
+    /// Get the next row from the current in-memory chunk.
     ///
-    /// Returns `None` when all rows have been consumed.
+    /// Returns `None` when the current chunk is exhausted. Call
+    /// [`fetch_next_chunk()`](QueryStream::fetch_next_chunk) to load more rows
+    /// from the server, or use [`try_next()`](QueryStream::try_next) which
+    /// handles chunk management automatically.
     ///
     /// Rows borrow from the arena, which is reset between chunks. Each row
     /// must be fully decoded (into owned types) before calling `next_row()`
@@ -91,6 +110,48 @@ impl QueryStream {
         // Current chunk exhausted — cannot fetch more synchronously.
         // The async fetch is done via `fetch_next_chunk()`.
         None
+    }
+
+    /// Ensure the current chunk has rows available for `next_row()`.
+    ///
+    /// If the current chunk is exhausted but more rows exist on the server,
+    /// fetches the next chunk. Returns `true` if rows are available (call
+    /// `next_row()` next), `false` if all rows have been consumed.
+    ///
+    /// This is the async complement to `next_row()`. Together they form
+    /// the primary iteration pattern:
+    ///
+    /// ```rust,ignore
+    /// while stream.advance().await? {
+    ///     let row = stream.next_row().unwrap();
+    ///     let id: i32 = row.get_i32(0).unwrap();
+    ///     // decode before next advance() — row borrows from arena
+    /// }
+    /// ```
+    pub async fn advance(&mut self) -> Result<bool, crate::error::BsqlError> {
+        // Fast path: current chunk still has rows
+        if let Some(ref result) = self.current_result {
+            if self.position < result.len() {
+                return Ok(true);
+            }
+        }
+
+        // Current chunk exhausted
+        if self.finished {
+            return Ok(false);
+        }
+
+        // Fetch the next chunk
+        self.fetch_next_chunk().await?;
+
+        // Check if the new chunk has rows
+        if let Some(ref result) = self.current_result {
+            if self.position < result.len() {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 
     /// Whether more rows might be available (either in the current chunk or
@@ -137,7 +198,7 @@ impl QueryStream {
             guard
                 .streaming_send_execute(STREAM_CHUNK_SIZE)
                 .await
-                .map_err(crate::error::BsqlError::from)?;
+                .map_err(crate::error::BsqlError::from_driver_query)?;
         }
 
         let num_cols = self.columns.len();
@@ -155,7 +216,7 @@ impl QueryStream {
         let more = guard
             .streaming_next_chunk(arena, &mut col_offsets)
             .await
-            .map_err(crate::error::BsqlError::from)?;
+            .map_err(crate::error::BsqlError::from_driver_query)?;
 
         if !more {
             self.finished = true;
@@ -168,10 +229,12 @@ impl QueryStream {
             return Ok(false);
         }
 
+        // Pass Arc::clone of columns. The Arc is shared across all chunks —
+        // this is a single refcount increment per chunk, not per row.
         self.current_result = Some(QueryResult::from_parts(
             col_offsets,
             num_cols,
-            self.columns.clone(),
+            Arc::clone(&self.columns),
             0,
         ));
         self.position = 0;
@@ -185,6 +248,11 @@ impl QueryStream {
             Some(ref result) => result.len().saturating_sub(self.position),
             None => 0,
         }
+    }
+
+    /// Column descriptors for the result set.
+    pub fn columns(&self) -> &[ColumnDesc] {
+        &self.columns
     }
 }
 
