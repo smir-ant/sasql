@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[lib]
+name = "bsql_bench"
+path = "src/lib.rs"
+
 [[bench]]
 name = "pg_fetch_one"
 harness = false

@@ -1,8 +1,12 @@
 //! SQLite connection pool — async wrapper over `bsql_driver_sqlite::pool::SqlitePool`.
 //!
 //! The driver pool uses dedicated OS threads and crossbeam channels. This
-//! wrapper provides an async-compatible API by spawning blocking tasks on
-//! tokio's blocking thread pool.
+//! wrapper provides an async-compatible API using `block_in_place` to avoid
+//! the overhead of spawning a new blocking task for each query. The crossbeam
+//! recv blocks for only microseconds (the dedicated thread processes the
+//! query and replies), so `block_in_place` is ideal here.
+//!
+//! Requires a multi-threaded tokio runtime.
 
 use std::sync::Arc;
 
@@ -82,6 +86,10 @@ impl SqlitePool {
     ///
     /// Routes to a reader thread in the pool. Returns the `QueryResult`
     /// and its associated `Arena`.
+    ///
+    /// Uses `block_in_place` instead of `spawn_blocking` to avoid task
+    /// creation overhead (~2-5us). The crossbeam channel recv blocks for
+    /// only microseconds while the dedicated thread processes the query.
     pub async fn query_readonly(
         &self,
         sql: &str,
@@ -90,18 +98,10 @@ impl SqlitePool {
     ) -> BsqlResult<(bsql_driver_sqlite::conn::QueryResult, bsql_arena::Arena)> {
         let pool = Arc::clone(&self.inner);
         let sql = sql.to_owned();
-        tokio::task::spawn_blocking(move || {
+        tokio::task::block_in_place(move || {
             pool.query_readonly(&sql, sql_hash, params)
                 .map_err(BsqlError::from_sqlite)
         })
-        .await
-        .map_err(|e| {
-            BsqlError::Query(crate::error::QueryError {
-                message: format!("SQLite task panicked: {e}").into(),
-                pg_code: None,
-                source: None,
-            })
-        })?
     }
 
     /// Execute a read-write query via the async wrapper.
@@ -113,18 +113,10 @@ impl SqlitePool {
     ) -> BsqlResult<(bsql_driver_sqlite::conn::QueryResult, bsql_arena::Arena)> {
         let pool = Arc::clone(&self.inner);
         let sql = sql.to_owned();
-        tokio::task::spawn_blocking(move || {
+        tokio::task::block_in_place(move || {
             pool.query_readwrite(&sql, sql_hash, params)
                 .map_err(BsqlError::from_sqlite)
         })
-        .await
-        .map_err(|e| {
-            BsqlError::Query(crate::error::QueryError {
-                message: format!("SQLite task panicked: {e}").into(),
-                pg_code: None,
-                source: None,
-            })
-        })?
     }
 
     /// Execute a write statement (INSERT/UPDATE/DELETE), return affected row count.
@@ -136,33 +128,17 @@ impl SqlitePool {
     ) -> BsqlResult<u64> {
         let pool = Arc::clone(&self.inner);
         let sql = sql.to_owned();
-        tokio::task::spawn_blocking(move || {
+        tokio::task::block_in_place(move || {
             pool.execute(&sql, sql_hash, params)
                 .map_err(BsqlError::from_sqlite)
         })
-        .await
-        .map_err(|e| {
-            BsqlError::Query(crate::error::QueryError {
-                message: format!("SQLite task panicked: {e}").into(),
-                pg_code: None,
-                source: None,
-            })
-        })?
     }
 
     /// Execute a simple SQL statement on the writer (PRAGMA, DDL).
     pub async fn simple_exec(&self, sql: &str) -> BsqlResult<()> {
         let pool = Arc::clone(&self.inner);
         let sql = sql.to_owned();
-        tokio::task::spawn_blocking(move || pool.simple_exec(&sql).map_err(BsqlError::from_sqlite))
-            .await
-            .map_err(|e| {
-                BsqlError::Query(crate::error::QueryError {
-                    message: format!("SQLite task panicked: {e}").into(),
-                    pg_code: None,
-                    source: None,
-                })
-            })?
+        tokio::task::block_in_place(move || pool.simple_exec(&sql).map_err(BsqlError::from_sqlite))
     }
 
     /// Begin a transaction on the writer connection.
@@ -171,17 +147,9 @@ impl SqlitePool {
     /// If dropped without committing, the transaction is automatically rolled back.
     pub async fn begin(&self) -> BsqlResult<SqliteTransaction> {
         let pool = Arc::clone(&self.inner);
-        tokio::task::spawn_blocking(move || {
+        tokio::task::block_in_place(move || {
             pool.begin_transaction().map_err(BsqlError::from_sqlite)
-        })
-        .await
-        .map_err(|e| {
-            BsqlError::Query(crate::error::QueryError {
-                message: format!("SQLite task panicked: {e}").into(),
-                pg_code: None,
-                source: None,
-            })
-        })??;
+        })?;
 
         Ok(SqliteTransaction {
             pool: Arc::clone(&self.inner),
@@ -202,20 +170,12 @@ impl SqlitePool {
         let pool = Arc::clone(&self.inner);
         let sql = sql.to_owned();
         let (first_result, first_arena, state, reader_idx) =
-            tokio::task::spawn_blocking(move || {
+            tokio::task::block_in_place(move || {
                 let (result, arena, state, idx) = pool
                     .query_streaming(&sql, sql_hash, params, chunk_size)
                     .map_err(BsqlError::from_sqlite)?;
                 Ok::<_, BsqlError>((result, arena, state, idx))
-            })
-            .await
-            .map_err(|e| {
-                BsqlError::Query(crate::error::QueryError {
-                    message: format!("SQLite task panicked: {e}").into(),
-                    pg_code: None,
-                    source: None,
-                })
-            })??;
+            })?;
 
         Ok(SqliteStreamingQuery {
             pool: Arc::clone(&self.inner),
@@ -272,17 +232,9 @@ impl SqliteTransaction {
     pub async fn commit(mut self) -> BsqlResult<()> {
         self.finished = true;
         let pool = Arc::clone(&self.pool);
-        tokio::task::spawn_blocking(move || {
+        tokio::task::block_in_place(move || {
             pool.commit_transaction().map_err(BsqlError::from_sqlite)
         })
-        .await
-        .map_err(|e| {
-            BsqlError::Query(crate::error::QueryError {
-                message: format!("SQLite task panicked: {e}").into(),
-                pg_code: None,
-                source: None,
-            })
-        })?
     }
 
     /// Explicitly roll back the transaction.
@@ -291,17 +243,9 @@ impl SqliteTransaction {
     pub async fn rollback(mut self) -> BsqlResult<()> {
         self.finished = true;
         let pool = Arc::clone(&self.pool);
-        tokio::task::spawn_blocking(move || {
+        tokio::task::block_in_place(move || {
             pool.rollback_transaction().map_err(BsqlError::from_sqlite)
         })
-        .await
-        .map_err(|e| {
-            BsqlError::Query(crate::error::QueryError {
-                message: format!("SQLite task panicked: {e}").into(),
-                pg_code: None,
-                source: None,
-            })
-        })?
     }
 
     /// Create a savepoint within the transaction.
@@ -311,15 +255,7 @@ impl SqliteTransaction {
         validate_savepoint_name(name)?;
         let pool = Arc::clone(&self.pool);
         let name = name.to_owned();
-        tokio::task::spawn_blocking(move || pool.savepoint(&name).map_err(BsqlError::from_sqlite))
-            .await
-            .map_err(|e| {
-                BsqlError::Query(crate::error::QueryError {
-                    message: format!("SQLite task panicked: {e}").into(),
-                    pg_code: None,
-                    source: None,
-                })
-            })?
+        tokio::task::block_in_place(move || pool.savepoint(&name).map_err(BsqlError::from_sqlite))
     }
 
     /// Release (destroy) a savepoint, keeping its effects.
@@ -327,18 +263,10 @@ impl SqliteTransaction {
         validate_savepoint_name(name)?;
         let pool = Arc::clone(&self.pool);
         let name = name.to_owned();
-        tokio::task::spawn_blocking(move || {
+        tokio::task::block_in_place(move || {
             pool.release_savepoint(&name)
                 .map_err(BsqlError::from_sqlite)
         })
-        .await
-        .map_err(|e| {
-            BsqlError::Query(crate::error::QueryError {
-                message: format!("SQLite task panicked: {e}").into(),
-                pg_code: None,
-                source: None,
-            })
-        })?
     }
 
     /// Roll back to a savepoint.
@@ -346,15 +274,7 @@ impl SqliteTransaction {
         validate_savepoint_name(name)?;
         let pool = Arc::clone(&self.pool);
         let name = name.to_owned();
-        tokio::task::spawn_blocking(move || pool.rollback_to(&name).map_err(BsqlError::from_sqlite))
-            .await
-            .map_err(|e| {
-                BsqlError::Query(crate::error::QueryError {
-                    message: format!("SQLite task panicked: {e}").into(),
-                    pg_code: None,
-                    source: None,
-                })
-            })?
+        tokio::task::block_in_place(move || pool.rollback_to(&name).map_err(BsqlError::from_sqlite))
     }
 
     /// Execute a write query within the transaction.
@@ -366,18 +286,10 @@ impl SqliteTransaction {
     ) -> BsqlResult<u64> {
         let pool = Arc::clone(&self.pool);
         let sql = sql.to_owned();
-        tokio::task::spawn_blocking(move || {
+        tokio::task::block_in_place(move || {
             pool.execute(&sql, sql_hash, params)
                 .map_err(BsqlError::from_sqlite)
         })
-        .await
-        .map_err(|e| {
-            BsqlError::Query(crate::error::QueryError {
-                message: format!("SQLite task panicked: {e}").into(),
-                pg_code: None,
-                source: None,
-            })
-        })?
     }
 
     /// Execute a query within the transaction (writer thread).
@@ -389,18 +301,10 @@ impl SqliteTransaction {
     ) -> BsqlResult<(bsql_driver_sqlite::conn::QueryResult, bsql_arena::Arena)> {
         let pool = Arc::clone(&self.pool);
         let sql = sql.to_owned();
-        tokio::task::spawn_blocking(move || {
+        tokio::task::block_in_place(move || {
             pool.query_readwrite(&sql, sql_hash, params)
                 .map_err(BsqlError::from_sqlite)
         })
-        .await
-        .map_err(|e| {
-            BsqlError::Query(crate::error::QueryError {
-                message: format!("SQLite task panicked: {e}").into(),
-                pg_code: None,
-                source: None,
-            })
-        })?
     }
 }
 
@@ -460,18 +364,10 @@ impl SqliteStreamingQuery {
 
         let pool = Arc::clone(&self.pool);
         let reader_idx = self.reader_idx;
-        let (result, arena, new_state) = tokio::task::spawn_blocking(move || {
+        let (result, arena, new_state) = tokio::task::block_in_place(move || {
             pool.streaming_next(state, reader_idx)
                 .map_err(BsqlError::from_sqlite)
-        })
-        .await
-        .map_err(|e| {
-            BsqlError::Query(crate::error::QueryError {
-                message: format!("SQLite task panicked: {e}").into(),
-                pg_code: None,
-                source: None,
-            })
-        })??;
+        })?;
 
         let has_rows = result.row_count > 0;
         self.current_result = Some(result);
@@ -565,7 +461,7 @@ mod tests {
 
     // --- Transaction tests ---
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn transaction_commit() {
         let path = temp_db_path();
         let pool = SqlitePool::connect(&path).unwrap();
@@ -604,7 +500,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn transaction_rollback() {
         let path = temp_db_path();
         let pool = SqlitePool::connect(&path).unwrap();
@@ -634,7 +530,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn transaction_savepoint() {
         let path = temp_db_path();
         let pool = SqlitePool::connect(&path).unwrap();
@@ -676,7 +572,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn transaction_drop_auto_rollback() {
         let path = temp_db_path();
         let pool = SqlitePool::connect(&path).unwrap();
@@ -711,7 +607,7 @@ mod tests {
 
     // --- Streaming tests ---
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn streaming_query() {
         let path = temp_db_path();
         let pool = SqlitePool::connect(&path).unwrap();

@@ -195,3 +195,13 @@ Collected 2026-04-03 on Apple M1 Pro. All times in microseconds unless noted.
   `target/criterion/report/index.html` for interactive charts.
 - The C and Go benchmarks run 1,000-10,000 iterations with `mach_absolute_time`
   (C) or `time.Now()` (Go) for nanosecond-precision timing.
+
+## Optimization flags
+
+- **Rust**: `cargo bench` uses `--release` by default (criterion). LTO and
+  codegen-units=1 are not set — these are the default release profile settings.
+- **C**: compiled with `-O3 -march=native` (see `c/Makefile`).
+- **Go**: default compiler optimizations. Go does not expose explicit `-O` flags;
+  the standard toolchain applies its own optimization passes.
+- **PostgreSQL**: version is whatever is installed locally (15.14 on the reference
+  machine). No special server tuning beyond defaults.
