@@ -364,6 +364,14 @@ pub fn generate_sort_query_code(
                 ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
                     self.fetch_optional(executor).await
                 }
+
+                /// Stream rows one by one. Alias for `fetch_stream`.
+                pub async fn stream(
+                    self,
+                    pool: &::bsql_core::Pool,
+                ) -> ::bsql_core::BsqlResult<#stream_name> {
+                    self.fetch_stream(pool).await
+                }
             }
         }
     } else {
@@ -696,9 +704,10 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
         TokenStream::new()
     };
 
-    // --- Simple API aliases (get/fetch/run/maybe) ---
+    // --- Simple API aliases (get/fetch/run/maybe/stream) ---
     let simple_api_fetch = if has_columns {
         let result_name = result_struct_name(parsed);
+        let stream_name = stream_struct_name(parsed);
 
         quote! {
             /// Fetch exactly one row. Alias for `fetch_one`.
@@ -723,6 +732,14 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
                 executor: &E,
             ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
                 self.fetch_optional(executor).await
+            }
+
+            /// Stream rows one by one. Alias for `fetch_stream`.
+            pub async fn stream(
+                self,
+                pool: &::bsql_core::Pool,
+            ) -> ::bsql_core::BsqlResult<#stream_name> {
+                self.fetch_stream(pool).await
             }
         }
     } else {
@@ -1018,9 +1035,10 @@ fn gen_dynamic_executor_impls(
         TokenStream::new()
     };
 
-    // --- Simple API aliases (get/fetch/run/maybe) ---
+    // --- Simple API aliases (get/fetch/run/maybe/stream) ---
     let simple_api_fetch = if has_columns {
         let result_name = result_struct_name(parsed);
+        let stream_name = stream_struct_name(parsed);
 
         quote! {
             /// Fetch exactly one row. Alias for `fetch_one`.
@@ -1045,6 +1063,14 @@ fn gen_dynamic_executor_impls(
                 executor: &E,
             ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
                 self.fetch_optional(executor).await
+            }
+
+            /// Stream rows one by one. Alias for `fetch_stream`.
+            pub async fn stream(
+                self,
+                pool: &::bsql_core::Pool,
+            ) -> ::bsql_core::BsqlResult<#stream_name> {
+                self.fetch_stream(pool).await
             }
         }
     } else {
@@ -2479,6 +2505,22 @@ mod tests {
             "missing fetch_optional: {code_str}"
         );
         assert!(code_str.contains("execute"), "missing execute: {code_str}");
+        // Simple API aliases
+        assert!(code_str.contains("fn get"), "missing get alias: {code_str}");
+        assert!(
+            // The `fetch` alias: look for `fn fetch <` or `fn fetch(` to avoid matching fetch_one/etc
+            code_str.contains("fn fetch <") || code_str.contains("fn fetch <"),
+            "missing fetch alias: {code_str}"
+        );
+        assert!(
+            code_str.contains("fn maybe"),
+            "missing maybe alias: {code_str}"
+        );
+        assert!(code_str.contains("fn run"), "missing run alias: {code_str}");
+        assert!(
+            code_str.contains("fn stream"),
+            "missing stream alias: {code_str}"
+        );
     }
 
     #[test]

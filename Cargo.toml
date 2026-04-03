@@ -38,8 +38,8 @@ rust_decimal = { version = "1", default-features = false, features = ["std"] }
 # Proc-macro optimization
 smallvec = { version = "1", default-features = false }
 
-# SQLite
-libsqlite3-sys = { version = "0.30", features = ["bundled"] }
+# SQLite  (no "bundled" — bsql-driver-sqlite adds it via its own `bundled` feature)
+libsqlite3-sys = { version = "0.30" }
 crossbeam-channel = "0.5"
 
 # Internal

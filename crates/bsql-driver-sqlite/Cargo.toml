@@ -7,6 +7,22 @@ license.workspace = true
 repository.workspace = true
 description = "SQLite driver for bsql — direct FFI, arena allocation, dedicated-thread pool"
 
+[features]
+default = ["bundled"]
+## Compile SQLite from source (default). Convenient — no system dependency needed.
+## The bundled build enables FTS5, RTREE, COLUMN_METADATA, and compiles with
+## SQLITE_THREADSAFE=1. For maximum speed, set the LIBSQLITE3_FLAGS env var to
+## tune the build, e.g.:
+##   LIBSQLITE3_FLAGS="-USQLITE_THREADSAFE -DSQLITE_THREADSAFE=0 \
+##     SQLITE_DEFAULT_MEMSTATUS=0 SQLITE_OMIT_DEPRECATED \
+##     SQLITE_LIKE_DOESNT_MATCH_BLOBS"
+bundled = ["libsqlite3-sys/bundled"]
+## Link against the system SQLite (e.g. Apple's optimized build on macOS).
+## Requires libsqlite3 headers and library available via pkg-config or system paths.
+## This typically yields 10-15% faster complex queries because system SQLite is
+## compiled with -O3 -march=native and without unused extension overhead.
+system = []
+
 [dependencies]
 bsql-arena = { workspace = true }
 libsqlite3-sys = { workspace = true }

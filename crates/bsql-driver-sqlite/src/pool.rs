@@ -1,8 +1,9 @@
 //! Synchronous connection pool — Mutex-guarded connections, WAL reader/writer split.
 //!
-//! SQLite connections are opened with `SQLITE_OPEN_FULLMUTEX` (serialized mode),
-//! making them safe to move between threads. The pool wraps each connection in
-//! a `std::sync::Mutex` to prevent interleaved `step()` calls.
+//! SQLite connections are opened with `SQLITE_OPEN_NOMUTEX` (multi-thread mode),
+//! disabling SQLite's internal serialization for maximum performance. The pool
+//! wraps each connection in a `std::sync::Mutex` to prevent interleaved `step()`
+//! calls — external serialization replaces SQLite's internal locking.
 //!
 //! # Architecture
 //!
@@ -572,6 +573,12 @@ impl SqlitePoolBuilder {
 
         // Open writer first (creates the database if needed, sets WAL mode)
         let writer = SqliteConnection::open(&path)?;
+
+        // Force WAL initialization: on some system SQLite builds (e.g. macOS 3.51+),
+        // read-only connections cannot open a WAL database until the WAL/SHM files
+        // are materialized on disk. Executing a trivial write-then-rollback forces
+        // SQLite to create these files before any reader connections open.
+        writer.exec("BEGIN IMMEDIATE; ROLLBACK")?;
 
         // Open readers
         let mut readers = Vec::with_capacity(reader_count);

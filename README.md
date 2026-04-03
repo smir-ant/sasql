@@ -22,7 +22,7 @@ let id = 42i32;
 // or `id` isn't an i32 -- this won't compile.
 let user = bsql::query!(
     "SELECT id, login, active FROM users WHERE id = $id: i32"
-).fetch_one(&pool).await?;
+).get(&pool).await?;
 
 // user.id: i32, user.login: String, user.active: bool
 // Types are inferred from the database schema. Nullable columns become Option<T>.
@@ -63,7 +63,7 @@ async fn main() -> Result<(), bsql::BsqlError> {
     let id = 1i32;
     let user = bsql::query!(
         "SELECT id, login, first_name FROM users WHERE id = $id: i32"
-    ).fetch_one(&pool).await?;
+    ).get(&pool).await?;
 
     println!("{} ({})", user.first_name, user.login);
     Ok(())
@@ -94,12 +94,12 @@ use bsql::SqlitePool;
 
 #[tokio::main]
 async fn main() -> Result<(), bsql::BsqlError> {
-    let pool = SqlitePool::connect("./myapp.db")?;
+    let pool = SqlitePool::open("./myapp.db")?;
 
     let id = 1i64;
     let user = bsql::query!(
         "SELECT id, login, active FROM users WHERE id = $id: i64"
-    ).fetch_one(&pool).await?;
+    ).get(&pool).await?;
 
     println!("{}: active={}", user.login, user.active);
     Ok(())
@@ -181,7 +181,7 @@ let tickets = bsql::query!(
     "SELECT id, title FROM tickets WHERE deleted_at IS NULL
      [AND department_id = $dept: Option<i64>]
      [AND assignee_id = $assignee: Option<i64>]"
-).fetch_all(&pool).await?;
+).fetch(&pool).await?;
 ```
 
 No string concatenation. No runtime SQL assembly. 2 optional clauses = 4 variants, all validated at compile time.
@@ -191,13 +191,14 @@ No string concatenation. No runtime SQL assembly. 2 optional clauses = 4 variant
 <details>
 <summary>Execution methods</summary>
 
-| Method | Returns | Use when |
-|---|---|---|
-| `.fetch_one(&pool)` | `T` | Exactly one row expected |
-| `.fetch_all(&pool)` | `Vec<T>` | All matching rows |
-| `.fetch_optional(&pool)` | `Option<T>` | Row might not exist |
-| `.fetch_stream(&pool)` | `impl Stream<Item = Result<T>>` | Large result sets, row-by-row processing |
-| `.execute(&pool)` | `u64` (affected rows) | INSERT/UPDATE/DELETE without RETURNING |
+| Method | Returns | Use when | Also available as |
+|---|---|---|---|
+| `.get(&pool)` | `T` | Exactly one row expected | `.fetch_one()` |
+| `.fetch(&pool)` | `Vec<T>` | All matching rows | `.fetch_all()` |
+| `.maybe(&pool)` | `Option<T>` | Row might not exist | `.fetch_optional()` |
+| `.stream(&pool)` | `impl Stream<Item = Result<T>>` | Large result sets, row-by-row processing | `.fetch_stream()` |
+| `.run(&pool)` | `u64` (affected rows) | INSERT/UPDATE/DELETE without RETURNING | `.execute()` |
+| `.defer(&tx)` | `()` | Buffer writes in a transaction pipeline | |
 
 </details>
 
@@ -224,7 +225,7 @@ If the transaction is dropped without calling `commit()`, it automatically rolls
 ```rust
 let mut stream = bsql::query!(
     "SELECT id, login FROM users"
-).fetch_stream(&pool);
+).stream(&pool).await?;
 
 while let Some(row) = stream.next().await {
     let user = row?;
@@ -287,7 +288,7 @@ Type-safe mapping between Rust enums and PostgreSQL enum types.
 ```rust
 let tickets = bsql::query!(
     "SELECT id, title FROM tickets ORDER BY $[sort: TicketSort] LIMIT $limit: i64"
-).fetch_all(&pool).await?;
+).fetch(&pool).await?;
 ```
 
 Each sort variant's SQL is validated at compile time. The enum is exhaustive -- no default case, no fallback.

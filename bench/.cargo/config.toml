@@ -1,0 +1,15 @@
+# Benchmark-specific Cargo configuration.
+#
+# Optimizes the bundled SQLite compilation for maximum speed:
+#   - SQLITE_THREADSAFE=0: omit internal mutexes (bsql serializes externally
+#     via Mutex<SqliteConnection>)
+#   - SQLITE_DEFAULT_MEMSTATUS=0: disable sqlite3_status() memory tracking
+#   - SQLITE_OMIT_DEPRECATED: remove deprecated APIs (smaller, faster code)
+#   - SQLITE_LIKE_DOESNT_MATCH_BLOBS: faster LIKE operator
+#
+# These flags are passed via LIBSQLITE3_FLAGS which libsqlite3-sys reads
+# during its build script. They APPEND to (and can override) the defaults
+# set by the bundled build (which includes SQLITE_THREADSAFE=1).
+
+[env]
+LIBSQLITE3_FLAGS = "-USQLITE_THREADSAFE -DSQLITE_THREADSAFE=0 -DSQLITE_DEFAULT_MEMSTATUS=0 -DSQLITE_OMIT_DEPRECATED -DSQLITE_LIKE_DOESNT_MATCH_BLOBS"

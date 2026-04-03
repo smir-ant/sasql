@@ -1,6 +1,6 @@
 //! Basic PostgreSQL operations with bsql.
 //!
-//! Demonstrates: Pool::connect, fetch_one, fetch_all, fetch_optional, execute.
+//! Demonstrates: Pool::connect, get, fetch, maybe, run.
 //!
 //! Requires a running PostgreSQL instance with a `users` table:
 //!   CREATE TABLE users (id SERIAL PRIMARY KEY, login TEXT NOT NULL, active BOOLEAN NOT NULL DEFAULT true);
@@ -21,27 +21,27 @@ async fn main() -> Result<(), BsqlError> {
     let _affected = bsql::query!(
         "INSERT INTO users (login) VALUES ($login: &str)"
     )
-    .execute(&pool)
+    .run(&pool) // also available: .execute(&pool)
     .await?;
     println!("Inserted user '{login}'");
 
     // --- SELECT one row ---
-    // fetch_one returns the row directly, or errors if 0 or 2+ rows match.
+    // get returns the row directly, or errors if 0 or 2+ rows match.
     let id = 1i32;
     let user = bsql::query!(
         "SELECT id, login, active FROM users WHERE id = $id: i32"
     )
-    .fetch_one(&pool)
+    .get(&pool) // also available: .fetch_one(&pool)
     .await?;
     println!("User: {} (id={}, active={})", user.login, user.id, user.active);
 
     // --- SELECT optional ---
-    // fetch_optional returns None if no rows match.
+    // maybe returns None if no rows match.
     let maybe_id = 9999i32;
     let maybe_user = bsql::query!(
         "SELECT id, login FROM users WHERE id = $maybe_id: i32"
     )
-    .fetch_optional(&pool)
+    .maybe(&pool) // also available: .fetch_optional(&pool)
     .await?;
     match maybe_user {
         Some(u) => println!("Found: {}", u.login),
@@ -50,7 +50,7 @@ async fn main() -> Result<(), BsqlError> {
 
     // --- SELECT all rows ---
     let users = bsql::query!("SELECT id, login FROM users")
-        .fetch_all(&pool)
+        .fetch(&pool) // also available: .fetch_all(&pool)
         .await?;
     println!("Total users: {}", users.len());
     for u in &users {
@@ -63,7 +63,7 @@ async fn main() -> Result<(), BsqlError> {
     let updated = bsql::query!(
         "UPDATE users SET login = $new_login: &str WHERE id = $target_id: i32"
     )
-    .execute(&pool)
+    .run(&pool) // also available: .execute(&pool)
     .await?;
     println!("Updated {updated} row(s)");
 
@@ -72,7 +72,7 @@ async fn main() -> Result<(), BsqlError> {
     let deleted = bsql::query!(
         "DELETE FROM users WHERE id = $delete_id: i32"
     )
-    .execute(&pool)
+    .run(&pool) // also available: .execute(&pool)
     .await?;
     println!("Deleted {deleted} row(s)");
 

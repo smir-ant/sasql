@@ -57,7 +57,7 @@ async fn main() -> Result<(), BsqlError> {
          ORDER BY created_at DESC
          LIMIT 50"
     )
-    .fetch_all(&pool)
+    .fetch(&pool) // also available: .fetch_all(&pool)
     .await?;
 
     println!("Found {} tickets for department 3:", tickets.len());
@@ -75,7 +75,7 @@ async fn main() -> Result<(), BsqlError> {
          ORDER BY $[sort: TicketSort]
          LIMIT $limit: i64"
     )
-    .fetch_all(&pool)
+    .fetch(&pool) // also available: .fetch_all(&pool)
     .await?;
 
     println!("\nTop {} tickets by priority:", limit);
@@ -97,7 +97,7 @@ async fn main() -> Result<(), BsqlError> {
          ORDER BY $[sort: TicketSort]
          LIMIT $limit: i64 OFFSET $offset: i64"
     )
-    .fetch_all(&pool)
+    .fetch(&pool) // also available: .fetch_all(&pool)
     .await?;
 
     println!("\nPage of high-priority tickets: {}", page.len());

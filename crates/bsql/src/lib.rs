@@ -36,7 +36,7 @@
 //!     //   let id = 1i32;
 //!     //   let user = bsql::query!(
 //!     //       "SELECT id, login, active FROM users WHERE id = $id: i32"
-//!     //   ).fetch_one(&pool).await?;
+//!     //   ).get(&pool).await?;
 //!     //
 //!     // The result struct has typed fields:
 //!     //   user.id: i32, user.login: String, user.active: bool
@@ -54,24 +54,14 @@
 //!
 //! ## Execution methods
 //!
-//! ### Simple API (recommended)
-//!
-//! | Method | Returns | Error if |
-//! |--------|---------|----------|
-//! | `.get(&pool)` | `T` | 0 rows, or 2+ rows |
-//! | `.fetch(&pool)` | `Vec<T>` | never (empty = empty vec) |
-//! | `.maybe(&pool)` | `Option<T>` | 2+ rows |
-//! | `.run(&pool)` | `u64` (affected rows) | never |
-//! | `.defer(&tx)` | `()` | pipeline error |
-//!
-//! ### Full API (same behavior, longer names)
-//!
-//! | Method | Returns | Error if |
-//! |--------|---------|----------|
-//! | `.fetch_one(&pool)` | `T` | 0 rows, or 2+ rows |
-//! | `.fetch_all(&pool)` | `Vec<T>` | never (empty = empty vec) |
-//! | `.fetch_optional(&pool)` | `Option<T>` | 2+ rows |
-//! | `.execute(&pool)` | `u64` (affected rows) | never |
+//! | Method | Returns | Error if | Also available as |
+//! |--------|---------|----------|-------------------|
+//! | `.get(&pool)` | `T` | 0 rows, or 2+ rows | `.fetch_one()` |
+//! | `.fetch(&pool)` | `Vec<T>` | never (empty = empty vec) | `.fetch_all()` |
+//! | `.maybe(&pool)` | `Option<T>` | 2+ rows | `.fetch_optional()` |
+//! | `.run(&pool)` | `u64` (affected rows) | never | `.execute()` |
+//! | `.defer(&tx)` | `()` | pipeline error | |
+//! | `.stream(&pool)` | `impl Stream<Item = Result<T>>` | never | `.fetch_stream()` |
 
 // Re-export the query! macro and attribute macros
 pub use bsql_macros::pg_enum;

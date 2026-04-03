@@ -28,13 +28,13 @@ async fn main() -> Result<(), BsqlError> {
     bsql::query!(
         "UPDATE accounts SET balance = balance - $amount: i32 WHERE id = $from_id: i32"
     )
-    .execute(&tx)
+    .run(&tx) // also available: .execute(&tx)
     .await?;
 
     bsql::query!(
         "UPDATE accounts SET balance = balance + $amount: i32 WHERE id = $to_id: i32"
     )
-    .execute(&tx)
+    .run(&tx) // also available: .execute(&tx)
     .await?;
 
     tx.commit().await?;
@@ -50,7 +50,7 @@ async fn main() -> Result<(), BsqlError> {
     bsql::query!(
         "UPDATE accounts SET balance = balance + $debit: i32 WHERE id = $account_id: i32"
     )
-    .execute(&tx)
+    .run(&tx) // also available: .execute(&tx)
     .await?;
 
     // Create a savepoint before the audit log insert.
@@ -63,7 +63,7 @@ async fn main() -> Result<(), BsqlError> {
         "INSERT INTO audit_log (account_id, delta, note)
          VALUES ($account_id: i32, $debit: i32, $note: &str)"
     )
-    .execute(&tx)
+    .run(&tx) // also available: .execute(&tx)
     .await;
 
     match audit_result {
@@ -86,7 +86,7 @@ async fn main() -> Result<(), BsqlError> {
     let account = bsql::query!(
         "SELECT id, name, balance FROM accounts WHERE id = $account_id: i32"
     )
-    .fetch_one(&tx)
+    .get(&tx) // also available: .fetch_one(&tx)
     .await?;
     println!(
         "Serializable read: account {} has balance {}",

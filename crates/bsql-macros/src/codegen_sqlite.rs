@@ -802,7 +802,7 @@ fn gen_executor_impls(
         }
     };
 
-    // --- Simple API aliases (get/fetch/run/maybe) ---
+    // --- Simple API aliases (get/fetch/run/maybe/stream) ---
     let simple_api_fetch = if has_columns {
         let result_name = result_struct_name(parsed);
 
@@ -846,6 +846,14 @@ fn gen_executor_impls(
                 pool: &::bsql_core::SqlitePool,
             ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
                 self.fetch_optional(pool)
+            }
+
+            /// Stream rows in chunks. Alias for `fetch_stream`.
+            pub fn stream(
+                self,
+                pool: &::bsql_core::SqlitePool,
+            ) -> ::bsql_core::BsqlResult<::bsql_core::SqliteStreamingQuery> {
+                self.fetch_stream(pool)
             }
         }
     } else {
@@ -1896,7 +1904,7 @@ fn gen_dynamic_executor_impls(
         }
     };
 
-    // --- Simple API aliases (get/fetch/run/maybe) ---
+    // --- Simple API aliases (get/fetch/run/maybe/stream) ---
     let simple_api_fetch = if has_columns {
         let result_name = result_struct_name(parsed);
 
@@ -1940,6 +1948,14 @@ fn gen_dynamic_executor_impls(
                 pool: &::bsql_core::SqlitePool,
             ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
                 self.fetch_optional(pool)
+            }
+
+            /// Stream rows in chunks. Alias for `fetch_stream`.
+            pub fn stream(
+                self,
+                pool: &::bsql_core::SqlitePool,
+            ) -> ::bsql_core::BsqlResult<::bsql_core::SqliteStreamingQuery> {
+                self.fetch_stream(pool)
             }
         }
     } else {

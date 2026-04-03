@@ -16,6 +16,10 @@ decimal = ["bsql-core/decimal", "bsql-macros/decimal"]
 explain = ["bsql-macros/explain"]
 tls = ["bsql-core/tls", "bsql-macros/tls"]
 sqlite = ["bsql-core/sqlite", "bsql-macros/sqlite", "dep:bsql-driver-sqlite"]
+## Compile SQLite from source (default for sqlite). Convenient, no system dep.
+sqlite-bundled = ["sqlite", "bsql-core/sqlite-bundled", "bsql-macros/sqlite-bundled", "bsql-driver-sqlite/bundled"]
+## Link against optimized system SQLite. Typically 10-15% faster for complex queries.
+sqlite-system = ["sqlite", "bsql-core/sqlite-system", "bsql-macros/sqlite-system", "bsql-driver-sqlite/system"]
 
 [dependencies]
 bsql-core = { workspace = true }

@@ -19,6 +19,8 @@ decimal = []
 explain = []
 tls = ["bsql-driver-postgres/tls"]
 sqlite = ["dep:bsql-driver-sqlite", "dep:libsqlite3-sys"]
+sqlite-bundled = ["sqlite", "bsql-driver-sqlite/bundled", "libsqlite3-sys/bundled"]
+sqlite-system = ["sqlite", "bsql-driver-sqlite/system"]
 
 [dependencies]
 syn = { workspace = true }

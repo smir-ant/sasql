@@ -70,12 +70,26 @@ impl SqlitePool {
     }
 
     /// Open a SQLite pool with default settings (4 reader connections).
+    ///
+    /// Alias: [`open`](Self::open) — same behavior, friendlier name for file-backed databases.
     pub fn connect(path: &str) -> BsqlResult<Self> {
         let inner =
             bsql_driver_sqlite::pool::SqlitePool::connect(path).map_err(BsqlError::from_sqlite)?;
         Ok(SqlitePool {
             inner: Arc::new(inner),
         })
+    }
+
+    /// Open a SQLite pool with default settings (4 reader connections).
+    ///
+    /// Identical to [`connect`](Self::connect). Provided because `open` reads
+    /// more naturally for file-backed databases:
+    ///
+    /// ```rust,ignore
+    /// let pool = SqlitePool::open("./data.db")?;
+    /// ```
+    pub fn open(path: &str) -> BsqlResult<Self> {
+        Self::connect(path)
     }
 
     /// Create a pool builder for custom configuration.
@@ -580,6 +594,20 @@ mod tests {
         let dir = std::env::temp_dir();
         let pid = std::process::id();
         format!("{}/bsql_test_sqlite_pool_{}_{}.db", dir.display(), pid, id)
+    }
+
+    // --- SqlitePool::open alias ---
+
+    #[test]
+    fn open_is_alias_for_connect() {
+        let path = temp_db_path();
+        let pool = SqlitePool::open(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+            .unwrap();
+        // Verify the pool is usable
+        assert_eq!(pool.reader_count(), 4);
+        pool.close();
+        let _ = std::fs::remove_file(&path);
     }
 
     // --- Transaction tests ---

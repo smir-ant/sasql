@@ -1,6 +1,6 @@
 //! Basic SQLite operations with bsql.
 //!
-//! Demonstrates: SqlitePool::connect, fetch_one, fetch_all, fetch_optional, execute.
+//! Demonstrates: SqlitePool::open, get, fetch, maybe, run.
 //!
 //! bsql validates SQLite queries at compile time against the real database file,
 //! just like it does for PostgreSQL. Same query! macro, same guarantees.
@@ -15,16 +15,16 @@ use bsql::{BsqlError, SqlitePool};
 
 #[tokio::main]
 async fn main() -> Result<(), BsqlError> {
-    // Connect to SQLite. The path is relative to the working directory.
+    // Open a SQLite pool. The path is relative to the working directory.
     // bsql automatically configures WAL mode, mmap, and page cache.
-    let pool = SqlitePool::connect("./myapp.db")?;
+    let pool = SqlitePool::open("./myapp.db")?; // also available: SqlitePool::connect("./myapp.db")
 
     // --- INSERT ---
     let login = "alice";
     let _affected = bsql::query!(
         "INSERT INTO users (login) VALUES ($login: &str)"
     )
-    .execute(&pool)
+    .run(&pool) // also available: .execute(&pool)
     .await?;
     println!("Inserted user '{login}'");
 
@@ -34,7 +34,7 @@ async fn main() -> Result<(), BsqlError> {
     let user = bsql::query!(
         "SELECT id, login, active FROM users WHERE id = $id: i64"
     )
-    .fetch_one(&pool)
+    .get(&pool) // also available: .fetch_one(&pool)
     .await?;
     println!("User: {} (id={}, active={})", user.login, user.id, user.active);
 
@@ -43,7 +43,7 @@ async fn main() -> Result<(), BsqlError> {
     let maybe_user = bsql::query!(
         "SELECT id, login FROM users WHERE id = $maybe_id: i64"
     )
-    .fetch_optional(&pool)
+    .maybe(&pool) // also available: .fetch_optional(&pool)
     .await?;
     match maybe_user {
         Some(u) => println!("Found: {}", u.login),
@@ -52,7 +52,7 @@ async fn main() -> Result<(), BsqlError> {
 
     // --- SELECT all ---
     let users = bsql::query!("SELECT id, login FROM users")
-        .fetch_all(&pool)
+        .fetch(&pool) // also available: .fetch_all(&pool)
         .await?;
     println!("Total users: {}", users.len());
     for u in &users {
@@ -65,7 +65,7 @@ async fn main() -> Result<(), BsqlError> {
     let updated = bsql::query!(
         "UPDATE users SET login = $new_login: &str WHERE id = $target_id: i64"
     )
-    .execute(&pool)
+    .run(&pool) // also available: .execute(&pool)
     .await?;
     println!("Updated {updated} row(s)");
 
@@ -74,7 +74,7 @@ async fn main() -> Result<(), BsqlError> {
     let deleted = bsql::query!(
         "DELETE FROM users WHERE id = $delete_id: i64"
     )
-    .execute(&pool)
+    .run(&pool) // also available: .execute(&pool)
     .await?;
     println!("Deleted {deleted} row(s)");
 
