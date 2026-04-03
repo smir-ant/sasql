@@ -44,25 +44,25 @@ Apple M1 Pro (10-core), 16 GB RAM, macOS Darwin 25.0.0, Rust 1.96.0-nightly, Go 
 
 ## Results
 
-Collected 2026-04-03. All times are median. Microseconds unless noted.
+Collected 2026-04-04. All times are median. Microseconds unless noted.
 
 ### PostgreSQL
 
 | Operation | bsql | C | Go (pgx) | diesel (Rust) | sqlx (Rust) |
 |---|---|---|---|---|---|
-| Single row by PK | **14.9 us** | 16.8 us | 31.7 us | 27.3 us | 62.3 us |
-| 10 rows | **24.4 us** | 31.9 us | 47.2 us | 36.2 us | 78.4 us |
-| 100 rows | **45.9 us** | 56.0 us | 81.3 us | 68.7 us | 116 us |
-| 1,000 rows | **288 us** | 338 us | 331 us | 475 us | 537 us |
-| 10,000 rows | **2.59 ms** | 3.17 ms | 2.65 ms | 4.53 ms | 4.32 ms |
-| Insert single row | 103 us | 99.0 us | 128 us | 99.5 us | 147 us |
-| Insert batch (100) | **876 us** | 2.06 ms | 3.36 ms | 2.88 ms | 2.80 ms |
-| Insert batch deferred (100) | **906 us** | — | — | — | — |
-| JOIN + aggregate | 24.1 ms | 25.5 ms | 25.4 ms | 23.1 ms | 23.3 ms |
-| Subquery | 74.5 us | 66.7 us | 97.1 us | 117 us | 154 us |
+| Single row by PK | **15.8 us** | 16.9 us | 34.9 us | 28.6 us | 59.6 us |
+| 10 rows | **25.9 us** | 28.0 us | 52.2 us | — | — |
+| 100 rows | **47.6 us** | 56.2 us | 87.0 us | — | — |
+| 1,000 rows | **277 us** | 351 us | 365 us | — | — |
+| 10,000 rows | **2.50 ms** | 3.22 ms | 3.04 ms | — | — |
+| Insert single row | 91.7 us | 86.0 us | 119 us | — | — |
+| Insert batch (100) | **864 us** | 2.02 ms | 3.67 ms | — | — |
+| Insert batch deferred (100) | **837 us** | — | — | — | — |
+| JOIN + aggregate | 24.9 ms | 25.4 ms | 25.4 ms | — | — |
+| Subquery | **64.6 us** | 70.3 us | 97.7 us | — | — |
 
 Note: "Insert batch (100)" for bsql uses execute_pipeline. "Insert batch deferred" uses defer_execute + commit auto-flush. Both are real production APIs.
-Note: C insert batch uses 100 separate PQexecPrepared calls in a transaction (no pipelining — libpq doesn't have built-in pipeline for this pattern).
+Note: C insert batch uses 100 separate PQexecPrepared calls in a transaction (no pipelining -- libpq doesn't have built-in pipeline for this pattern).
 
 These numbers use Unix domain socket connections, which eliminate network overhead and isolate library performance. See the TCP section below for network-included numbers.
 
@@ -70,16 +70,16 @@ These numbers use Unix domain socket connections, which eliminate network overhe
 
 | Operation | bsql | C | Go (go-sqlite3) | diesel (Rust) | sqlx (Rust) |
 |---|---|---|---|---|---|
-| Single row by PK | **1.36 us** | 3.24 us | 4.73 us | 2.94 us | 30.4 us |
-| 10 rows | **2.15 us** | 6.10 us | 10.3 us | 7.47 us | 47.9 us |
-| 100 rows | **10.1 us** | 15.1 us | 72.6 us | 33.2 us | 215 us |
-| 1,000 rows | **90.5 us** | 113 us | 689 us | 256 us | 1.85 ms |
-| 10,000 rows | **906 us** | 1.10 ms | 7.15 ms | 2.85 ms | 20.6 ms |
-| Insert single row | **20.5 us** | 42.8 us | 24.1 us | 57.8 us | 475 us |
-| Insert batch (100) | **1.21 ms** | 1.43 ms | 1.35 ms | 1.41 ms | 2.08 ms |
-| Insert batch optimized (100) | **1.21 ms** | — | — | — | — |
-| JOIN + aggregate | 23.8 ms | 20.7 ms | 25.3 ms | 24.6 ms | 25.9 ms |
-| Subquery | **32.2 us** | 44.2 us | 73.1 us | 46.4 us | 189 us |
+| Single row by PK | **1.74 us** | 2.51 us | 3.38 us | 2.94 us | 30.4 us |
+| 10 rows | **2.34 us** | 5.90 us | 10.4 us | 7.47 us | 47.9 us |
+| 100 rows | **9.85 us** | 15.7 us | 74.8 us | 33.2 us | 215 us |
+| 1,000 rows | **84.0 us** | 114 us | 699 us | 256 us | 1.85 ms |
+| 10,000 rows | **841 us** | 1.11 ms | 7.22 ms | 2.85 ms | 20.6 ms |
+| Insert single row | **20.5 us** | 32.8 us | 25.9 us | 57.8 us | 475 us |
+| Insert batch (100) | **1.25 ms** | 1.62 ms | 1.45 ms | 1.41 ms | 2.08 ms |
+| Insert batch optimized (100) | **1.29 ms** | — | — | — | — |
+| JOIN + aggregate | 21.7 ms | 21.1 ms | 25.9 ms | 24.6 ms | 25.9 ms |
+| Subquery | **30.1 us** | 44.6 us | 75.2 us | 46.4 us | 189 us |
 
 SQLite benchmarks use NOMUTEX mode (bsql's pool guarantees single-thread-per-connection access).
 
@@ -96,21 +96,22 @@ When connected via TCP instead of Unix domain socket, network round-trip adds la
 
 ### PostgreSQL
 
-- bsql is faster than C (libpq) on reads up to 1K rows. The sync connection path over Unix domain socket eliminates async runtime overhead entirely.
-- PG insert batch: bsql pipeline is 2.4x faster than C (876 us vs 2.06 ms) because C can't pipeline — libpq uses 100 separate PQexecPrepared calls in a transaction.
+- bsql is faster than C (libpq) on reads up to 10K rows. The sync connection path over Unix domain socket eliminates async runtime overhead entirely.
+- PG insert batch: bsql pipeline is 2.3x faster than C (864 us vs 2.02 ms) because C can't pipeline -- libpq uses 100 separate PQexecPrepared calls in a transaction.
+- PG subquery: bsql is 1.09x faster than C (64.6 us vs 70.3 us).
 - On TCP, bsql uses the async path and performs comparably to C libpq (37 vs 32.5 us for single-row).
-- bsql is 2-4x faster than sqlx across all read operations.
+- bsql is 2-4x faster than sqlx on single-row fetch (15.8 us vs 59.6 us).
 - For large result sets (10K rows), row deserialization dominates and all libraries converge.
-- JOIN + aggregate is query-engine-bound (~24 ms), similar across all libraries.
+- JOIN + aggregate is query-engine-bound (~25 ms), similar across all libraries.
 
 ### SQLite
 
-- bsql beats raw C sqlite3 on single-row fetch (1.36 us vs 3.24 us) due to zero-overhead sync path, NOMUTEX mode, IdentityHasher statement cache, and aggressive inlining.
-- SQLite insert single: bsql is 2.1x faster than C (20.5 us vs 42.8 us).
-- SQLite subquery: bsql is 1.4x faster than C (32.2 us vs 44.2 us).
-- bsql is faster than C for fetch operations up to 10K rows (906 us vs 1.10 ms).
-- bsql is 5-22x faster than sqlx across all SQLite operations.
-- Go (go-sqlite3) pays CGO overhead, making it 2-10x slower than C.
+- bsql beats raw C sqlite3 on single-row fetch (1.74 us vs 2.51 us) due to zero-overhead sync path, NOMUTEX mode, IdentityHasher statement cache, and aggressive inlining.
+- SQLite insert single: bsql is 1.6x faster than C (20.5 us vs 32.8 us).
+- SQLite subquery: bsql is 1.5x faster than C (30.1 us vs 44.6 us).
+- bsql is faster than C for fetch operations up to 10K rows (841 us vs 1.11 ms).
+- bsql is 5-24x faster than sqlx across all SQLite operations.
+- Go (go-sqlite3) pays CGO overhead, making it 2-9x slower than C.
 - JOIN + aggregate is query-engine-bound, similar across all libraries.
 
 ## Methodology
