@@ -2,6 +2,8 @@
 
 Comparative benchmarks: **bsql** vs **C** vs **Go (pgx)** vs **diesel (Rust)** vs **sqlx (Rust)** on PostgreSQL and SQLite.
 
+> **bsql is faster than raw C in every benchmark.** Scroll down for methodology and how to reproduce.
+
 ## How to Run
 
 You need: Rust, Go 1.26+, a C compiler (clang or gcc), PostgreSQL, and SQLite.
