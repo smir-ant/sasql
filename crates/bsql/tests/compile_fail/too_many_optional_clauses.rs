@@ -8,6 +8,8 @@ fn main() {
     let c6: Option<i32> = None;
     let c7: Option<i32> = None;
     let c8: Option<i32> = None;
+    let c9: Option<i32> = None;
+    let c10: Option<i32> = None;
     let _ = bsql::query!(
         "SELECT id FROM users WHERE 1=1
          [AND id = $c0: Option<i32>]
@@ -18,6 +20,8 @@ fn main() {
          [AND id = $c5: Option<i32>]
          [AND id = $c6: Option<i32>]
          [AND id = $c7: Option<i32>]
-         [AND id = $c8: Option<i32>]"
+         [AND id = $c8: Option<i32>]
+         [AND id = $c9: Option<i32>]
+         [AND id = $c10: Option<i32>]"
     );
 }
