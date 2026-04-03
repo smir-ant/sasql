@@ -1,9 +1,15 @@
 //! PostgreSQL connection — startup, authentication, statement cache, query execution.
 //!
-//! `Connection` owns a TCP (or TLS) stream and implements the extended query protocol
-//! with pipelining. Statements are cached by rapidhash of the SQL text. On first use,
-//! Parse+Describe+Bind+Execute+Sync are pipelined in one TCP write. On subsequent uses,
-//! only Bind+Execute+Sync are sent.
+//! `Connection` owns a TCP, TLS, or Unix domain socket stream and implements the
+//! extended query protocol with pipelining. Statements are cached by rapidhash of the
+//! SQL text. On first use, Parse+Describe+Bind+Execute+Sync are pipelined in one write.
+//! On subsequent uses, only Bind+Execute+Sync are sent.
+//!
+//! # Unix domain sockets
+//!
+//! When `Config::host` starts with `/`, the driver connects via Unix domain socket
+//! at `{host}/.s.PGSQL.{port}` (libpq convention). Use `?host=/tmp` in the connection
+//! URL to enable UDS. This avoids TCP overhead for localhost connections.
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
@@ -51,11 +57,13 @@ use crate::tls;
 
 // --- Stream abstraction ---
 
-/// The underlying stream type — either plain TCP or TLS.
+/// The underlying stream type — plain TCP, TLS, or Unix domain socket.
 enum Stream {
     Plain(TcpStream),
     #[cfg(feature = "tls")]
     Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+    #[cfg(unix)]
+    Unix(tokio::net::UnixStream),
 }
 
 impl Stream {
@@ -64,14 +72,22 @@ impl Stream {
             Stream::Plain(s) => s.write_all(buf).await,
             #[cfg(feature = "tls")]
             Stream::Tls(s) => s.write_all(buf).await,
+            #[cfg(unix)]
+            Stream::Unix(s) => s.write_all(buf).await,
         }
     }
 
+    #[expect(
+        dead_code,
+        reason = "kept for completeness; may be needed for non-TCP_NODELAY paths"
+    )]
     async fn flush(&mut self) -> std::io::Result<()> {
         match self {
             Stream::Plain(s) => s.flush().await,
             #[cfg(feature = "tls")]
             Stream::Tls(s) => s.flush().await,
+            #[cfg(unix)]
+            Stream::Unix(s) => s.flush().await,
         }
     }
 }
@@ -89,6 +105,8 @@ impl AsyncRead for StreamReader<'_> {
             Stream::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
             #[cfg(feature = "tls")]
             Stream::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_read(cx, buf),
+            #[cfg(unix)]
+            Stream::Unix(s) => std::pin::Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -139,6 +157,16 @@ impl Config {
     /// Parse a PostgreSQL connection URL.
     ///
     /// Format: `postgres://user:password@host:port/database?sslmode=prefer`
+    ///
+    /// # Unix domain sockets
+    ///
+    /// Use the `host` query parameter to specify a UDS directory (libpq convention):
+    /// ```text
+    /// postgres://user@localhost/dbname?host=/tmp
+    /// postgres:///dbname?host=/var/run/postgresql
+    /// ```
+    /// When `host` starts with `/`, the driver connects via Unix domain socket at
+    /// `{host}/.s.PGSQL.{port}` instead of TCP. TLS is skipped for UDS connections.
     pub fn from_url(url: &str) -> Result<Self, DriverError> {
         let url = url
             .strip_prefix("postgres://")
@@ -167,6 +195,7 @@ impl Config {
 
         let mut ssl = SslMode::Prefer;
         let mut statement_timeout_secs: u32 = 30;
+        let mut host_override: Option<String> = None;
         for param in params.split('&') {
             if param.is_empty() {
                 continue;
@@ -185,11 +214,21 @@ impl Config {
                 };
             } else if let Some(val) = param.strip_prefix("statement_timeout=") {
                 statement_timeout_secs = val.parse::<u32>().unwrap_or(30);
+            } else if let Some(val) = param.strip_prefix("host=") {
+                host_override = Some(url_decode(val)?);
             }
         }
 
+        // If ?host=/path was specified, override the URL hostname with it.
+        // This follows the libpq convention: host=/tmp means UDS.
+        let final_host = if let Some(h) = host_override {
+            h
+        } else {
+            url_decode(&host)?
+        };
+
         let config = Config {
-            host: url_decode(&host)?,
+            host: final_host,
             port,
             user: url_decode(user)?,
             password: url_decode(password)?,
@@ -220,6 +259,21 @@ impl Config {
             return Err(DriverError::Protocol("database cannot be empty".into()));
         }
         Ok(())
+    }
+
+    /// Returns `true` if the host is a Unix domain socket directory path.
+    ///
+    /// libpq convention: if `host` starts with `/`, the connection uses a
+    /// Unix domain socket at `{host}/.s.PGSQL.{port}`.
+    pub fn host_is_uds(&self) -> bool {
+        self.host.starts_with('/')
+    }
+
+    /// Returns the Unix domain socket path: `{host}/.s.PGSQL.{port}`.
+    ///
+    /// Only meaningful when [`host_is_uds()`](Self::host_is_uds) returns `true`.
+    pub fn uds_path(&self) -> String {
+        format!("{}/.s.PGSQL.{}", self.host, self.port)
     }
 }
 
@@ -419,9 +473,24 @@ pub struct Connection {
 
 impl Connection {
     /// Connect to PostgreSQL and complete the startup/auth handshake.
+    ///
+    /// When `config.host` starts with `/` (Unix domain socket directory),
+    /// connects via `UnixStream` at `{host}/.s.PGSQL.{port}` instead of TCP.
+    /// TCP_NODELAY and keepalive are skipped for UDS since they are TCP-only.
     pub async fn connect(config: &Config) -> Result<Self, DriverError> {
         // Config::from_url() already validates. Manual Config construction
         // should call validate() explicitly before passing to connect().
+
+        #[cfg(unix)]
+        if config.host_is_uds() {
+            let path = config.uds_path();
+            let unix = tokio::net::UnixStream::connect(&path)
+                .await
+                .map_err(DriverError::Io)?;
+            let stream = Stream::Unix(unix);
+            return Self::finish_connect(stream, config).await;
+        }
+
         let addr = format!("{}:{}", config.host, config.port);
         let tcp = TcpStream::connect(&addr).await.map_err(DriverError::Io)?;
 
@@ -458,6 +527,13 @@ impl Connection {
             SslMode::Prefer => Stream::Plain(tcp),
         };
 
+        Self::finish_connect(stream, config).await
+    }
+
+    /// Shared connection setup: build the `Connection`, run startup handshake,
+    /// validate server params, and set statement timeout. Called by both the
+    /// TCP and UDS paths in [`connect`].
+    async fn finish_connect(stream: Stream, config: &Config) -> Result<Self, DriverError> {
         let mut conn = Self {
             stream,
             read_buf: Vec::with_capacity(8192),
@@ -3315,5 +3391,130 @@ mod tests {
         assert_eq!(dr_bool, Some(in_bool));
         assert!((dr_f64.unwrap() - in_f64).abs() < 1e-15);
         assert_eq!(pos, data.len());
+    }
+
+    // --- Unix domain socket (UDS) tests ---
+
+    #[test]
+    fn config_host_is_uds_absolute_path() {
+        let cfg = Config {
+            host: "/tmp".into(),
+            port: 5432,
+            user: "user".into(),
+            password: "".into(),
+            database: "db".into(),
+            ssl: SslMode::Disable,
+            statement_timeout_secs: 30,
+        };
+        assert!(cfg.host_is_uds());
+        assert_eq!(cfg.uds_path(), "/tmp/.s.PGSQL.5432");
+    }
+
+    #[test]
+    fn config_host_is_uds_var_run() {
+        let cfg = Config {
+            host: "/var/run/postgresql".into(),
+            port: 5433,
+            user: "user".into(),
+            password: "".into(),
+            database: "db".into(),
+            ssl: SslMode::Disable,
+            statement_timeout_secs: 30,
+        };
+        assert!(cfg.host_is_uds());
+        assert_eq!(cfg.uds_path(), "/var/run/postgresql/.s.PGSQL.5433");
+    }
+
+    #[test]
+    fn config_host_is_not_uds_for_hostname() {
+        let cfg = Config {
+            host: "localhost".into(),
+            port: 5432,
+            user: "user".into(),
+            password: "".into(),
+            database: "db".into(),
+            ssl: SslMode::Disable,
+            statement_timeout_secs: 30,
+        };
+        assert!(!cfg.host_is_uds());
+    }
+
+    #[test]
+    fn config_host_is_not_uds_for_ip() {
+        let cfg = Config {
+            host: "127.0.0.1".into(),
+            port: 5432,
+            user: "user".into(),
+            password: "".into(),
+            database: "db".into(),
+            ssl: SslMode::Disable,
+            statement_timeout_secs: 30,
+        };
+        assert!(!cfg.host_is_uds());
+    }
+
+    #[test]
+    fn config_parse_uds_host_query_param() {
+        let cfg = Config::from_url("postgres://user@localhost/mydb?host=/tmp").unwrap();
+        assert_eq!(cfg.host, "/tmp");
+        assert!(cfg.host_is_uds());
+        assert_eq!(cfg.uds_path(), "/tmp/.s.PGSQL.5432");
+        assert_eq!(cfg.database, "mydb");
+        assert_eq!(cfg.user, "user");
+    }
+
+    #[test]
+    fn config_parse_uds_host_query_param_custom_port() {
+        let cfg = Config::from_url("postgres://user@localhost:5433/mydb?host=/var/run/postgresql")
+            .unwrap();
+        assert_eq!(cfg.host, "/var/run/postgresql");
+        assert_eq!(cfg.port, 5433);
+        assert_eq!(cfg.uds_path(), "/var/run/postgresql/.s.PGSQL.5433");
+    }
+
+    #[test]
+    fn config_parse_uds_host_with_other_params() {
+        let cfg = Config::from_url(
+            "postgres://user@localhost/db?host=/tmp&sslmode=disable&statement_timeout=60",
+        )
+        .unwrap();
+        assert_eq!(cfg.host, "/tmp");
+        assert!(cfg.host_is_uds());
+        assert_eq!(cfg.ssl, SslMode::Disable);
+        assert_eq!(cfg.statement_timeout_secs, 60);
+    }
+
+    #[test]
+    fn config_parse_uds_host_percent_encoded() {
+        // %2F = '/'
+        let cfg = Config::from_url("postgres://user@localhost/db?host=%2Ftmp").unwrap();
+        assert_eq!(cfg.host, "/tmp");
+        assert!(cfg.host_is_uds());
+    }
+
+    #[test]
+    fn config_parse_tcp_host_not_overridden_without_param() {
+        // No ?host= param: hostname from URL is used (TCP)
+        let cfg = Config::from_url("postgres://user@myserver/db").unwrap();
+        assert_eq!(cfg.host, "myserver");
+        assert!(!cfg.host_is_uds());
+    }
+
+    #[test]
+    fn config_parse_uds_host_overrides_url_hostname() {
+        // ?host= overrides even an explicit hostname
+        let cfg = Config::from_url("postgres://user@db.example.com/mydb?host=/var/run/postgresql")
+            .unwrap();
+        assert_eq!(cfg.host, "/var/run/postgresql");
+        assert!(cfg.host_is_uds());
+    }
+
+    #[test]
+    fn config_parse_uds_empty_url_host() {
+        // postgres:///dbname?host=/tmp — empty hostname before /, host from param
+        let cfg = Config::from_url("postgres://user@/mydb?host=/tmp").unwrap();
+        assert_eq!(cfg.host, "/tmp");
+        assert!(cfg.host_is_uds());
+        assert_eq!(cfg.database, "mydb");
     }
 }

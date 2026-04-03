@@ -38,7 +38,10 @@ The Go benchmarks use pgx/v5 and mattn/go-sqlite3 with prepared statements.
 createdb bench_db
 
 # Set the URL (used at both compile time and runtime)
+# TCP (default):
 export BENCH_DATABASE_URL=postgres://user:pass@localhost/bench_db
+# Unix domain socket (lower latency, less jitter — recommended for benchmarks):
+# export BENCH_DATABASE_URL="postgres://user@localhost/bench_db?host=/tmp"
 export BSQL_DATABASE_URL=$BENCH_DATABASE_URL
 
 # Seed tables and indexes
