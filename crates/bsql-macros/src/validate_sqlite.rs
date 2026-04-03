@@ -469,4 +469,62 @@ mod tests {
         drop(conn);
         let _ = std::fs::remove_file(&path);
     }
+
+    // --- pg_to_sqlite_params: additional edge cases ---
+
+    #[test]
+    fn convert_dollar_at_end_of_string() {
+        // Trailing $ without digits
+        assert_eq!(pg_to_sqlite_params("SELECT $"), "SELECT $");
+    }
+
+    #[test]
+    fn convert_dollar_followed_by_non_alnum() {
+        assert_eq!(pg_to_sqlite_params("SELECT $ FROM t"), "SELECT $ FROM t");
+    }
+
+    #[test]
+    fn convert_consecutive_params() {
+        assert_eq!(pg_to_sqlite_params("$1$2$3"), "?1?2?3");
+    }
+
+    #[test]
+    fn convert_param_in_string_context() {
+        // Not a real SQL parser — it converts all $N regardless of context
+        assert_eq!(pg_to_sqlite_params("'$1'"), "'?1'");
+    }
+
+    // --- validate_query_sqlite: edge cases ---
+
+    #[test]
+    fn validate_multiple_params() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (a INTEGER NOT NULL, b TEXT NOT NULL)")
+            .unwrap();
+
+        let parsed =
+            crate::parse::parse_query("SELECT a, b FROM t WHERE a = $a: i64 AND b = $b: &str")
+                .unwrap();
+        let result = validate_query_sqlite(&parsed, &mut conn).unwrap();
+        assert_eq!(result.columns.len(), 2);
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_empty_variants_errors() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+
+        let parsed = crate::parse::parse_query("SELECT 1").unwrap();
+        let result = validate_variants_sqlite(&[], &parsed, &mut conn);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("no variants to validate"), "error: {err}");
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
 }

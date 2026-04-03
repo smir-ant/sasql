@@ -223,3 +223,123 @@ where
         f(conn).map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))
     })
 }
+
+#[cfg(test)]
+#[cfg(feature = "sqlite")]
+mod tests {
+    use super::*;
+
+    // --- detect_backend_from_url ---
+
+    #[test]
+    fn detect_postgres_url() {
+        assert_eq!(
+            detect_backend_from_url("postgres://user:pass@localhost/db").unwrap(),
+            Backend::Postgres
+        );
+    }
+
+    #[test]
+    fn detect_postgresql_url() {
+        assert_eq!(
+            detect_backend_from_url("postgresql://user:pass@localhost/db").unwrap(),
+            Backend::Postgres
+        );
+    }
+
+    #[test]
+    fn detect_sqlite_url() {
+        assert_eq!(
+            detect_backend_from_url("sqlite:./test.db").unwrap(),
+            Backend::Sqlite
+        );
+    }
+
+    #[test]
+    fn detect_sqlite_memory_url() {
+        assert_eq!(
+            detect_backend_from_url("sqlite::memory:").unwrap(),
+            Backend::Sqlite
+        );
+    }
+
+    #[test]
+    fn detect_unknown_scheme_errors() {
+        let result = detect_backend_from_url("mysql://localhost/db");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("unrecognized database URL scheme"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn detect_empty_url_errors() {
+        let result = detect_backend_from_url("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn detect_http_url_errors() {
+        let result = detect_backend_from_url("http://localhost");
+        assert!(result.is_err());
+    }
+
+    // --- resolve_sqlite_path ---
+
+    #[test]
+    fn resolve_memory_path() {
+        assert_eq!(resolve_sqlite_path("sqlite::memory:").unwrap(), ":memory:");
+    }
+
+    #[test]
+    fn resolve_absolute_path() {
+        assert_eq!(
+            resolve_sqlite_path("sqlite:///tmp/test.db").unwrap(),
+            "/tmp/test.db"
+        );
+    }
+
+    #[test]
+    fn resolve_absolute_path_nested() {
+        assert_eq!(
+            resolve_sqlite_path("sqlite:///var/data/myapp/db.sqlite").unwrap(),
+            "/var/data/myapp/db.sqlite"
+        );
+    }
+
+    #[test]
+    fn resolve_relative_path() {
+        // CARGO_MANIFEST_DIR is set by cargo during `cargo test`
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR should be set during cargo test");
+        let result = resolve_sqlite_path("sqlite:./data/test.db").unwrap();
+        let expected = format!("{manifest_dir}/./data/test.db");
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn resolve_relative_path_no_dot() {
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR should be set during cargo test");
+        let result = resolve_sqlite_path("sqlite:data/test.db").unwrap();
+        let expected = format!("{manifest_dir}/data/test.db");
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn resolve_not_sqlite_url_errors() {
+        let result = resolve_sqlite_path("postgres://localhost/db");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("not a sqlite URL"), "error: {err}");
+    }
+
+    #[test]
+    fn resolve_empty_sqlite_prefix() {
+        // sqlite: with nothing after it resolves relative to CARGO_MANIFEST_DIR
+        let result = resolve_sqlite_path("sqlite:");
+        assert!(result.is_ok());
+    }
+}

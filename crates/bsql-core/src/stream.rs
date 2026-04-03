@@ -274,3 +274,185 @@ impl Drop for QueryStream {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bsql_driver_postgres::arena::acquire_arena;
+    use bsql_driver_postgres::{ColumnDesc, QueryResult};
+
+    /// Build a QueryResult with `num_rows` rows and the given columns.
+    /// Each cell is NULL (offset=0, len=-1) which is fine for structural tests.
+    fn make_result(num_rows: usize, columns: &Arc<[ColumnDesc]>) -> QueryResult {
+        let num_cols = columns.len();
+        let col_offsets = vec![(0usize, -1i32); num_rows * num_cols];
+        QueryResult::from_parts(col_offsets, num_cols, Arc::clone(columns), 0)
+    }
+
+    fn sample_columns(n: usize) -> Arc<[ColumnDesc]> {
+        (0..n)
+            .map(|i| ColumnDesc {
+                name: format!("col{i}").into(),
+                type_oid: 23,
+                type_size: 4,
+                table_oid: 0,
+                column_id: 0,
+            })
+            .collect::<Vec<_>>()
+            .into()
+    }
+
+    /// Build a QueryStream without a real PoolGuard.
+    /// guard=None means fetch_next_chunk will fail, but structural methods work.
+    fn make_stream(num_rows: usize, num_cols: usize, finished: bool) -> QueryStream {
+        let columns = sample_columns(num_cols);
+        let result = make_result(num_rows, &columns);
+        let arena = acquire_arena();
+        QueryStream {
+            guard: None,
+            arena: Some(arena),
+            current_result: Some(result),
+            position: 0,
+            columns,
+            finished,
+            needs_execute: !finished,
+        }
+    }
+
+    // --- next_row returns rows from buffer ---
+
+    #[test]
+    fn next_row_returns_rows() {
+        let mut stream = make_stream(3, 2, true);
+        assert!(stream.next_row().is_some());
+        assert!(stream.next_row().is_some());
+        assert!(stream.next_row().is_some());
+    }
+
+    #[test]
+    fn next_row_returns_none_when_exhausted() {
+        let mut stream = make_stream(2, 1, true);
+        assert!(stream.next_row().is_some());
+        assert!(stream.next_row().is_some());
+        assert!(stream.next_row().is_none());
+    }
+
+    #[test]
+    fn next_row_returns_none_for_empty_result() {
+        let mut stream = make_stream(0, 1, true);
+        assert!(stream.next_row().is_none());
+    }
+
+    // --- has_more ---
+
+    #[test]
+    fn has_more_true_when_rows_in_buffer() {
+        let stream = make_stream(2, 1, true);
+        assert!(stream.has_more());
+    }
+
+    #[test]
+    fn has_more_false_when_exhausted_and_finished() {
+        let mut stream = make_stream(1, 1, true);
+        let _ = stream.next_row();
+        assert!(!stream.has_more());
+    }
+
+    #[test]
+    fn has_more_true_when_exhausted_but_not_finished() {
+        let mut stream = make_stream(1, 1, false);
+        let _ = stream.next_row();
+        // Buffer exhausted but server may have more
+        assert!(stream.has_more());
+    }
+
+    // --- remaining ---
+
+    #[test]
+    fn remaining_full_buffer() {
+        let stream = make_stream(5, 2, true);
+        assert_eq!(stream.remaining(), 5);
+    }
+
+    #[test]
+    fn remaining_after_consuming() {
+        let mut stream = make_stream(3, 1, true);
+        let _ = stream.next_row();
+        assert_eq!(stream.remaining(), 2);
+        let _ = stream.next_row();
+        assert_eq!(stream.remaining(), 1);
+        let _ = stream.next_row();
+        assert_eq!(stream.remaining(), 0);
+    }
+
+    #[test]
+    fn remaining_empty_result() {
+        let stream = make_stream(0, 1, true);
+        assert_eq!(stream.remaining(), 0);
+    }
+
+    // --- columns ---
+
+    #[test]
+    fn columns_returns_descriptors() {
+        let stream = make_stream(1, 3, true);
+        let cols = stream.columns();
+        assert_eq!(cols.len(), 3);
+        assert_eq!(&*cols[0].name, "col0");
+        assert_eq!(&*cols[1].name, "col1");
+        assert_eq!(&*cols[2].name, "col2");
+    }
+
+    // --- finished flag ---
+
+    #[test]
+    fn finished_stream_has_more_false_after_drain() {
+        let mut stream = make_stream(1, 1, true);
+        let _ = stream.next_row();
+        assert!(!stream.has_more());
+    }
+
+    // --- fetch_next_chunk requires guard ---
+
+    #[tokio::test]
+    async fn fetch_next_chunk_without_guard_errors() {
+        let mut stream = make_stream(0, 1, false);
+        let result = stream.fetch_next_chunk().await;
+        assert!(result.is_err(), "should error without guard");
+    }
+
+    #[tokio::test]
+    async fn fetch_next_chunk_when_finished_returns_false() {
+        let mut stream = make_stream(0, 1, true);
+        let result = stream.fetch_next_chunk().await.unwrap();
+        assert!(!result, "finished stream should return false");
+    }
+
+    // --- advance ---
+
+    #[tokio::test]
+    async fn advance_returns_true_when_rows_available() {
+        let mut stream = make_stream(2, 1, true);
+        let has = stream.advance().await.unwrap();
+        assert!(has);
+    }
+
+    #[tokio::test]
+    async fn advance_returns_false_when_finished_and_exhausted() {
+        let mut stream = make_stream(1, 1, true);
+        let _ = stream.next_row(); // consume the one row
+        let has = stream.advance().await.unwrap();
+        assert!(!has);
+    }
+
+    // --- Drop releases arena ---
+
+    #[test]
+    fn drop_releases_arena() {
+        let stream = make_stream(3, 2, true);
+        drop(stream);
+        // If arena was released back to pool, acquire should succeed
+        let arena = acquire_arena();
+        bsql_driver_postgres::arena::release_arena(arena);
+    }
+}

@@ -628,3 +628,301 @@ pub fn validate_query_with_suggestions(
 // of individual ORDER BY fragments is not possible without a registry. The query
 // structure is validated with a dummy ORDER BY, but individual sort SQL fragments
 // are verified only at runtime. See sort_enum.rs doc comment for details.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse::Param;
+
+    // --- strip_option ---
+
+    #[test]
+    fn strip_option_wraps_i32() {
+        assert_eq!(strip_option("Option<i32>"), "i32");
+    }
+
+    #[test]
+    fn strip_option_no_change_plain_type() {
+        assert_eq!(strip_option("i32"), "i32");
+    }
+
+    #[test]
+    fn strip_option_nested() {
+        // Option<Option<i32>> -> Option<i32> (only strips outer)
+        assert_eq!(strip_option("Option<Option<i32>>"), "Option<i32>");
+    }
+
+    #[test]
+    fn strip_option_with_str() {
+        assert_eq!(strip_option("Option<&str>"), "&str");
+    }
+
+    #[test]
+    fn strip_option_with_string() {
+        assert_eq!(strip_option("Option<String>"), "String");
+    }
+
+    #[test]
+    fn strip_option_with_whitespace_strips_outer() {
+        // strip_option matches "Option<" prefix and ">" suffix regardless of inner content
+        assert_eq!(strip_option("Option< i32 >"), " i32 ");
+    }
+
+    #[test]
+    fn strip_option_empty_string() {
+        assert_eq!(strip_option(""), "");
+    }
+
+    #[test]
+    fn strip_option_prefix_only() {
+        // "Option<i32" without closing > should not strip
+        assert_eq!(strip_option("Option<i32"), "Option<i32");
+    }
+
+    // --- format_driver_error_base ---
+
+    #[test]
+    fn format_server_error_basic() {
+        let err = DriverError::Server {
+            code: "42P01".into(),
+            message: "relation \"users\" does not exist".into(),
+            detail: None,
+            hint: None,
+            position: None,
+        };
+        let msg = format_driver_error_base(&err);
+        assert!(msg.contains("relation \"users\" does not exist"));
+        assert!(msg.starts_with("PostgreSQL error:"));
+    }
+
+    #[test]
+    fn format_server_error_with_detail_and_hint() {
+        let err = DriverError::Server {
+            code: "42P01".into(),
+            message: "something went wrong".into(),
+            detail: Some("extra detail here".into()),
+            hint: Some("try this instead".into()),
+            position: None,
+        };
+        let msg = format_driver_error_base(&err);
+        assert!(msg.contains("something went wrong"));
+        assert!(msg.contains("detail: extra detail here"));
+        assert!(msg.contains("hint: try this instead"));
+    }
+
+    #[test]
+    fn format_server_error_with_position() {
+        let err = DriverError::Server {
+            code: "42601".into(),
+            message: "syntax error".into(),
+            detail: None,
+            hint: None,
+            position: Some(15),
+        };
+        let msg = format_driver_error_base(&err);
+        assert!(msg.contains("at position 15"));
+    }
+
+    #[test]
+    fn format_non_server_error() {
+        let err = DriverError::Pool("connection lost".into());
+        let msg = format_driver_error_base(&err);
+        assert!(msg.contains("PostgreSQL error:"));
+        assert!(msg.contains("connection lost"));
+    }
+
+    // --- format_driver_error (includes SQL) ---
+
+    #[test]
+    fn format_driver_error_includes_sql() {
+        let err = DriverError::Server {
+            code: "42P01".into(),
+            message: "relation does not exist".into(),
+            detail: None,
+            hint: None,
+            position: None,
+        };
+        let parsed = crate::parse::parse_query("SELECT id FROM users WHERE id = $id: i32").unwrap();
+        let msg = format_driver_error(&err, &parsed);
+        assert!(msg.contains("SQL:"), "should include SQL in error: {msg}");
+        assert!(msg.contains("$1"), "should include positional SQL: {msg}");
+    }
+
+    #[test]
+    fn format_driver_error_includes_position_marker() {
+        let err = DriverError::Server {
+            code: "42601".into(),
+            message: "syntax error".into(),
+            detail: None,
+            hint: None,
+            position: Some(8),
+        };
+        let parsed = crate::parse::parse_query("SELECT id FROM users WHERE id = $id: i32").unwrap();
+        let msg = format_driver_error(&err, &parsed);
+        assert!(msg.contains('^'), "should include position marker: {msg}");
+    }
+
+    // --- check_params_against_pg ---
+
+    #[test]
+    fn check_params_count_mismatch() {
+        let params = vec![Param {
+            name: "id".into(),
+            rust_type: "i32".into(),
+            position: 1,
+        }];
+        // PG expects 2 params but we declared 1
+        let pg_oids = [23u32, 25u32]; // int4, text
+        let pg_enum = [false, false];
+        let result = check_params_against_pg(&params, &pg_oids, &pg_enum, false, "");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("parameter count mismatch"), "error: {err}");
+    }
+
+    #[test]
+    fn check_params_count_mismatch_with_context() {
+        let params = vec![];
+        let pg_oids = [23u32];
+        let pg_enum = [false];
+        let result =
+            check_params_against_pg(&params, &pg_oids, &pg_enum, false, "variant (mask 0b0011)");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("variant (mask 0b0011)"),
+            "should include context: {err}"
+        );
+    }
+
+    #[test]
+    fn check_params_type_mismatch() {
+        let params = vec![Param {
+            name: "id".into(),
+            rust_type: "&str".into(), // declared &str
+            position: 1,
+        }];
+        let pg_oids = [23u32]; // PG expects int4
+        let pg_enum = [false];
+        let result = check_params_against_pg(&params, &pg_oids, &pg_enum, false, "");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("type mismatch"),
+            "should mention type mismatch: {err}"
+        );
+    }
+
+    #[test]
+    fn check_params_matching_types_ok() {
+        let params = vec![Param {
+            name: "id".into(),
+            rust_type: "i32".into(),
+            position: 1,
+        }];
+        let pg_oids = [23u32]; // int4
+        let pg_enum = [false];
+        let result = check_params_against_pg(&params, &pg_oids, &pg_enum, false, "");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_params_empty_ok() {
+        let params: Vec<Param> = vec![];
+        let pg_oids: [u32; 0] = [];
+        let pg_enum: [bool; 0] = [];
+        let result = check_params_against_pg(&params, &pg_oids, &pg_enum, false, "");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_params_enum_with_str_ok() {
+        let params = vec![Param {
+            name: "status".into(),
+            rust_type: "&str".into(),
+            position: 1,
+        }];
+        let pg_oids = [99999u32]; // some custom enum OID
+        let pg_enum = [true];
+        let result = check_params_against_pg(&params, &pg_oids, &pg_enum, false, "");
+        assert!(result.is_ok(), "enum param with &str should be accepted");
+    }
+
+    #[test]
+    fn check_params_enum_with_string_ok() {
+        let params = vec![Param {
+            name: "status".into(),
+            rust_type: "String".into(),
+            position: 1,
+        }];
+        let pg_oids = [99999u32];
+        let pg_enum = [true];
+        let result = check_params_against_pg(&params, &pg_oids, &pg_enum, false, "");
+        assert!(result.is_ok(), "enum param with String should be accepted");
+    }
+
+    #[test]
+    fn check_params_enum_with_i32_error() {
+        let params = vec![Param {
+            name: "status".into(),
+            rust_type: "i32".into(),
+            position: 1,
+        }];
+        let pg_oids = [99999u32];
+        let pg_enum = [true];
+        let result = check_params_against_pg(&params, &pg_oids, &pg_enum, false, "");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("cannot be used for PostgreSQL enum"),
+            "should reject i32 for enum: {err}"
+        );
+    }
+
+    #[test]
+    fn check_params_enum_with_custom_type_ok() {
+        // Unknown type (likely a #[pg_enum] user type) should be accepted
+        let params = vec![Param {
+            name: "status".into(),
+            rust_type: "MyStatusEnum".into(),
+            position: 1,
+        }];
+        let pg_oids = [99999u32];
+        let pg_enum = [true];
+        let result = check_params_against_pg(&params, &pg_oids, &pg_enum, false, "");
+        assert!(result.is_ok(), "custom enum type should be accepted");
+    }
+
+    #[test]
+    fn check_params_strip_option_in_variant_mode() {
+        // In variant mode (strip_option_wrapper=true), Option<i32> -> i32
+        let params = vec![Param {
+            name: "id".into(),
+            rust_type: "Option<i32>".into(),
+            position: 1,
+        }];
+        let pg_oids = [23u32]; // int4
+        let pg_enum = [false];
+        let result = check_params_against_pg(&params, &pg_oids, &pg_enum, true, "variant");
+        assert!(
+            result.is_ok(),
+            "Option<i32> stripped to i32 should match int4"
+        );
+    }
+
+    #[test]
+    fn check_params_strip_option_mismatch() {
+        let params = vec![Param {
+            name: "id".into(),
+            rust_type: "Option<&str>".into(),
+            position: 1,
+        }];
+        let pg_oids = [23u32]; // int4
+        let pg_enum = [false];
+        let result = check_params_against_pg(&params, &pg_oids, &pg_enum, true, "variant");
+        assert!(
+            result.is_err(),
+            "Option<&str> stripped to &str should not match int4"
+        );
+    }
+}

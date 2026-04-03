@@ -211,3 +211,116 @@ impl Executor for Transaction {
         self.execute_inner(sql, sql_hash, params).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bsql_driver_postgres::arena::{acquire_arena, release_arena};
+    use bsql_driver_postgres::{ColumnDesc, QueryResult};
+    use std::sync::Arc;
+
+    /// Helper: build an OwnedResult with `n` rows and `num_cols` columns.
+    /// Each column offset entry is a dummy (0, 0) pair — sufficient for
+    /// testing len/is_empty/row-count without decoding real data.
+    fn make_owned_result(num_rows: usize, num_cols: usize) -> OwnedResult {
+        let arena = acquire_arena();
+        let cols: Arc<[ColumnDesc]> = (0..num_cols)
+            .map(|i| ColumnDesc {
+                name: format!("c{i}").into(),
+                type_oid: 23, // int4
+                type_size: 4,
+                table_oid: 0,
+                column_id: 0,
+            })
+            .collect::<Vec<_>>()
+            .into();
+
+        let col_offsets: Vec<(usize, i32)> = vec![(0, -1); num_rows * num_cols]; // NULL columns
+        let result = QueryResult::from_parts(col_offsets, num_cols, cols, 0);
+        OwnedResult::new(result, arena)
+    }
+
+    // --- OwnedResult::new ---
+
+    #[test]
+    fn owned_result_new_zero_rows() {
+        let owned = make_owned_result(0, 2);
+        assert_eq!(owned.len(), 0);
+        assert!(owned.is_empty());
+    }
+
+    #[test]
+    fn owned_result_new_single_row() {
+        let owned = make_owned_result(1, 3);
+        assert_eq!(owned.len(), 1);
+        assert!(!owned.is_empty());
+    }
+
+    #[test]
+    fn owned_result_new_multiple_rows() {
+        let owned = make_owned_result(5, 2);
+        assert_eq!(owned.len(), 5);
+        assert!(!owned.is_empty());
+    }
+
+    // --- OwnedResult::row ---
+
+    #[test]
+    fn owned_result_row_access() {
+        let owned = make_owned_result(3, 2);
+        // Should not panic for valid indices
+        let _r0 = owned.row(0);
+        let _r1 = owned.row(1);
+        let _r2 = owned.row(2);
+    }
+
+    #[test]
+    #[should_panic]
+    fn owned_result_row_out_of_bounds_panics() {
+        let owned = make_owned_result(2, 1);
+        let _r = owned.row(2); // out of bounds
+    }
+
+    // --- OwnedResult::iter ---
+
+    #[test]
+    fn owned_result_iter_count() {
+        let owned = make_owned_result(4, 2);
+        let count = owned.iter().count();
+        assert_eq!(count, 4);
+    }
+
+    #[test]
+    fn owned_result_iter_empty() {
+        let owned = make_owned_result(0, 2);
+        let count = owned.iter().count();
+        assert_eq!(count, 0);
+    }
+
+    // --- OwnedResult::Drop releases arena back to pool ---
+
+    #[test]
+    fn owned_result_drop_releases_arena() {
+        // Acquire an arena, wrap it in OwnedResult, drop it.
+        // After drop, acquiring should succeed (arena was returned to pool).
+        let owned = make_owned_result(1, 1);
+        drop(owned);
+        // If the arena was released, we can acquire again without issue.
+        let arena = acquire_arena();
+        release_arena(arena);
+    }
+
+    // --- OwnedResult with zero columns ---
+
+    #[test]
+    fn owned_result_zero_columns() {
+        // Commands like INSERT without RETURNING have 0 columns
+        let arena = acquire_arena();
+        let cols: Arc<[ColumnDesc]> = Arc::from(Vec::new());
+        let result = QueryResult::from_parts(vec![], 0, cols, 42);
+        let owned = OwnedResult::new(result, arena);
+        assert_eq!(owned.len(), 0);
+        assert!(owned.is_empty());
+        assert_eq!(owned.result.affected_rows(), 42);
+    }
+}

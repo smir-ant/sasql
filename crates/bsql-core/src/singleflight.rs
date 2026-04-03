@@ -193,4 +193,206 @@ mod tests {
         let k2 = Singleflight::compute_key(456, &[]);
         assert_ne!(k1, k2);
     }
+
+    // --- compute_key with actual params ---
+
+    #[test]
+    fn compute_key_same_params_same_key() {
+        let a = 42i32;
+        let b = 42i32;
+        let k1 = Singleflight::compute_key(100, &[&a]);
+        let k2 = Singleflight::compute_key(100, &[&b]);
+        assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn compute_key_different_params_different_key() {
+        let a = 42i32;
+        let b = 99i32;
+        let k1 = Singleflight::compute_key(100, &[&a]);
+        let k2 = Singleflight::compute_key(100, &[&b]);
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn compute_key_different_sql_same_params_different_key() {
+        let a = 42i32;
+        let k1 = Singleflight::compute_key(100, &[&a]);
+        let k2 = Singleflight::compute_key(200, &[&a]);
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn compute_key_null_param_handling() {
+        // Option<i32> = None encodes as NULL
+        let null_val: Option<i32> = None;
+        let some_val: Option<i32> = Some(42);
+        let k1 = Singleflight::compute_key(100, &[&null_val]);
+        let k2 = Singleflight::compute_key(100, &[&some_val]);
+        assert_ne!(k1, k2, "NULL and Some(42) should produce different keys");
+    }
+
+    #[test]
+    fn compute_key_two_nulls_same_key() {
+        let a: Option<i32> = None;
+        let b: Option<i32> = None;
+        let k1 = Singleflight::compute_key(100, &[&a]);
+        let k2 = Singleflight::compute_key(100, &[&b]);
+        assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn compute_key_multiple_params() {
+        let a = 1i32;
+        let b = "hello";
+        let k1 = Singleflight::compute_key(100, &[&a, &b]);
+        let k2 = Singleflight::compute_key(100, &[&a, &b]);
+        assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn compute_key_param_order_matters() {
+        let a = 1i32;
+        let b = 2i32;
+        let k1 = Singleflight::compute_key(100, &[&a, &b]);
+        let k2 = Singleflight::compute_key(100, &[&b, &a]);
+        assert_ne!(k1, k2);
+    }
+
+    // --- FlightLeader::complete broadcasts result ---
+
+    #[tokio::test]
+    async fn leader_complete_broadcasts_to_follower() {
+        let sf = Singleflight::new();
+
+        let leader = match sf.try_join(42) {
+            FlightResult::Leader(l) => l,
+            _ => panic!("expected leader"),
+        };
+
+        let mut rx = match sf.try_join(42) {
+            FlightResult::Follower(rx) => rx,
+            _ => panic!("expected follower"),
+        };
+
+        let err = BsqlError::from(bsql_driver_postgres::DriverError::Pool("test".into()));
+        leader.complete(&sf, Arc::new(Err(err)));
+
+        let received = rx.recv().await.unwrap();
+        assert!(received.is_err());
+    }
+
+    // --- Multiple followers receive same result ---
+
+    #[tokio::test]
+    async fn multiple_followers_receive_result() {
+        let sf = Singleflight::new();
+
+        let leader = match sf.try_join(42) {
+            FlightResult::Leader(l) => l,
+            _ => panic!("expected leader"),
+        };
+
+        let mut rx1 = match sf.try_join(42) {
+            FlightResult::Follower(rx) => rx,
+            _ => panic!("expected follower 1"),
+        };
+        let mut rx2 = match sf.try_join(42) {
+            FlightResult::Follower(rx) => rx,
+            _ => panic!("expected follower 2"),
+        };
+
+        let err = BsqlError::from(bsql_driver_postgres::DriverError::Pool("done".into()));
+        leader.complete(&sf, Arc::new(Err(err)));
+
+        let r1 = rx1.recv().await.unwrap();
+        let r2 = rx2.recv().await.unwrap();
+        assert!(r1.is_err());
+        assert!(r2.is_err());
+    }
+
+    // --- Drop leader without completing -> key stays in map ---
+
+    #[test]
+    fn drop_leader_without_complete_key_stays_in_map() {
+        let sf = Singleflight::new();
+
+        let leader = match sf.try_join(42) {
+            FlightResult::Leader(l) => l,
+            _ => panic!("expected leader"),
+        };
+
+        // Drop leader without calling complete.
+        // The in-flight map still holds the broadcast sender (cloned on insert),
+        // so the key is NOT removed. New joiners become followers.
+        drop(leader);
+
+        // A new try_join for the same key should still produce a follower
+        // (the entry is still in the map).
+        let result = sf.try_join(42);
+        assert!(
+            matches!(result, FlightResult::Follower(_)),
+            "key should still be in map after leader drop without complete"
+        );
+    }
+
+    // --- Concurrent stress test ---
+
+    #[tokio::test]
+    async fn concurrent_stress_test() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::task;
+
+        let sf = Arc::new(Singleflight::new());
+        let leader_count = Arc::new(AtomicUsize::new(0));
+        let follower_count = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+
+        // 10 tasks, 5 unique keys (2 tasks per key)
+        for i in 0..10 {
+            let sf = Arc::clone(&sf);
+            let leaders = Arc::clone(&leader_count);
+            let followers = Arc::clone(&follower_count);
+            let key = (i % 5) as u64;
+
+            handles.push(task::spawn(async move {
+                match sf.try_join(key) {
+                    FlightResult::Leader(leader) => {
+                        leaders.fetch_add(1, Ordering::Relaxed);
+                        // Complete immediately
+                        let err = BsqlError::from(bsql_driver_postgres::DriverError::Pool(
+                            "stress".into(),
+                        ));
+                        leader.complete(&sf, Arc::new(Err(err)));
+                    }
+                    FlightResult::Follower(_rx) => {
+                        followers.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let total = leader_count.load(Ordering::Relaxed) + follower_count.load(Ordering::Relaxed);
+        assert_eq!(total, 10, "all 10 tasks should participate");
+        // At least 5 leaders (one per unique key)
+        assert!(
+            leader_count.load(Ordering::Relaxed) >= 5,
+            "should have at least 5 leaders (one per key)"
+        );
+    }
+
+    // --- Default trait ---
+
+    #[test]
+    fn singleflight_default() {
+        let sf = Singleflight::default();
+        // Should be able to use it
+        let result = sf.try_join(1);
+        assert!(matches!(result, FlightResult::Leader(_)));
+    }
 }

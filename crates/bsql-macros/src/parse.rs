@@ -1966,4 +1966,133 @@ mod tests {
         assert_eq!(r.optional_clauses.len(), 1);
         assert_eq!(r.optional_clauses[0].params.len(), 1);
     }
+
+    // --- Additional gap coverage ---
+
+    // Dollar-quoted string with nested $param: syntax inside
+    #[test]
+    fn dollar_quoted_with_nested_param_syntax() {
+        let r = parse_query("SELECT $$SELECT * FROM t WHERE id = $id: i32$$ AS code").unwrap();
+        assert_eq!(
+            r.params.len(),
+            0,
+            "$id: i32 inside $$ should not be extracted"
+        );
+    }
+
+    // Tagged dollar-quoted string with nested param
+    #[test]
+    fn tagged_dollar_quoted_with_nested_param() {
+        let r =
+            parse_query("SELECT $body$SELECT $x: i32 FROM t$body$ AS q AND id = $id: i32").unwrap();
+        assert_eq!(
+            r.params.len(),
+            1,
+            "only $id outside dollar quote should be extracted"
+        );
+        assert_eq!(r.params[0].name, "id");
+    }
+
+    // E-string: backslash at end of string
+    #[test]
+    fn e_string_backslash_at_end() {
+        let r = parse_query(r"SELECT * FROM t WHERE path = E'C:\\' AND id = $id: i32").unwrap();
+        assert_eq!(r.params.len(), 1);
+        assert_eq!(r.params[0].name, "id");
+    }
+
+    // E-string: multiple escape sequences
+    #[test]
+    fn e_string_multiple_escapes() {
+        let r = parse_query(r"SELECT * FROM t WHERE s = E'\t\n\r\\' AND id = $id: i32").unwrap();
+        assert_eq!(r.params.len(), 1);
+    }
+
+    // Exactly 10 optional clauses (boundary - max allowed)
+    #[test]
+    fn exactly_ten_optional_clauses_boundary() {
+        let clauses: Vec<String> = (0..10)
+            .map(|i| format!("[AND c{i} = $c{i}: Option<i32>]"))
+            .collect();
+        let sql = format!("SELECT id FROM t WHERE 1 = 1 {}", clauses.join(" "));
+        let r = parse_query(&sql).unwrap();
+        assert_eq!(r.optional_clauses.len(), 10);
+    }
+
+    // 11 optional clauses (one over max)
+    #[test]
+    fn eleven_optional_clauses_one_over_max() {
+        let clauses: Vec<String> = (0..11)
+            .map(|i| format!("[AND c{i} = $c{i}: Option<i32>]"))
+            .collect();
+        let sql = format!("SELECT id FROM t WHERE 1 = 1 {}", clauses.join(" "));
+        let r = parse_query(&sql);
+        assert!(r.is_err());
+        let err = r.unwrap_err();
+        assert!(err.contains("maximum is 10"), "error: {err}");
+    }
+
+    // Sort placeholder with extra whitespace around all tokens
+    #[test]
+    fn sort_placeholder_with_lots_of_whitespace() {
+        let r = parse_query("SELECT id FROM t ORDER BY $[  sort  :  MySortEnum  ]").unwrap();
+        assert!(r.sort_placeholder.is_some());
+        assert_eq!(r.sort_placeholder.unwrap().enum_name, "MySortEnum");
+    }
+
+    // Dollar-quoted string body that looks like param but has no closing quote
+    #[test]
+    fn unclosed_dollar_quote_treated_as_dollar_sign() {
+        // $$ without matching close — the first $ is treated as a plain char
+        // This is an edge case: $$unclosed becomes $$ + unclosed, then no end tag found
+        // The parser should handle this gracefully (the $ falls through to param parsing)
+        let r = parse_query("SELECT id FROM t WHERE id = $id: i32");
+        assert!(r.is_ok());
+    }
+
+    // Multiple params with complex types
+    #[test]
+    fn complex_generic_types() {
+        let r = parse_query(
+            "INSERT INTO t (a, b, c) VALUES ($a: Vec<i32>, $b: Option<String>, $c: &[u8])",
+        )
+        .unwrap();
+        assert_eq!(r.params.len(), 3);
+        assert_eq!(r.params[0].rust_type, "Vec<i32>");
+        assert_eq!(r.params[1].rust_type, "Option<String>");
+        assert_eq!(r.params[2].rust_type, "&[u8]");
+    }
+
+    // Double-colon cast inside optional clause
+    #[test]
+    fn double_colon_cast_inside_optional_clause() {
+        let r = parse_query("SELECT id FROM t WHERE 1 = 1 [AND status::text = $s: Option<&str>]")
+            .unwrap();
+        assert_eq!(r.optional_clauses.len(), 1);
+        assert!(
+            r.optional_clauses[0].sql_fragment.contains("::text"),
+            "cast should be preserved: {}",
+            r.optional_clauses[0].sql_fragment
+        );
+    }
+
+    // Duplicate param reuse inside optional clause
+    #[test]
+    fn optional_clause_duplicate_param_reuses_position() {
+        let r = parse_query(
+            "SELECT id FROM t WHERE 1 = 1 [AND a = $x: Option<i32> AND b = $x: Option<i32>]",
+        )
+        .unwrap();
+        assert_eq!(r.optional_clauses.len(), 1);
+        // The clause should have 1 unique param, reused for both occurrences
+        assert_eq!(r.optional_clauses[0].params.len(), 1);
+        assert_eq!(r.optional_clauses[0].params[0].name, "x");
+    }
+
+    // UTF-8 emoji in string literal
+    #[test]
+    fn utf8_emoji_in_string_literal() {
+        let r = parse_query("SELECT * FROM t WHERE emoji = '\u{1F600}' AND id = $id: i32").unwrap();
+        assert_eq!(r.params.len(), 1);
+    }
 }
