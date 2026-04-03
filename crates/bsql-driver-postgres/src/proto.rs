@@ -267,6 +267,19 @@ pub fn write_execute(buf: &mut Vec<u8>, portal: &str, max_rows: i32) {
     buf.extend_from_slice(&max_rows.to_be_bytes());
 }
 
+/// Pre-built Execute(portal="", max_rows=0) + Sync message pair.
+///
+/// This is the most common suffix for non-streaming pipelines. Using a constant
+/// avoids two function calls and their per-field length calculations on every query.
+///
+/// Layout:
+///   Execute: 'E' [len=9: i32 BE] [portal="" NUL] [max_rows=0: i32 BE]
+///   Sync:    'S' [len=4: i32 BE]
+pub const EXECUTE_SYNC: &[u8] = &[
+    b'E', 0, 0, 0, 9, 0, 0, 0, 0, 0, // Execute(portal="", max_rows=0)
+    b'S', 0, 0, 0, 4, // Sync
+];
+
 /// Sync message — marks the end of a message pipeline.
 ///
 /// Causes PG to close the implicit transaction (if outside BEGIN) and destroy
@@ -908,6 +921,14 @@ mod tests {
         let mut buf = Vec::new();
         write_execute(&mut buf, "", 0);
         assert_eq!(buf[0], b'E');
+    }
+
+    #[test]
+    fn execute_sync_constant_matches_functions() {
+        let mut buf = Vec::new();
+        write_execute(&mut buf, "", 0);
+        write_sync(&mut buf);
+        assert_eq!(buf.as_slice(), EXECUTE_SYNC);
     }
 
     #[test]

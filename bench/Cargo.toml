@@ -44,6 +44,7 @@ harness = false
 # bsql (local, with features)
 bsql = { path = "../crates/bsql", features = ["time", "uuid", "sqlite"] }
 bsql-core = { path = "../crates/bsql-core", features = ["sqlite"] }
+bsql-driver-postgres = { path = "../crates/bsql-driver-postgres" }
 tokio = { version = "1", features = ["full"] }
 
 # sqlx (PostgreSQL + SQLite)

@@ -19,6 +19,19 @@ fn bench_pg_fetch_many(c: &mut Criterion) {
     // -- bsql pool --
     let bsql_pool = rt.block_on(async { bsql::Pool::connect(&url).await.unwrap() });
 
+    // -- bsql direct connection (no pool, same as C/Go) --
+    let sql_direct = "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $1";
+    let sql_hash = bsql_driver_postgres::hash_sql(sql_direct);
+    let mut bsql_conn = rt.block_on(async {
+        let config = bsql_driver_postgres::Config::from_url(&url).unwrap();
+        let mut conn = bsql_driver_postgres::Connection::connect(&config)
+            .await
+            .unwrap();
+        // Pre-prepare statement so benchmark iterations only send Bind+Execute+Sync
+        conn.prepare_only(sql_direct, sql_hash).await.unwrap();
+        conn
+    });
+
     // -- sqlx pool --
     let sqlx_pool = rt.block_on(async { sqlx::PgPool::connect(&url).await.unwrap() });
 
@@ -37,6 +50,14 @@ fn bench_pg_fetch_many(c: &mut Criterion) {
         .unwrap();
     });
     rt.block_on(async {
+        let n_param: i64 = 10;
+        let params: &[&(dyn bsql_driver_postgres::Encode + Sync)] = &[&n_param];
+        bsql_conn
+            .for_each_raw(sql_direct, sql_hash, params, |_data| Ok(()))
+            .await
+            .unwrap();
+    });
+    rt.block_on(async {
         let _rows: Vec<(i32, String, String, bool, f64)> = sqlx::query_as(
             "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $1",
         )
@@ -51,7 +72,7 @@ fn bench_pg_fetch_many(c: &mut Criterion) {
     let mut group = c.benchmark_group("pg_fetch_many");
 
     for &n in row_counts {
-        // -- bsql (for_each — fastest path, zero arena allocation) --
+        // -- bsql (for_each via pool — measures pool + mutex + query) --
         group.bench_with_input(BenchmarkId::new("bsql", n), &n, |b, &n| {
             b.to_async(&rt).iter(|| async {
                 let n = n;
@@ -61,6 +82,24 @@ fn bench_pg_fetch_many(c: &mut Criterion) {
                 .for_each(&bsql_pool, |_row| Ok(()))
                 .await
                 .unwrap();
+            });
+        });
+
+        // -- bsql_direct (no pool, same as C/Go — raw connection) --
+        group.bench_with_input(BenchmarkId::new("bsql_direct", n), &n, |b, &n| {
+            let n_param: i64 = n;
+            b.iter_custom(|iters| {
+                rt.block_on(async {
+                    let start = std::time::Instant::now();
+                    for _ in 0..iters {
+                        let params: &[&(dyn bsql_driver_postgres::Encode + Sync)] = &[&n_param];
+                        bsql_conn
+                            .for_each_raw(sql_direct, sql_hash, params, |_data| Ok(()))
+                            .await
+                            .unwrap();
+                    }
+                    start.elapsed()
+                })
             });
         });
 

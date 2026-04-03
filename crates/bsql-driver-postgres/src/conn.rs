@@ -1025,8 +1025,7 @@ impl Connection {
                 None
             };
 
-            proto::write_execute(&mut self.write_buf, "", 0);
-            proto::write_sync(&mut self.write_buf);
+            self.write_buf.extend_from_slice(proto::EXECUTE_SYNC);
             self.flush_write().await?;
 
             cols
@@ -1039,8 +1038,7 @@ impl Connection {
             proto::write_describe(&mut self.write_buf, b'S', &name);
             proto::write_bind_params(&mut self.write_buf, "", &name, params);
 
-            proto::write_execute(&mut self.write_buf, "", 0);
-            proto::write_sync(&mut self.write_buf);
+            self.write_buf.extend_from_slice(proto::EXECUTE_SYNC);
             self.flush_write().await?;
 
             self.expect_message(|m| matches!(m, BackendMessage::ParseComplete))
