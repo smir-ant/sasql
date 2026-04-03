@@ -54,3 +54,11 @@ diesel = { version = "2", features = ["postgres", "sqlite"] }
 
 # Benchmarking
 criterion = { version = "0.5", features = ["async_tokio"] }
+
+# Maximum optimization — cross-crate inlining is critical for bsql
+# because the hot path spans bsql-driver-sqlite (ffi.rs StmtHandle methods)
+# and the benchmark crate (closure in for_each).
+[profile.bench]
+codegen-units = 1
+lto = "fat"
+opt-level = 3

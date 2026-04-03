@@ -114,6 +114,7 @@ impl SqlitePool {
     /// Fetch exactly one row via direct decode — zero arena overhead.
     ///
     /// The `decode` closure reads columns directly from the stepped statement.
+    #[inline]
     pub fn fetch_one_direct<F, T>(
         &self,
         sql: &str,
@@ -133,6 +134,7 @@ impl SqlitePool {
     }
 
     /// Fetch zero or one row via direct decode — zero arena overhead.
+    #[inline]
     pub fn fetch_optional_direct<F, T>(
         &self,
         sql: &str,
@@ -155,6 +157,7 @@ impl SqlitePool {
     ///
     /// The `decode` closure reads columns directly from the stepped statement
     /// for each row. This is the fastest path for multi-row queries.
+    #[inline]
     pub fn fetch_all_direct<F, T>(
         &self,
         sql: &str,
@@ -173,6 +176,7 @@ impl SqlitePool {
 
     /// Fetch all rows into an arena-backed result — zero per-row heap allocation
     /// for text/blob columns. See [`bsql_driver_sqlite::conn::SqliteConnection::fetch_all_arena`].
+    #[inline]
     pub fn fetch_all_arena<F, T>(
         &self,
         sql: &str,
@@ -194,6 +198,7 @@ impl SqlitePool {
 
     /// Process each row in-place via a closure. Zero-copy -- text columns
     /// borrow directly from SQLite's internal buffer.
+    #[inline]
     pub fn for_each<F>(
         &self,
         sql: &str,
@@ -213,6 +218,7 @@ impl SqlitePool {
     }
 
     /// Process each row in-place, collecting results into a `Vec`.
+    #[inline]
     pub fn for_each_collect<F, T>(
         &self,
         sql: &str,
@@ -234,6 +240,7 @@ impl SqlitePool {
     /// Execute a statement via direct param binding — zero arena/ParamValue overhead.
     ///
     /// Takes `&[&dyn SqliteEncode]` directly instead of `SmallVec<ParamValue>`.
+    #[inline]
     pub fn execute_direct(
         &self,
         sql: &str,
