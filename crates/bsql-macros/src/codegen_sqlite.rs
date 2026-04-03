@@ -384,7 +384,7 @@ fn gen_executor_struct(parsed: &ParsedQuery) -> TokenStream {
         .collect();
 
     quote! {
-        #[must_use = "query is not executed until .fetch_one(), .fetch_all(), .fetch_optional(), or .execute() is called"]
+        #[must_use = "query is not executed until .get(), .fetch(), .run(), .maybe(), or another execution method is called"]
         #[allow(non_camel_case_types)]
         struct #struct_name<'_bsql> {
             #(#fields,)*
@@ -802,12 +802,74 @@ fn gen_executor_impls(
         }
     };
 
+    // --- Simple API aliases (get/fetch/run/maybe) ---
+    let simple_api_fetch = if has_columns {
+        let result_name = result_struct_name(parsed);
+
+        let fetch_alias = if use_arena {
+            let arena_name = arena_result_struct_name(parsed);
+            quote! {
+                /// Fetch all rows. Alias for `fetch_all`.
+                pub fn fetch(
+                    self,
+                    pool: &::bsql_core::SqlitePool,
+                ) -> ::bsql_core::BsqlResult<::bsql_core::driver_sqlite::ValidatedRows<#arena_name>> {
+                    self.fetch_all(pool)
+                }
+            }
+        } else {
+            quote! {
+                /// Fetch all rows. Alias for `fetch_all`.
+                pub fn fetch(
+                    self,
+                    pool: &::bsql_core::SqlitePool,
+                ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
+                    self.fetch_all(pool)
+                }
+            }
+        };
+
+        quote! {
+            /// Fetch exactly one row. Alias for `fetch_one`.
+            pub fn get(
+                self,
+                pool: &::bsql_core::SqlitePool,
+            ) -> ::bsql_core::BsqlResult<#result_name> {
+                self.fetch_one(pool)
+            }
+
+            #fetch_alias
+
+            /// Fetch zero or one row. Alias for `fetch_optional`.
+            pub fn maybe(
+                self,
+                pool: &::bsql_core::SqlitePool,
+            ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
+                self.fetch_optional(pool)
+            }
+        }
+    } else {
+        TokenStream::new()
+    };
+
+    let simple_api_run = quote! {
+        /// Execute (INSERT/UPDATE/DELETE). Returns affected row count. Alias for `execute`.
+        pub fn run(
+            self,
+            pool: &::bsql_core::SqlitePool,
+        ) -> ::bsql_core::BsqlResult<u64> {
+            self.execute(pool)
+        }
+    };
+
     quote! {
         #[allow(non_camel_case_types)]
         impl<'_bsql> #executor_name<'_bsql> {
             #fetch_methods
             #for_each_methods
             #execute_method
+            #simple_api_fetch
+            #simple_api_run
         }
     }
 }
@@ -1483,7 +1545,7 @@ fn gen_dynamic_executor_struct(parsed: &ParsedQuery) -> TokenStream {
     }
 
     quote! {
-        #[must_use = "query is not executed until .fetch_one(), .fetch_all(), .fetch_optional(), or .execute() is called"]
+        #[must_use = "query is not executed until .get(), .fetch(), .run(), .maybe(), or another execution method is called"]
         #[allow(non_camel_case_types)]
         struct #struct_name<'_bsql> {
             #(#fields,)*
@@ -1834,12 +1896,74 @@ fn gen_dynamic_executor_impls(
         }
     };
 
+    // --- Simple API aliases (get/fetch/run/maybe) ---
+    let simple_api_fetch = if has_columns {
+        let result_name = result_struct_name(parsed);
+
+        let fetch_alias = if use_arena {
+            let arena_name = arena_result_struct_name(parsed);
+            quote! {
+                /// Fetch all rows. Alias for `fetch_all`.
+                pub fn fetch(
+                    self,
+                    pool: &::bsql_core::SqlitePool,
+                ) -> ::bsql_core::BsqlResult<::bsql_core::driver_sqlite::ValidatedRows<#arena_name>> {
+                    self.fetch_all(pool)
+                }
+            }
+        } else {
+            quote! {
+                /// Fetch all rows. Alias for `fetch_all`.
+                pub fn fetch(
+                    self,
+                    pool: &::bsql_core::SqlitePool,
+                ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
+                    self.fetch_all(pool)
+                }
+            }
+        };
+
+        quote! {
+            /// Fetch exactly one row. Alias for `fetch_one`.
+            pub fn get(
+                self,
+                pool: &::bsql_core::SqlitePool,
+            ) -> ::bsql_core::BsqlResult<#result_name> {
+                self.fetch_one(pool)
+            }
+
+            #fetch_alias
+
+            /// Fetch zero or one row. Alias for `fetch_optional`.
+            pub fn maybe(
+                self,
+                pool: &::bsql_core::SqlitePool,
+            ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
+                self.fetch_optional(pool)
+            }
+        }
+    } else {
+        TokenStream::new()
+    };
+
+    let simple_api_run = quote! {
+        /// Execute (INSERT/UPDATE/DELETE). Returns affected row count. Alias for `execute`.
+        pub fn run(
+            self,
+            pool: &::bsql_core::SqlitePool,
+        ) -> ::bsql_core::BsqlResult<u64> {
+            self.execute(pool)
+        }
+    };
+
     quote! {
         #[allow(non_camel_case_types)]
         impl<'_bsql> #executor_name<'_bsql> {
             #fetch_methods
             #for_each_methods
             #execute_method
+            #simple_api_fetch
+            #simple_api_run
         }
     }
 }
@@ -1980,7 +2104,7 @@ pub fn generate_sort_sqlite_query_code(
         .collect();
 
     let executor_struct = quote! {
-        #[must_use = "query is not executed until .fetch_one(), .fetch_all(), .fetch_optional(), or .execute() is called"]
+        #[must_use = "query is not executed until .get(), .fetch(), .run(), .maybe(), or another execution method is called"]
         #[allow(non_camel_case_types)]
         struct #executor_name<'_bsql> {
             #(#param_fields,)*
@@ -2163,6 +2287,40 @@ pub fn generate_sort_sqlite_query_code(
                     #build_sql
                     pool.execute_direct(&sql, sql_hash, _bsql_params)
                 }
+
+                // --- Simple API aliases ---
+
+                /// Fetch exactly one row. Alias for `fetch_one`.
+                pub fn get(
+                    self,
+                    pool: &::bsql_core::SqlitePool,
+                ) -> ::bsql_core::BsqlResult<#result_name> {
+                    self.fetch_one(pool)
+                }
+
+                /// Fetch all rows. Alias for `fetch_all`.
+                pub fn fetch(
+                    self,
+                    pool: &::bsql_core::SqlitePool,
+                ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
+                    self.fetch_all(pool)
+                }
+
+                /// Fetch zero or one row. Alias for `fetch_optional`.
+                pub fn maybe(
+                    self,
+                    pool: &::bsql_core::SqlitePool,
+                ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
+                    self.fetch_optional(pool)
+                }
+
+                /// Execute (INSERT/UPDATE/DELETE). Returns affected row count. Alias for `execute`.
+                pub fn run(
+                    self,
+                    pool: &::bsql_core::SqlitePool,
+                ) -> ::bsql_core::BsqlResult<u64> {
+                    self.execute(pool)
+                }
             }
         }
     } else {
@@ -2177,6 +2335,14 @@ pub fn generate_sort_sqlite_query_code(
                     #direct_params_build
                     #build_sql
                     pool.execute_direct(&sql, sql_hash, _bsql_params)
+                }
+
+                /// Execute (INSERT/UPDATE/DELETE). Returns affected row count. Alias for `execute`.
+                pub fn run(
+                    self,
+                    pool: &::bsql_core::SqlitePool,
+                ) -> ::bsql_core::BsqlResult<u64> {
+                    self.execute(pool)
                 }
             }
         }

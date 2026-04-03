@@ -54,6 +54,18 @@
 //!
 //! ## Execution methods
 //!
+//! ### Simple API (recommended)
+//!
+//! | Method | Returns | Error if |
+//! |--------|---------|----------|
+//! | `.get(&pool)` | `T` | 0 rows, or 2+ rows |
+//! | `.fetch(&pool)` | `Vec<T>` | never (empty = empty vec) |
+//! | `.maybe(&pool)` | `Option<T>` | 2+ rows |
+//! | `.run(&pool)` | `u64` (affected rows) | never |
+//! | `.defer(&tx)` | `()` | pipeline error |
+//!
+//! ### Full API (same behavior, longer names)
+//!
 //! | Method | Returns | Error if |
 //! |--------|---------|----------|
 //! | `.fetch_one(&pool)` | `T` | 0 rows, or 2+ rows |

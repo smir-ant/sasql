@@ -99,7 +99,7 @@ pub fn generate_sort_query_code(
         .collect();
 
     let executor_struct = quote! {
-        #[must_use = "query is not executed until .fetch_one(), .fetch_all(), .fetch_optional(), or .execute() is called"]
+        #[must_use = "query is not executed until .get(), .fetch(), .run(), .maybe(), or another execution method is called"]
         #[allow(non_camel_case_types)]
         struct #executor_name<'_bsql> {
             #(#param_fields,)*
@@ -330,6 +330,40 @@ pub fn generate_sort_query_code(
                     #build_sql
                     tx.defer_execute(sql, sql_hash, #params_slice).await
                 }
+
+                // --- Simple API aliases ---
+
+                /// Fetch exactly one row. Alias for `fetch_one`.
+                pub async fn get<E: ::bsql_core::Executor>(
+                    self,
+                    executor: &E,
+                ) -> ::bsql_core::BsqlResult<#result_name> {
+                    self.fetch_one(executor).await
+                }
+
+                /// Fetch all rows. Alias for `fetch_all`.
+                pub async fn fetch<E: ::bsql_core::Executor>(
+                    self,
+                    executor: &E,
+                ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
+                    self.fetch_all(executor).await
+                }
+
+                /// Execute (INSERT/UPDATE/DELETE). Returns affected row count. Alias for `execute`.
+                pub async fn run<E: ::bsql_core::Executor>(
+                    self,
+                    executor: &E,
+                ) -> ::bsql_core::BsqlResult<u64> {
+                    self.execute(executor).await
+                }
+
+                /// Fetch zero or one row. Alias for `fetch_optional`.
+                pub async fn maybe<E: ::bsql_core::Executor>(
+                    self,
+                    executor: &E,
+                ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
+                    self.fetch_optional(executor).await
+                }
             }
         }
     } else {
@@ -349,6 +383,14 @@ pub fn generate_sort_query_code(
                 pub async fn defer(self, tx: &::bsql_core::Transaction) -> ::bsql_core::BsqlResult<()> {
                     #build_sql
                     tx.defer_execute(sql, sql_hash, #params_slice).await
+                }
+
+                /// Execute (INSERT/UPDATE/DELETE). Returns affected row count. Alias for `execute`.
+                pub async fn run<E: ::bsql_core::Executor>(
+                    self,
+                    executor: &E,
+                ) -> ::bsql_core::BsqlResult<u64> {
+                    self.execute(executor).await
                 }
             }
         }
@@ -437,7 +479,7 @@ fn gen_executor_struct(parsed: &ParsedQuery) -> TokenStream {
         .collect();
 
     quote! {
-        #[must_use = "query is not executed until .fetch_one(), .fetch_all(), .fetch_optional(), or .execute() is called"]
+        #[must_use = "query is not executed until .get(), .fetch(), .run(), .maybe(), or another execution method is called"]
         #[allow(non_camel_case_types)]
         struct #struct_name<'_bsql> {
             #(#fields,)*
@@ -654,6 +696,49 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
         TokenStream::new()
     };
 
+    // --- Simple API aliases (get/fetch/run/maybe) ---
+    let simple_api_fetch = if has_columns {
+        let result_name = result_struct_name(parsed);
+
+        quote! {
+            /// Fetch exactly one row. Alias for `fetch_one`.
+            pub async fn get<E: ::bsql_core::Executor>(
+                self,
+                executor: &E,
+            ) -> ::bsql_core::BsqlResult<#result_name> {
+                self.fetch_one(executor).await
+            }
+
+            /// Fetch all rows. Alias for `fetch_all`.
+            pub async fn fetch<E: ::bsql_core::Executor>(
+                self,
+                executor: &E,
+            ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
+                self.fetch_all(executor).await
+            }
+
+            /// Fetch zero or one row. Alias for `fetch_optional`.
+            pub async fn maybe<E: ::bsql_core::Executor>(
+                self,
+                executor: &E,
+            ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
+                self.fetch_optional(executor).await
+            }
+        }
+    } else {
+        TokenStream::new()
+    };
+
+    let simple_api_run = quote! {
+        /// Execute (INSERT/UPDATE/DELETE). Returns affected row count. Alias for `execute`.
+        pub async fn run<E: ::bsql_core::Executor>(
+            self,
+            executor: &E,
+        ) -> ::bsql_core::BsqlResult<u64> {
+            self.execute(executor).await
+        }
+    };
+
     quote! {
         #stream_struct
         #for_each_row_struct
@@ -664,6 +749,8 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
             #for_each_methods
             #execute_method
             #defer_method
+            #simple_api_fetch
+            #simple_api_run
         }
     }
 }
@@ -695,7 +782,7 @@ fn gen_dynamic_executor_struct(parsed: &ParsedQuery) -> TokenStream {
     }
 
     quote! {
-        #[must_use = "query is not executed until .fetch_one(), .fetch_all(), .fetch_optional(), or .execute() is called"]
+        #[must_use = "query is not executed until .get(), .fetch(), .run(), .maybe(), or another execution method is called"]
         #[allow(non_camel_case_types)]
         struct #struct_name<'_bsql> {
             #(#fields,)*
@@ -931,6 +1018,49 @@ fn gen_dynamic_executor_impls(
         TokenStream::new()
     };
 
+    // --- Simple API aliases (get/fetch/run/maybe) ---
+    let simple_api_fetch = if has_columns {
+        let result_name = result_struct_name(parsed);
+
+        quote! {
+            /// Fetch exactly one row. Alias for `fetch_one`.
+            pub async fn get<E: ::bsql_core::Executor>(
+                self,
+                executor: &E,
+            ) -> ::bsql_core::BsqlResult<#result_name> {
+                self.fetch_one(executor).await
+            }
+
+            /// Fetch all rows. Alias for `fetch_all`.
+            pub async fn fetch<E: ::bsql_core::Executor>(
+                self,
+                executor: &E,
+            ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
+                self.fetch_all(executor).await
+            }
+
+            /// Fetch zero or one row. Alias for `fetch_optional`.
+            pub async fn maybe<E: ::bsql_core::Executor>(
+                self,
+                executor: &E,
+            ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
+                self.fetch_optional(executor).await
+            }
+        }
+    } else {
+        TokenStream::new()
+    };
+
+    let simple_api_run = quote! {
+        /// Execute (INSERT/UPDATE/DELETE). Returns affected row count. Alias for `execute`.
+        pub async fn run<E: ::bsql_core::Executor>(
+            self,
+            executor: &E,
+        ) -> ::bsql_core::BsqlResult<u64> {
+            self.execute(executor).await
+        }
+    };
+
     quote! {
         #stream_struct
 
@@ -940,6 +1070,8 @@ fn gen_dynamic_executor_impls(
             #for_each_methods
             #execute_method
             #defer_method
+            #simple_api_fetch
+            #simple_api_run
         }
     }
 }
