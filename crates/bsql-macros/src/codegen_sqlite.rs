@@ -95,20 +95,23 @@ fn is_arena_type(rust_type: &str) -> bool {
     }
 }
 
-/// Convert a column rust_type to its arena-borrowed equivalent.
-/// String -> &'static str, Vec<u8> -> &'static [u8], Option<String> -> Option<&'static str>, etc.
+/// Convert a column rust_type to its inner-struct storage type.
+///
+/// Text columns: stored as `(u32, u32)` byte range into the validated text buffer.
+/// Blob columns: stored as `(u32, u32)` (offset, len) into the blob arena.
+/// Scalars: stored as-is (Copy types).
+/// Option<Text>: stored as `Option<(u32, u32)>`.
 fn arena_result_type(type_str: &str) -> TokenStream {
     match type_str {
-        "String" => quote! { &'static str },
-        "Vec<u8>" => quote! { &'static [u8] },
+        "String" => quote! { (u32, u32) },
+        "Vec<u8>" => quote! { (u32, u32) },
         _ => {
             if let Some(inner) = type_str
                 .strip_prefix("Option<")
                 .and_then(|s| s.strip_suffix('>'))
             {
                 match inner {
-                    "String" => quote! { Option<&'static str> },
-                    "Vec<u8>" => quote! { Option<&'static [u8]> },
+                    "String" | "Vec<u8>" => quote! { Option<(u32, u32)> },
                     _ => parse_result_type(type_str),
                 }
             } else {
@@ -288,14 +291,17 @@ fn gen_for_each_not_null_decode(idx: i32, rust_type: &str) -> TokenStream {
                 }
             }
         }
-        // Zero-copy: borrow &str directly from SQLite's buffer
+        // Zero-copy: borrow &str directly from SQLite's buffer (safe validation)
         "String" => {
             let err = gen_direct_decode_error(&col_idx_str, "&str");
             quote! {
                 {
                     let _bsql_bytes = _bsql_stmt.column_text(#idx)
                         .ok_or_else(|| #err)?;
-                    unsafe { ::std::str::from_utf8_unchecked(_bsql_bytes) }
+                    ::std::str::from_utf8(_bsql_bytes)
+                        .map_err(|_| ::bsql_core::driver_sqlite::SqliteError::Internal(
+                            format!("invalid UTF-8 in column {}", #col_idx_str),
+                        ))?
                 }
             }
         }
@@ -317,6 +323,7 @@ fn gen_for_each_not_null_decode(idx: i32, rust_type: &str) -> TokenStream {
 }
 
 fn gen_for_each_nullable_decode(idx: i32, inner_type: &str) -> TokenStream {
+    let col_idx_str = idx.to_string();
     match inner_type {
         "bool" => quote! {
             if _bsql_stmt.column_type(#idx) == ::bsql_core::driver_sqlite::SQLITE_NULL {
@@ -339,10 +346,15 @@ fn gen_for_each_nullable_decode(idx: i32, inner_type: &str) -> TokenStream {
                 Some(_bsql_stmt.column_double(#idx))
             }
         },
-        // Zero-copy: Option<&str> borrowed from SQLite
+        // Zero-copy: Option<&str> borrowed from SQLite (safe validation)
         "String" => quote! {
-            _bsql_stmt.column_text(#idx)
-                .map(|b| unsafe { ::std::str::from_utf8_unchecked(b) })
+            match _bsql_stmt.column_text(#idx) {
+                None => None,
+                Some(b) => Some(::std::str::from_utf8(b)
+                    .map_err(|_| ::bsql_core::driver_sqlite::SqliteError::Internal(
+                        format!("invalid UTF-8 in column {}", #col_idx_str),
+                    ))?),
+            }
         },
         // Zero-copy: Option<&[u8]> borrowed from SQLite
         "Vec<u8>" => quote! {
@@ -388,6 +400,15 @@ fn gen_executor_struct(parsed: &ParsedQuery) -> TokenStream {
 /// `Result<T, SqliteError>`, but inline code returns `BsqlResult<T>`.
 /// This wraps the construction in a closure to bridge the error type.
 fn wrap_decode_as_bsql(struct_name: &proc_macro2::Ident, decode: &TokenStream) -> TokenStream {
+    quote! {
+        (|| -> Result<#struct_name, ::bsql_core::driver_sqlite::SqliteError> {
+            Ok(#struct_name { #decode })
+        })().map_err(::bsql_core::BsqlError::from_sqlite)?
+    }
+}
+
+/// Wrap a validated-rows decode expression (arena path with text_buf + blob_arena).
+fn wrap_validated_decode(struct_name: &proc_macro2::Ident, decode: &TokenStream) -> TokenStream {
     quote! {
         (|| -> Result<#struct_name, ::bsql_core::driver_sqlite::SqliteError> {
             Ok(#struct_name { #decode })
@@ -598,19 +619,20 @@ fn gen_executor_impls(
         let fetch_all_method = if use_arena {
             let arena_name = arena_result_struct_name(parsed);
             let inline_acquire_all = gen_inline_acquire(is_write);
-            let decode_arena = wrap_decode_as_bsql(&arena_name, &arena_decode);
+            let decode_arena = wrap_validated_decode(&arena_name, &arena_decode);
             quote! {
-                /// Fetch all rows. Inline step loop with arena — no cross-crate call overhead.
+                /// Fetch all rows. Batch-validated text, zero unsafe.
                 pub fn fetch_all(
                     self,
                     pool: &::bsql_core::SqlitePool,
-                ) -> ::bsql_core::BsqlResult<::bsql_core::driver_sqlite::ArenaRows<#arena_name>> {
+                ) -> ::bsql_core::BsqlResult<::bsql_core::driver_sqlite::ValidatedRows<#arena_name>> {
                     #direct_params_build
                     let mut _bsql_conn = #inline_acquire_all;
                     let _bsql_stmt = _bsql_conn.__get_or_prepare(#sql_lit, #sql_hash_val)
                         .map_err(::bsql_core::BsqlError::from_sqlite)?;
                     #inline_bind
-                    let mut _bsql_arena = ::bsql_core::driver_sqlite::acquire_arena();
+                    let mut _bsql_text_buf: Vec<u8> = Vec::new();
+                    let mut _bsql_blob_arena = ::bsql_core::driver_sqlite::acquire_arena();
                     let mut _bsql_rows = Vec::new();
                     loop {
                         match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
@@ -622,15 +644,18 @@ fn gen_executor_impls(
                     }
                     _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
                     drop(_bsql_conn);
-                    // SAFETY: The decode code stored &'static str / &'static [u8]
-                    // that actually point into `_bsql_arena`. The ArenaRows struct
-                    // guarantees rows are dropped before arena (field order).
-                    Ok(unsafe {
-                        ::bsql_core::driver_sqlite::ArenaRows::from_raw_parts(
-                            _bsql_rows,
-                            _bsql_arena,
-                        )
-                    })
+                    // Batch-validate ALL text in one SIMD-accelerated pass
+                    let _bsql_text = String::from_utf8(_bsql_text_buf)
+                        .map_err(|e| ::bsql_core::BsqlError::from_sqlite(
+                            ::bsql_core::driver_sqlite::SqliteError::Internal(
+                                format!("invalid UTF-8 in query result: {e}"),
+                            ),
+                        ))?;
+                    Ok(::bsql_core::driver_sqlite::ValidatedRows::new(
+                        _bsql_rows,
+                        _bsql_text,
+                        _bsql_blob_arena,
+                    ))
                 }
             }
         } else {
@@ -903,7 +928,10 @@ fn gen_sqlite_direct_not_null_decode(idx: i32, rust_type: &str) -> TokenStream {
                 {
                     let _bsql_bytes = _bsql_stmt.column_text(#idx)
                         .ok_or_else(|| #err)?;
-                    unsafe { ::std::str::from_utf8_unchecked(_bsql_bytes) }
+                    ::std::str::from_utf8(_bsql_bytes)
+                        .map_err(|_| ::bsql_core::driver_sqlite::SqliteError::Internal(
+                            format!("invalid UTF-8 in column {}", #col_idx_str),
+                        ))?
                         .to_owned()
                 }
             }
@@ -947,9 +975,14 @@ fn gen_sqlite_direct_nullable_decode(idx: i32, inner_type: &str) -> TokenStream 
             }
         },
         "String" => quote! {
-            _bsql_stmt.column_text(#idx)
-                .and_then(|b| Some(unsafe { ::std::str::from_utf8_unchecked(b) }))
-                .map(|s| s.to_owned())
+            match _bsql_stmt.column_text(#idx) {
+                None => None,
+                Some(b) => Some(::std::str::from_utf8(b)
+                    .map_err(|_| ::bsql_core::driver_sqlite::SqliteError::Internal(
+                        format!("invalid UTF-8 in column {}", #idx),
+                    ))?
+                    .to_owned()),
+            }
         },
         "Vec<u8>" => quote! {
             if _bsql_stmt.column_type(#idx) == ::bsql_core::driver_sqlite::SQLITE_NULL {
@@ -979,17 +1012,29 @@ fn gen_direct_decode_error(col_idx: &str, type_name: &str) -> TokenStream {
     }
 }
 
+/// Helper: generate safe column_text -> &str decode (no from_utf8_unchecked).
+fn gen_safe_column_text_to_str(idx: i32) -> TokenStream {
+    let col_idx_str = idx.to_string();
+    let err = gen_direct_decode_error(&col_idx_str, "&str");
+    quote! {
+        let _bsql_bytes = _bsql_stmt.column_text(#idx)
+            .ok_or_else(|| #err)?;
+        let s = ::std::str::from_utf8(_bsql_bytes)
+            .map_err(|_| ::bsql_core::driver_sqlite::SqliteError::Internal(
+                format!("invalid UTF-8 in column {}", #col_idx_str),
+            ))?;
+    }
+}
+
 fn gen_sqlite_direct_feature_gated_decode(idx: i32, rust_type: &str) -> TokenStream {
     let col_idx_str = idx.to_string();
-    let err = gen_direct_decode_error(&col_idx_str, rust_type);
+    let text_to_str = gen_safe_column_text_to_str(idx);
 
     match rust_type {
         "::uuid::Uuid" | "uuid::Uuid" => {
             quote! {
                 {
-                    let _bsql_bytes = _bsql_stmt.column_text(#idx)
-                        .ok_or_else(|| #err)?;
-                    let s = unsafe { ::std::str::from_utf8_unchecked(_bsql_bytes) };
+                    #text_to_str
                     s.parse::<::uuid::Uuid>().map_err(|e| ::bsql_core::driver_sqlite::SqliteError::Internal(
                         format!("invalid UUID in column {}: {}", #col_idx_str, e),
                     ))?
@@ -999,9 +1044,7 @@ fn gen_sqlite_direct_feature_gated_decode(idx: i32, rust_type: &str) -> TokenStr
         "::time::PrimitiveDateTime" | "time::PrimitiveDateTime" => {
             quote! {
                 {
-                    let _bsql_bytes = _bsql_stmt.column_text(#idx)
-                        .ok_or_else(|| #err)?;
-                    let s = unsafe { ::std::str::from_utf8_unchecked(_bsql_bytes) };
+                    #text_to_str
                     ::time::PrimitiveDateTime::parse(s, &::time::format_description::well_known::iso8601::Iso8601::DEFAULT)
                         .or_else(|_| {
                             ::time::PrimitiveDateTime::parse(s, &::time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]:[second]"))
@@ -1015,9 +1058,7 @@ fn gen_sqlite_direct_feature_gated_decode(idx: i32, rust_type: &str) -> TokenStr
         "::time::Date" | "time::Date" => {
             quote! {
                 {
-                    let _bsql_bytes = _bsql_stmt.column_text(#idx)
-                        .ok_or_else(|| #err)?;
-                    let s = unsafe { ::std::str::from_utf8_unchecked(_bsql_bytes) };
+                    #text_to_str
                     ::time::Date::parse(s, &::time::macros::format_description!("[year]-[month]-[day]"))
                         .map_err(|e| ::bsql_core::driver_sqlite::SqliteError::Internal(
                             format!("invalid date in column {}: {}", #col_idx_str, e),
@@ -1028,9 +1069,7 @@ fn gen_sqlite_direct_feature_gated_decode(idx: i32, rust_type: &str) -> TokenStr
         "::time::Time" | "time::Time" => {
             quote! {
                 {
-                    let _bsql_bytes = _bsql_stmt.column_text(#idx)
-                        .ok_or_else(|| #err)?;
-                    let s = unsafe { ::std::str::from_utf8_unchecked(_bsql_bytes) };
+                    #text_to_str
                     ::time::Time::parse(s, &::time::macros::format_description!("[hour]:[minute]:[second]"))
                         .map_err(|e| ::bsql_core::driver_sqlite::SqliteError::Internal(
                             format!("invalid time in column {}: {}", #col_idx_str, e),
@@ -1041,9 +1080,7 @@ fn gen_sqlite_direct_feature_gated_decode(idx: i32, rust_type: &str) -> TokenStr
         "::chrono::NaiveDateTime" | "chrono::NaiveDateTime" => {
             quote! {
                 {
-                    let _bsql_bytes = _bsql_stmt.column_text(#idx)
-                        .ok_or_else(|| #err)?;
-                    let s = unsafe { ::std::str::from_utf8_unchecked(_bsql_bytes) };
+                    #text_to_str
                     s.parse::<::chrono::NaiveDateTime>().map_err(|e| ::bsql_core::driver_sqlite::SqliteError::Internal(
                         format!("invalid datetime in column {}: {}", #col_idx_str, e),
                     ))?
@@ -1053,9 +1090,7 @@ fn gen_sqlite_direct_feature_gated_decode(idx: i32, rust_type: &str) -> TokenStr
         "::chrono::NaiveDate" | "chrono::NaiveDate" => {
             quote! {
                 {
-                    let _bsql_bytes = _bsql_stmt.column_text(#idx)
-                        .ok_or_else(|| #err)?;
-                    let s = unsafe { ::std::str::from_utf8_unchecked(_bsql_bytes) };
+                    #text_to_str
                     s.parse::<::chrono::NaiveDate>().map_err(|e| ::bsql_core::driver_sqlite::SqliteError::Internal(
                         format!("invalid date in column {}: {}", #col_idx_str, e),
                     ))?
@@ -1065,9 +1100,7 @@ fn gen_sqlite_direct_feature_gated_decode(idx: i32, rust_type: &str) -> TokenStr
         "::chrono::NaiveTime" | "chrono::NaiveTime" => {
             quote! {
                 {
-                    let _bsql_bytes = _bsql_stmt.column_text(#idx)
-                        .ok_or_else(|| #err)?;
-                    let s = unsafe { ::std::str::from_utf8_unchecked(_bsql_bytes) };
+                    #text_to_str
                     s.parse::<::chrono::NaiveTime>().map_err(|e| ::bsql_core::driver_sqlite::SqliteError::Internal(
                         format!("invalid time in column {}: {}", #col_idx_str, e),
                     ))?
@@ -1077,9 +1110,7 @@ fn gen_sqlite_direct_feature_gated_decode(idx: i32, rust_type: &str) -> TokenStr
         "::rust_decimal::Decimal" | "rust_decimal::Decimal" => {
             quote! {
                 {
-                    let _bsql_bytes = _bsql_stmt.column_text(#idx)
-                        .ok_or_else(|| #err)?;
-                    let s = unsafe { ::std::str::from_utf8_unchecked(_bsql_bytes) };
+                    #text_to_str
                     s.parse::<::rust_decimal::Decimal>().map_err(|e| ::bsql_core::driver_sqlite::SqliteError::Internal(
                         format!("invalid decimal in column {}: {}", #col_idx_str, e),
                     ))?
@@ -1087,24 +1118,25 @@ fn gen_sqlite_direct_feature_gated_decode(idx: i32, rust_type: &str) -> TokenStr
             }
         }
         _ => {
-            // Fallback: read as text
+            // Fallback: read as text (safe)
             quote! {
                 {
-                    let _bsql_bytes = _bsql_stmt.column_text(#idx)
-                        .ok_or_else(|| #err)?;
-                    unsafe { ::std::str::from_utf8_unchecked(_bsql_bytes) }
-                        .to_owned()
+                    #text_to_str
+                    s.to_owned()
                 }
             }
         }
     }
 }
 
-// --- Arena-backed decode for fetch_all ---
+// --- Arena-backed decode for fetch_all (batch-validated, zero unsafe) ---
 //
-// These functions generate decode code that copies text/blob data into the arena
-// and returns &'static str / &'static [u8] via lifetime extension. Non-text
-// columns (integers, floats, bools) are decoded identically to the direct path.
+// Text columns: appended to `_bsql_text_buf` (Vec<u8>), stored as (start, end) u32 range.
+// Blob columns: copied into `_bsql_blob_arena`, stored as (offset, len) u32 range.
+// Scalar columns: decoded directly, no buffer needed.
+//
+// After the step loop, `String::from_utf8(_bsql_text_buf)` validates ALL text
+// in one SIMD-accelerated pass. No from_utf8_unchecked. No transmute. No unsafe.
 
 fn gen_sqlite_arena_decode(validation: &ValidationResult) -> TokenStream {
     let deduped_names = deduplicate_column_names(&validation.columns);
@@ -1133,23 +1165,21 @@ fn gen_sqlite_arena_column_decode(idx: i32, rust_type: &str) -> TokenStream {
 fn gen_sqlite_arena_not_null_decode(idx: i32, rust_type: &str) -> TokenStream {
     let col_idx_str = idx.to_string();
     match rust_type {
-        // Text: copy into arena, return &'static str
+        // Text: append to text_buf, store (start, end) range
         "String" => {
             let err = gen_direct_decode_error(&col_idx_str, "&str");
             quote! {
                 {
                     let _bsql_bytes = _bsql_stmt.column_text(#idx)
                         .ok_or_else(|| #err)?;
-                    let _bsql_off = _bsql_arena.alloc_copy(_bsql_bytes);
-                    // SAFETY: SQLite TEXT columns are guaranteed valid UTF-8
-                    // (validated on INSERT by sqlite3_bind_text). Skip redundant
-                    // re-validation for maximum throughput.
-                    let _bsql_s = unsafe { _bsql_arena.get_str_unchecked(_bsql_off, _bsql_bytes.len()) };
-                    unsafe { ::bsql_core::driver_sqlite::extend_lifetime_str(_bsql_s) }
+                    let _bsql_start = _bsql_text_buf.len() as u32;
+                    _bsql_text_buf.extend_from_slice(_bsql_bytes);
+                    let _bsql_end = _bsql_text_buf.len() as u32;
+                    (_bsql_start, _bsql_end)
                 }
             }
         }
-        // Blob: copy into arena, return &'static [u8]
+        // Blob: copy into blob arena, store (offset, len) range
         "Vec<u8>" => {
             let err = gen_direct_decode_error(&col_idx_str, "&[u8]");
             quote! {
@@ -1158,40 +1188,38 @@ fn gen_sqlite_arena_not_null_decode(idx: i32, rust_type: &str) -> TokenStream {
                         return Err(#err);
                     }
                     let _bsql_raw = _bsql_stmt.column_blob(#idx);
-                    let _bsql_off = _bsql_arena.alloc_copy(_bsql_raw);
-                    let _bsql_slice = _bsql_arena.get(_bsql_off, _bsql_raw.len());
-                    unsafe { ::bsql_core::driver_sqlite::extend_lifetime_bytes(_bsql_slice) }
+                    let _bsql_off = _bsql_blob_arena.alloc_copy(_bsql_raw) as u32;
+                    (_bsql_off, _bsql_raw.len() as u32)
                 }
             }
         }
-        // All non-text types: identical to direct decode (no arena needed)
+        // All non-text types: identical to direct decode (no buffer needed)
         _ => gen_sqlite_direct_not_null_decode(idx, rust_type),
     }
 }
 
 fn gen_sqlite_arena_nullable_decode(idx: i32, inner_type: &str) -> TokenStream {
     match inner_type {
-        // Option<String> -> Option<&'static str>
+        // Option<String> -> Option<(u32, u32)> text range
         "String" => quote! {
             match _bsql_stmt.column_text(#idx) {
                 None => None,
                 Some(_bsql_bytes) => {
-                    let _bsql_off = _bsql_arena.alloc_copy(_bsql_bytes);
-                    // SAFETY: SQLite TEXT is guaranteed valid UTF-8
-                    let _bsql_s = unsafe { _bsql_arena.get_str_unchecked(_bsql_off, _bsql_bytes.len()) };
-                    Some(unsafe { ::bsql_core::driver_sqlite::extend_lifetime_str(_bsql_s) })
+                    let _bsql_start = _bsql_text_buf.len() as u32;
+                    _bsql_text_buf.extend_from_slice(_bsql_bytes);
+                    let _bsql_end = _bsql_text_buf.len() as u32;
+                    Some((_bsql_start, _bsql_end))
                 }
             }
         },
-        // Option<Vec<u8>> -> Option<&'static [u8]>
+        // Option<Vec<u8>> -> Option<(u32, u32)> blob range
         "Vec<u8>" => quote! {
             if _bsql_stmt.column_type(#idx) == ::bsql_core::driver_sqlite::SQLITE_NULL {
                 None
             } else {
                 let _bsql_raw = _bsql_stmt.column_blob(#idx);
-                let _bsql_off = _bsql_arena.alloc_copy(_bsql_raw);
-                let _bsql_slice = _bsql_arena.get(_bsql_off, _bsql_raw.len());
-                Some(unsafe { ::bsql_core::driver_sqlite::extend_lifetime_bytes(_bsql_slice) })
+                let _bsql_off = _bsql_blob_arena.alloc_copy(_bsql_raw) as u32;
+                Some((_bsql_off, _bsql_raw.len() as u32))
             }
         },
         // Non-text option types: identical to direct decode
@@ -1580,7 +1608,7 @@ fn gen_dynamic_executor_impls(
             let arena_name = arena_result_struct_name(parsed);
             let acq = gen_inline_acquire(is_write);
             let bind = gen_inline_param_bind();
-            let decode_arena = wrap_decode_as_bsql(&arena_name, &arena_decode);
+            let decode_arena = wrap_validated_decode(&arena_name, &arena_decode);
             let fetch_all_dispatcher = gen_sqlite_inline_variant_dispatcher(
                 parsed,
                 variants,
@@ -1590,7 +1618,8 @@ fn gen_dynamic_executor_impls(
                         let _bsql_stmt = _bsql_conn.__get_or_prepare(#sql_lit, #sql_hash)
                             .map_err(::bsql_core::BsqlError::from_sqlite)?;
                         #bind
-                        let mut _bsql_arena = ::bsql_core::driver_sqlite::acquire_arena();
+                        let mut _bsql_text_buf: Vec<u8> = Vec::new();
+                        let mut _bsql_blob_arena = ::bsql_core::driver_sqlite::acquire_arena();
                         let mut _bsql_rows = Vec::new();
                         loop {
                             match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
@@ -1602,12 +1631,17 @@ fn gen_dynamic_executor_impls(
                         }
                         _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
                         drop(_bsql_conn);
-                        return Ok(unsafe {
-                            ::bsql_core::driver_sqlite::ArenaRows::from_raw_parts(
-                                _bsql_rows,
-                                _bsql_arena,
-                            )
-                        });
+                        let _bsql_text = String::from_utf8(_bsql_text_buf)
+                            .map_err(|e| ::bsql_core::BsqlError::from_sqlite(
+                                ::bsql_core::driver_sqlite::SqliteError::Internal(
+                                    format!("invalid UTF-8 in query result: {e}"),
+                                ),
+                            ))?;
+                        return Ok(::bsql_core::driver_sqlite::ValidatedRows::new(
+                            _bsql_rows,
+                            _bsql_text,
+                            _bsql_blob_arena,
+                        ));
                     }
                 },
                 quote! { let mut _bsql_conn = #acq; },
@@ -1616,7 +1650,7 @@ fn gen_dynamic_executor_impls(
                 pub fn fetch_all(
                     self,
                     pool: &::bsql_core::SqlitePool,
-                ) -> ::bsql_core::BsqlResult<::bsql_core::driver_sqlite::ArenaRows<#arena_name>> {
+                ) -> ::bsql_core::BsqlResult<::bsql_core::driver_sqlite::ValidatedRows<#arena_name>> {
                     #fetch_all_dispatcher
                 }
             }
@@ -1931,7 +1965,6 @@ pub fn generate_sort_sqlite_query_code(
     sort_enum_name: &str,
 ) -> TokenStream {
     let result_struct = gen_result_struct(parsed, validation);
-    let arena_result_struct = gen_arena_result_struct(parsed, validation);
     let sort_enum_ident = format_ident!("{}", sort_enum_name);
     let executor_name = executor_struct_name(parsed);
 
@@ -2059,55 +2092,27 @@ pub fn generate_sort_sqlite_query_code(
         TokenStream::new()
     };
 
-    let use_arena = has_columns && has_arena_columns(validation);
-
-    let arena_decode = if use_arena {
-        gen_sqlite_arena_decode(validation)
-    } else {
-        TokenStream::new()
-    };
-
     let fetch_methods = if has_columns {
         let result_name = result_struct_name(parsed);
 
-        let fetch_all_method = if use_arena {
-            let arena_name = arena_result_struct_name(parsed);
-            quote! {
-                pub fn fetch_all(
-                    self,
-                    pool: &::bsql_core::SqlitePool,
-                ) -> ::bsql_core::BsqlResult<::bsql_core::driver_sqlite::ArenaRows<#arena_name>> {
-                    #direct_params_build
-                    #build_sql
-                    pool.fetch_all_arena(
-                        &sql,
-                        sql_hash,
-                        _bsql_params,
-                        #is_write,
-                        |_bsql_stmt, _bsql_arena| {
-                            Ok(#arena_name { #arena_decode })
-                        },
-                    )
-                }
-            }
-        } else {
-            quote! {
-                pub fn fetch_all(
-                    self,
-                    pool: &::bsql_core::SqlitePool,
-                ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
-                    #direct_params_build
-                    #build_sql
-                    pool.fetch_all_direct(
-                        &sql,
-                        sql_hash,
-                        _bsql_params,
-                        #is_write,
-                        |_bsql_stmt| {
-                            Ok(#result_name { #direct_decode })
-                        },
-                    )
-                }
+        // Sort queries always use the direct decode path (safe from_utf8,
+        // owned strings) since they go through pool indirection anyway.
+        let fetch_all_method = quote! {
+            pub fn fetch_all(
+                self,
+                pool: &::bsql_core::SqlitePool,
+            ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
+                #direct_params_build
+                #build_sql
+                pool.fetch_all_direct(
+                    &sql,
+                    sql_hash,
+                    _bsql_params,
+                    #is_write,
+                    |_bsql_stmt| {
+                        Ok(#result_name { #direct_decode })
+                    },
+                )
             }
         };
 
@@ -2192,7 +2197,6 @@ pub fn generate_sort_sqlite_query_code(
     quote! {
         {
             #result_struct
-            #arena_result_struct
             #executor_struct
             #fetch_methods
             #constructor

@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 #![deny(clippy::all)]
 
 //! Bump allocator for row data — one allocation per query result.
@@ -138,21 +139,6 @@ impl Arena {
             return Some("");
         }
         simdutf8::basic::from_utf8(self.get(global_offset, len)).ok()
-    }
-
-    /// Retrieve a str slice WITHOUT UTF-8 validation.
-    ///
-    /// # Safety
-    ///
-    /// The caller must guarantee the bytes at `[global_offset..global_offset+len]`
-    /// are valid UTF-8. This is safe when the data originates from a source that
-    /// guarantees UTF-8 (e.g., SQLite TEXT columns inserted via `sqlite3_bind_text`).
-    #[inline]
-    pub unsafe fn get_str_unchecked(&self, global_offset: usize, len: usize) -> &str {
-        if len == 0 {
-            return "";
-        }
-        unsafe { std::str::from_utf8_unchecked(self.get(global_offset, len)) }
     }
 
     /// Reset the arena for reuse. Keeps allocated memory but resets the bump pointer.
@@ -363,15 +349,12 @@ pub struct ArenaRows<T> {
 }
 
 impl<T> ArenaRows<T> {
-    /// Build `ArenaRows` from a pre-populated arena and a row vector.
+    /// Build `ArenaRows` from an arena and a row vector.
     ///
-    /// # Safety
-    ///
-    /// Every `&'static str` and `&'static [u8]` inside the `T` values in
-    /// `rows` must point into `arena`'s memory. The caller guarantees this
-    /// by constructing rows via `arena.get_str()` / `arena.get()` with
-    /// lifetime-extended (`transmute`) references.
-    pub unsafe fn from_raw_parts(rows: Vec<T>, arena: Arena) -> Self {
+    /// `T` should contain only Copy types (integers, floats, bools) and
+    /// byte-range indices into a separately validated text buffer. No
+    /// `&'static str` transmute is involved.
+    pub fn new(rows: Vec<T>, arena: Arena) -> Self {
         Self { rows, arena }
     }
 
@@ -399,18 +382,11 @@ impl<T> ArenaRows<T> {
         self.rows.iter()
     }
 
-    /// Consume into the inner `Vec<T>`.
+    /// Consume into the inner `Vec<T>` and arena.
     ///
-    /// # Safety
-    ///
-    /// The returned `Vec<T>` may contain `&'static str` / `&'static [u8]`
-    /// that point into the arena which is **dropped** by this call.
-    /// Only safe if `T` contains no arena-borrowed references (e.g., all
-    /// numeric columns). Prefer iterating via `&ArenaRows` instead.
-    pub unsafe fn into_vec_unchecked(self) -> Vec<T> {
-        // Arena is dropped here when `self` is consumed — only safe if T
-        // has no arena-borrowed fields.
-        self.rows
+    /// Returns both so the caller can decide what to do with the arena.
+    pub fn into_parts(self) -> (Vec<T>, Arena) {
+        (self.rows, self.arena)
     }
 
     /// Total bytes allocated in the backing arena.
@@ -449,26 +425,135 @@ impl<T: std::fmt::Debug> std::fmt::Debug for ArenaRows<T> {
     }
 }
 
-/// Extend a `&'a str` from the arena to `&'static str`.
+// ---------------------------------------------------------------------------
+// ValidatedRows — batch-validated text, zero unsafe
+// ---------------------------------------------------------------------------
+
+/// A collection of decoded rows with batch-validated text data.
 ///
-/// # Safety
+/// Text columns are stored as byte ranges `(u32, u32)` into a shared,
+/// batch-validated `String` buffer. Blob columns are stored as byte ranges
+/// into the `Arena`. Scalar columns (i64, f64, bool) are stored directly.
 ///
-/// The returned `&'static str` is only valid as long as the arena that
-/// backs it is alive. The caller must ensure the arena outlives all uses
-/// of the returned reference — typically by storing both in an `ArenaRows`.
-#[inline]
-pub unsafe fn extend_lifetime_str(s: &str) -> &'static str {
-    unsafe { std::mem::transmute::<&str, &'static str>(s) }
+/// # Zero unsafe
+///
+/// The text buffer is validated once via `String::from_utf8` (SIMD-accelerated
+/// in std on modern CPUs). No `from_utf8_unchecked`, no `transmute`, no
+/// lifetime extension.
+///
+/// # Usage pattern
+///
+/// The codegen generates an "inner" struct with byte ranges and a "view" struct
+/// with `&str`. `ValidatedRows::iter()` maps inner -> view by slicing the
+/// validated text buffer.
+pub struct ValidatedRows<T> {
+    rows: Vec<T>,
+    text_buf: String,
+    blob_arena: Arena,
 }
 
-/// Extend a `&'a [u8]` from the arena to `&'static [u8]`.
-///
-/// # Safety
-///
-/// Same contract as `extend_lifetime_str`.
-#[inline]
-pub unsafe fn extend_lifetime_bytes(s: &[u8]) -> &'static [u8] {
-    unsafe { std::mem::transmute::<&[u8], &'static [u8]>(s) }
+impl<T> ValidatedRows<T> {
+    /// Build `ValidatedRows` from a text buffer (already validated as UTF-8),
+    /// a blob arena, and the decoded inner rows.
+    pub fn new(rows: Vec<T>, text_buf: String, blob_arena: Arena) -> Self {
+        Self {
+            rows,
+            text_buf,
+            blob_arena,
+        }
+    }
+
+    /// Get the validated text buffer.
+    #[inline]
+    pub fn text(&self) -> &str {
+        &self.text_buf
+    }
+
+    /// Get a text slice by byte range. Panics if range is out of bounds
+    /// or not on a UTF-8 char boundary (impossible if ranges were recorded
+    /// correctly during the step loop).
+    #[inline]
+    pub fn text_slice(&self, start: u32, end: u32) -> &str {
+        &self.text_buf[start as usize..end as usize]
+    }
+
+    /// Get a blob slice from the arena by global offset and length.
+    #[inline]
+    pub fn blob_slice(&self, offset: u32, len: u32) -> &[u8] {
+        self.blob_arena.get(offset as usize, len as usize)
+    }
+
+    /// Number of rows.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Whether the result set is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Get an inner row by index.
+    #[inline]
+    pub fn get_inner(&self, idx: usize) -> Option<&T> {
+        self.rows.get(idx)
+    }
+
+    /// Iterate over inner rows by reference.
+    #[inline]
+    pub fn iter_inner(&self) -> std::slice::Iter<'_, T> {
+        self.rows.iter()
+    }
+
+    /// Total bytes in the text buffer.
+    #[inline]
+    pub fn text_len(&self) -> usize {
+        self.text_buf.len()
+    }
+
+    /// Total bytes allocated in the blob arena.
+    #[inline]
+    pub fn blob_allocated(&self) -> usize {
+        self.blob_arena.allocated()
+    }
+
+    /// Total bytes allocated (text + blobs).
+    #[inline]
+    pub fn arena_allocated(&self) -> usize {
+        self.text_buf.len() + self.blob_arena.allocated()
+    }
+}
+
+impl<T> std::ops::Deref for ValidatedRows<T> {
+    type Target = [T];
+
+    #[inline]
+    fn deref(&self) -> &[T] {
+        &self.rows
+    }
+}
+
+impl<'a, T> IntoIterator for &'a ValidatedRows<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.rows.iter()
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for ValidatedRows<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ValidatedRows")
+            .field("len", &self.rows.len())
+            .field("text_len", &self.text_buf.len())
+            .field("blob_allocated", &self.blob_arena.allocated())
+            .field("rows", &self.rows)
+            .finish()
+    }
 }
 
 #[cfg(test)]
@@ -789,32 +874,22 @@ mod tests {
         release_arena(arena);
     }
 
-    // --- ArenaRows tests ---
+    // --- ArenaRows tests (safe) ---
 
     #[test]
     fn arena_rows_basic() {
-        let mut arena = Arena::new();
-        let off = arena.alloc_copy(b"hello");
-        let s = arena.get_str(off, 5).unwrap();
-        // SAFETY: arena is moved into ArenaRows, outlives the rows.
-        let s_static = unsafe { extend_lifetime_str(s) };
-
-        struct Row {
-            val: &'static str,
-        }
-        let rows = vec![Row { val: s_static }];
-        let ar = unsafe { ArenaRows::from_raw_parts(rows, arena) };
-
+        let arena = Arena::new();
+        let ar: ArenaRows<i64> = ArenaRows::new(vec![42], arena);
         assert_eq!(ar.len(), 1);
         assert!(!ar.is_empty());
-        assert_eq!(ar[0].val, "hello");
-        assert_eq!(ar.get(0).unwrap().val, "hello");
+        assert_eq!(ar[0], 42);
+        assert_eq!(ar.get(0), Some(&42));
     }
 
     #[test]
     fn arena_rows_empty() {
         let arena = Arena::new();
-        let ar: ArenaRows<i64> = unsafe { ArenaRows::from_raw_parts(vec![], arena) };
+        let ar: ArenaRows<i64> = ArenaRows::new(vec![], arena);
         assert!(ar.is_empty());
         assert_eq!(ar.len(), 0);
         assert!(ar.get(0).is_none());
@@ -822,27 +897,16 @@ mod tests {
 
     #[test]
     fn arena_rows_iter() {
-        let mut arena = Arena::new();
-        let o1 = arena.alloc_copy(b"foo");
-        let o2 = arena.alloc_copy(b"bar");
-        let s1 = unsafe { extend_lifetime_str(arena.get_str(o1, 3).unwrap()) };
-        let s2 = unsafe { extend_lifetime_str(arena.get_str(o2, 3).unwrap()) };
-
-        struct Row {
-            name: &'static str,
-        }
-        let rows = vec![Row { name: s1 }, Row { name: s2 }];
-        let ar = unsafe { ArenaRows::from_raw_parts(rows, arena) };
-
-        let names: Vec<&str> = ar.iter().map(|r| r.name).collect();
-        assert_eq!(names, vec!["foo", "bar"]);
+        let arena = Arena::new();
+        let ar: ArenaRows<i64> = ArenaRows::new(vec![10, 20, 30], arena);
+        let vals: Vec<&i64> = ar.iter().collect();
+        assert_eq!(vals, vec![&10, &20, &30]);
     }
 
     #[test]
     fn arena_rows_deref() {
         let arena = Arena::new();
-        let ar: ArenaRows<i64> = unsafe { ArenaRows::from_raw_parts(vec![1, 2, 3], arena) };
-        // Deref to [i64]
+        let ar: ArenaRows<i64> = ArenaRows::new(vec![1, 2, 3], arena);
         let slice: &[i64] = &ar;
         assert_eq!(slice, &[1, 2, 3]);
     }
@@ -850,7 +914,7 @@ mod tests {
     #[test]
     fn arena_rows_for_loop() {
         let arena = Arena::new();
-        let ar: ArenaRows<i64> = unsafe { ArenaRows::from_raw_parts(vec![10, 20], arena) };
+        let ar: ArenaRows<i64> = ArenaRows::new(vec![10, 20], arena);
         let mut sum = 0;
         for &val in &ar {
             sum += val;
@@ -861,7 +925,7 @@ mod tests {
     #[test]
     fn arena_rows_debug() {
         let arena = Arena::new();
-        let ar: ArenaRows<i64> = unsafe { ArenaRows::from_raw_parts(vec![42], arena) };
+        let ar: ArenaRows<i64> = ArenaRows::new(vec![42], arena);
         let dbg = format!("{ar:?}");
         assert!(dbg.contains("ArenaRows"));
         assert!(dbg.contains("42"));
@@ -872,69 +936,130 @@ mod tests {
         let mut arena = Arena::new();
         arena.alloc_copy(b"some data");
         let allocated = arena.allocated();
-        let ar: ArenaRows<i64> = unsafe { ArenaRows::from_raw_parts(vec![], arena) };
+        let ar: ArenaRows<i64> = ArenaRows::new(vec![], arena);
         assert_eq!(ar.arena_allocated(), allocated);
     }
 
     #[test]
-    fn arena_rows_many_strings() {
-        let mut arena = Arena::new();
-        struct Row {
-            id: i64,
-            name: &'static str,
-        }
-        let mut rows = Vec::new();
-        for i in 0..1000 {
-            let text = format!("user_{i}");
-            let off = arena.alloc_copy(text.as_bytes());
-            let s = unsafe { extend_lifetime_str(arena.get_str(off, text.len()).unwrap()) };
-            rows.push(Row { id: i, name: s });
-        }
-        let ar = unsafe { ArenaRows::from_raw_parts(rows, arena) };
-        assert_eq!(ar.len(), 1000);
-        assert_eq!(ar[0].name, "user_0");
-        assert_eq!(ar[999].name, "user_999");
-        assert_eq!(ar[500].id, 500);
-    }
-
-    #[test]
-    fn extend_lifetime_bytes_basic() {
-        let mut arena = Arena::new();
-        let off = arena.alloc_copy(&[0xDE, 0xAD, 0xBE, 0xEF]);
-        let bytes = arena.get(off, 4);
-        let extended = unsafe { extend_lifetime_bytes(bytes) };
-        // Arena is still alive, extended should be valid.
-        assert_eq!(extended, &[0xDE, 0xAD, 0xBE, 0xEF]);
-    }
-
-    // --- into_vec_unchecked ---
-
-    #[test]
-    fn arena_rows_into_vec_unchecked_numeric() {
-        // SAFETY: i64 contains no arena-borrowed references, so into_vec_unchecked is safe.
+    fn arena_rows_into_parts() {
         let arena = Arena::new();
-        let ar: ArenaRows<i64> = unsafe { ArenaRows::from_raw_parts(vec![1, 2, 3], arena) };
-        let v = unsafe { ar.into_vec_unchecked() };
+        let ar: ArenaRows<i64> = ArenaRows::new(vec![1, 2, 3], arena);
+        let (v, _arena) = ar.into_parts();
         assert_eq!(v, vec![1, 2, 3]);
     }
 
     #[test]
-    fn arena_rows_into_vec_unchecked_empty() {
+    fn arena_rows_into_parts_empty() {
         let arena = Arena::new();
-        let ar: ArenaRows<i64> = unsafe { ArenaRows::from_raw_parts(vec![], arena) };
-        let v = unsafe { ar.into_vec_unchecked() };
+        let ar: ArenaRows<i64> = ArenaRows::new(vec![], arena);
+        let (v, _arena) = ar.into_parts();
         assert!(v.is_empty());
     }
-
-    // --- get out of bounds returns None ---
 
     #[test]
     fn arena_rows_get_out_of_bounds() {
         let arena = Arena::new();
-        let ar: ArenaRows<i64> = unsafe { ArenaRows::from_raw_parts(vec![42], arena) };
+        let ar: ArenaRows<i64> = ArenaRows::new(vec![42], arena);
         assert_eq!(ar.get(0), Some(&42));
         assert_eq!(ar.get(1), None);
         assert_eq!(ar.get(999), None);
+    }
+
+    // --- ValidatedRows tests ---
+
+    #[test]
+    fn validated_rows_basic() {
+        let text_buf = String::from("alicebob");
+        let blob_arena = Arena::new();
+
+        #[derive(Debug)]
+        struct Inner {
+            id: i64,
+            name_start: u32,
+            name_end: u32,
+        }
+
+        let rows = vec![
+            Inner {
+                id: 1,
+                name_start: 0,
+                name_end: 5,
+            },
+            Inner {
+                id: 2,
+                name_start: 5,
+                name_end: 8,
+            },
+        ];
+        let vr = ValidatedRows::new(rows, text_buf, blob_arena);
+
+        assert_eq!(vr.len(), 2);
+        assert!(!vr.is_empty());
+        assert_eq!(vr.text_slice(vr[0].name_start, vr[0].name_end), "alice");
+        assert_eq!(vr.text_slice(vr[1].name_start, vr[1].name_end), "bob");
+    }
+
+    #[test]
+    fn validated_rows_empty() {
+        let vr: ValidatedRows<i64> = ValidatedRows::new(vec![], String::new(), Arena::new());
+        assert!(vr.is_empty());
+        assert_eq!(vr.len(), 0);
+        assert_eq!(vr.text_len(), 0);
+    }
+
+    #[test]
+    fn validated_rows_blob() {
+        let mut blob_arena = Arena::new();
+        let off = blob_arena.alloc_copy(&[0xDE, 0xAD]);
+
+        #[derive(Debug)]
+        struct Inner {
+            blob_off: u32,
+            blob_len: u32,
+        }
+
+        let rows = vec![Inner {
+            blob_off: off as u32,
+            blob_len: 2,
+        }];
+        let vr = ValidatedRows::new(rows, String::new(), blob_arena);
+
+        assert_eq!(vr.blob_slice(vr[0].blob_off, vr[0].blob_len), &[0xDE, 0xAD]);
+    }
+
+    #[test]
+    fn validated_rows_arena_allocated() {
+        let mut blob_arena = Arena::new();
+        blob_arena.alloc_copy(&[1, 2, 3]);
+        let text_buf = String::from("hello");
+
+        let vr: ValidatedRows<i64> = ValidatedRows::new(vec![], text_buf, blob_arena);
+        assert_eq!(vr.arena_allocated(), 5 + 3); // text_len + blob_allocated
+    }
+
+    #[test]
+    fn validated_rows_debug() {
+        let vr: ValidatedRows<i64> = ValidatedRows::new(vec![42], String::new(), Arena::new());
+        let dbg = format!("{vr:?}");
+        assert!(dbg.contains("ValidatedRows"));
+        assert!(dbg.contains("42"));
+    }
+
+    #[test]
+    fn validated_rows_deref() {
+        let vr: ValidatedRows<i64> = ValidatedRows::new(vec![1, 2, 3], String::new(), Arena::new());
+        let slice: &[i64] = &vr;
+        assert_eq!(slice, &[1, 2, 3]);
+    }
+
+    #[test]
+    fn validated_rows_iter() {
+        let vr: ValidatedRows<i64> = ValidatedRows::new(vec![10, 20], String::new(), Arena::new());
+        let mut sum = 0;
+        for &val in &vr {
+            sum += val;
+        }
+        assert_eq!(sum, 30);
     }
 
     // --- alloc zero length slice ---

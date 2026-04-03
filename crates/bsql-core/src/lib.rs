@@ -58,9 +58,7 @@ pub mod driver_sqlite {
     pub use smallvec::{SmallVec, smallvec};
 
     // Arena types for arena-backed fetch_all
-    pub use bsql_arena::{
-        Arena, ArenaRows, acquire_arena, extend_lifetime_bytes, extend_lifetime_str,
-    };
+    pub use bsql_arena::{Arena, ArenaRows, ValidatedRows, acquire_arena};
 
     /// SQLite NULL type indicator (matches `SQLITE_NULL` = 5).
     /// Re-exported here so generated code does not need a direct libsqlite3-sys dep.

@@ -1945,19 +1945,20 @@ mod tests {
 
         struct Row {
             id: i64,
-            name: &'static str,
+            name: String,
         }
 
         let rows = pool
-            .fetch_all_arena(sql, sql_hash, &[], false, |stmt, arena| {
+            .fetch_all_arena(sql, sql_hash, &[], false, |stmt, _arena| {
                 let id = stmt.column_int64(0);
-                let bytes = stmt
+                let name = stmt
                     .column_text(1)
-                    .ok_or_else(|| SqliteError::Internal("null".into()))?;
-                let off = arena.alloc_copy(bytes);
-                let s = arena.get_str(off, bytes.len()).unwrap();
-                let s = unsafe { bsql_arena::extend_lifetime_str(s) };
-                Ok(Row { id, name: s })
+                    .ok_or_else(|| SqliteError::Internal("null".into()))
+                    .and_then(|b| {
+                        std::str::from_utf8(b).map_err(|_| SqliteError::Internal("bad utf8".into()))
+                    })?
+                    .to_owned();
+                Ok(Row { id, name })
             })
             .unwrap();
 
@@ -1980,11 +1981,13 @@ mod tests {
         let sql = "SELECT name FROM t";
         let sql_hash = hash_sql(sql);
         let rows = pool
-            .fetch_all_arena(sql, sql_hash, &[], false, |stmt, arena| {
-                let bytes = stmt.column_text(0).unwrap_or(b"");
-                let off = arena.alloc_copy(bytes);
-                let s = arena.get_str(off, bytes.len()).unwrap();
-                Ok(unsafe { bsql_arena::extend_lifetime_str(s) })
+            .fetch_all_arena(sql, sql_hash, &[], false, |stmt, _arena| {
+                let s = stmt
+                    .column_text(0)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .unwrap_or("")
+                    .to_owned();
+                Ok(s)
             })
             .unwrap();
         assert!(rows.is_empty());
@@ -2006,13 +2009,14 @@ mod tests {
         let sql = "SELECT id, name FROM t";
         let sql_hash = hash_sql(sql);
         let rows = pool
-            .fetch_all_arena(sql, sql_hash, &[], true, |stmt, arena| {
+            .fetch_all_arena(sql, sql_hash, &[], true, |stmt, _arena| {
                 let id = stmt.column_int64(0);
-                let bytes = stmt.column_text(1).unwrap_or(b"");
-                let off = arena.alloc_copy(bytes);
-                let s = arena.get_str(off, bytes.len()).unwrap();
-                let s = unsafe { bsql_arena::extend_lifetime_str(s) };
-                Ok((id, s))
+                let name = stmt
+                    .column_text(1)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .unwrap_or("")
+                    .to_owned();
+                Ok((id, name))
             })
             .unwrap();
 
@@ -2042,24 +2046,24 @@ mod tests {
 
         struct Row {
             id: i64,
-            name: &'static str,
+            name: String,
         }
 
         let rows = pool
-            .fetch_all_arena(sql, sql_hash, &[], false, |stmt, arena| {
+            .fetch_all_arena(sql, sql_hash, &[], false, |stmt, _arena| {
                 let id = stmt.column_int64(0);
-                let bytes = stmt.column_text(1).unwrap_or(b"");
-                let off = arena.alloc_copy(bytes);
-                let s = arena.get_str(off, bytes.len()).unwrap();
-                let s = unsafe { bsql_arena::extend_lifetime_str(s) };
-                Ok(Row { id, name: s })
+                let name = stmt
+                    .column_text(1)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .unwrap_or("")
+                    .to_owned();
+                Ok(Row { id, name })
             })
             .unwrap();
 
         assert_eq!(rows.len(), 1000);
         assert_eq!(rows[0].name, "name_0");
         assert_eq!(rows[999].name, "name_999");
-        assert!(rows.arena_allocated() > 0);
 
         drop(pool);
         let _ = std::fs::remove_file(&path);

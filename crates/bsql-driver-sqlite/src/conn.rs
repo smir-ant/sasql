@@ -9,9 +9,8 @@
 //! independent of the SQLite statement lifetime.
 //!
 //! All FFI interaction goes through the safe [`DbHandle`] and [`StmtHandle`]
-//! wrapper types in [`crate::ffi`]. The only `unsafe` block is in
-//! `fetch_all_arena` which constructs an `ArenaRows` — a self-referential
-//! struct where rows borrow from a co-owned arena (see `bsql_arena::ArenaRows`).
+//! wrapper types in [`crate::ffi`]. No `unsafe` in user-facing APIs — text
+//! columns are batch-validated via `String::from_utf8` (SIMD-accelerated in std).
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
@@ -338,18 +337,11 @@ impl SqliteConnection {
         Ok(results)
     }
 
-    /// Fetch all rows into an arena-backed result. Text and blob data is
-    /// bump-allocated into the arena; the returned `ArenaRows<T>` owns both
-    /// the arena and the decoded rows.
+    /// Fetch all rows into an arena-backed result.
     ///
-    /// The `decode` closure receives `(&StmtHandle, &mut Arena)`. For text
-    /// columns it should:
-    /// 1. `arena.alloc_copy(bytes)` — copy from SQLite into the arena
-    /// 2. `arena.get_str(offset, len)` — get a `&str` borrowing from the arena
-    /// 3. `extend_lifetime_str(s)` — transmute to `&'static str`
-    ///
-    /// This eliminates per-row heap allocation for strings — all text data
-    /// lives in one contiguous arena that is freed in a single deallocation.
+    /// The `decode` closure receives `(&StmtHandle, &mut Arena)` and should
+    /// store scalar columns directly and blob columns via `arena.alloc_copy`.
+    /// No unsafe is involved — `ArenaRows::new` is fully safe.
     #[inline]
     pub fn fetch_all_arena<F, T>(
         &mut self,
@@ -372,11 +364,7 @@ impl SqliteConnection {
             results.push(decode(stmt, &mut arena)?);
         }
         stmt.reset()?;
-        // SAFETY: The decode closure stored &'static str / &'static [u8]
-        // that actually point into `arena`. The ArenaRows struct guarantees
-        // `results` (Vec<T>) is dropped before `arena` (field declaration
-        // order), so the references are valid for the lifetime of ArenaRows.
-        Ok(unsafe { bsql_arena::ArenaRows::from_raw_parts(results, arena) })
+        Ok(bsql_arena::ArenaRows::new(results, arena))
     }
 
     /// Process each row in-place via a closure. Zero-copy -- text columns
@@ -839,23 +827,6 @@ impl QueryResult {
     pub fn get_str<'a>(&self, row: usize, col: usize, arena: &'a Arena) -> Option<&'a str> {
         let bytes = self.get_bytes(row, col, arena)?;
         std::str::from_utf8(bytes).ok()
-    }
-
-    /// Get a text value WITHOUT UTF-8 validation. Returns `None` only for NULL.
-    ///
-    /// # Safety
-    ///
-    /// The caller must guarantee the stored bytes are valid UTF-8.
-    /// This is safe for SQLite TEXT columns (SQLite guarantees UTF-8).
-    #[inline]
-    pub unsafe fn get_str_unchecked<'a>(
-        &self,
-        row: usize,
-        col: usize,
-        arena: &'a Arena,
-    ) -> Option<&'a str> {
-        let bytes = self.get_bytes(row, col, arena)?;
-        Some(unsafe { std::str::from_utf8_unchecked(bytes) })
     }
 
     /// Get a bool value (stored as i64, 0=false, nonzero=true). Returns `None` for NULL.
@@ -2347,13 +2318,14 @@ mod tests {
         let sql = "SELECT id, name FROM t";
         let hash = hash_sql(sql);
         let rows = conn
-            .fetch_all_arena(sql, hash, &[], |stmt, arena| {
+            .fetch_all_arena(sql, hash, &[], |stmt, _arena| {
                 let id = stmt.column_int64(0);
-                let bytes = stmt.column_text(1).unwrap_or(b"");
-                let off = arena.alloc_copy(bytes);
-                let s = arena.get_str(off, bytes.len()).unwrap();
-                let s = unsafe { bsql_arena::extend_lifetime_str(s) };
-                Ok((id, s))
+                let text = stmt
+                    .column_text(1)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .unwrap_or("")
+                    .to_owned();
+                Ok((id, text))
             })
             .unwrap();
         assert!(rows.is_empty());
@@ -2378,21 +2350,20 @@ mod tests {
 
         struct Row {
             id: i64,
-            name: &'static str,
+            name: String,
         }
 
         let rows = conn
-            .fetch_all_arena(sql, hash, &[], |stmt, arena| {
+            .fetch_all_arena(sql, hash, &[], |stmt, _arena| {
                 let id = stmt.column_int64(0);
-                let bytes = stmt
+                let name = stmt
                     .column_text(1)
-                    .ok_or_else(|| SqliteError::Internal("null name".into()))?;
-                let off = arena.alloc_copy(bytes);
-                let s = arena
-                    .get_str(off, bytes.len())
-                    .ok_or_else(|| SqliteError::Internal("bad utf8".into()))?;
-                let s = unsafe { bsql_arena::extend_lifetime_str(s) };
-                Ok(Row { id, name: s })
+                    .ok_or_else(|| SqliteError::Internal("null name".into()))
+                    .and_then(|b| {
+                        std::str::from_utf8(b).map_err(|_| SqliteError::Internal("bad utf8".into()))
+                    })?
+                    .to_owned();
+                Ok(Row { id, name })
             })
             .unwrap();
 
@@ -2405,7 +2376,7 @@ mod tests {
         assert_eq!(rows[2].name, "charlie");
 
         // Verify we can iterate
-        let names: Vec<&str> = rows.iter().map(|r| r.name).collect();
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, vec!["alice", "bob", "charlie"]);
 
         drop(rows);
@@ -2430,17 +2401,18 @@ mod tests {
 
         struct Row {
             id: i64,
-            name: &'static str,
+            name: String,
         }
 
         let rows = conn
-            .fetch_all_arena(sql, hash, &[], |stmt, arena| {
+            .fetch_all_arena(sql, hash, &[], |stmt, _arena| {
                 let id = stmt.column_int64(0);
-                let bytes = stmt.column_text(1).unwrap_or(b"");
-                let off = arena.alloc_copy(bytes);
-                let s = arena.get_str(off, bytes.len()).unwrap();
-                let s = unsafe { bsql_arena::extend_lifetime_str(s) };
-                Ok(Row { id, name: s })
+                let name = stmt
+                    .column_text(1)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .unwrap_or("")
+                    .to_owned();
+                Ok(Row { id, name })
             })
             .unwrap();
 
@@ -2448,9 +2420,6 @@ mod tests {
         assert_eq!(rows[0].name, "user_0");
         assert_eq!(rows[999].name, "user_999");
         assert_eq!(rows[500].id, 500);
-
-        // One arena allocation for all strings
-        assert!(rows.arena_allocated() > 0);
 
         drop(rows);
         drop(conn);
@@ -2470,17 +2439,14 @@ mod tests {
 
         struct Row {
             id: i64,
-            data: &'static [u8],
+            data: Vec<u8>,
         }
 
         let rows = conn
-            .fetch_all_arena(sql, hash, &[], |stmt, arena| {
+            .fetch_all_arena(sql, hash, &[], |stmt, _arena| {
                 let id = stmt.column_int64(0);
-                let raw = stmt.column_blob(1);
-                let off = arena.alloc_copy(raw);
-                let slice = arena.get(off, raw.len());
-                let slice = unsafe { bsql_arena::extend_lifetime_bytes(slice) };
-                Ok(Row { id, data: slice })
+                let data = stmt.column_blob(1).to_vec();
+                Ok(Row { id, data })
             })
             .unwrap();
 
@@ -2508,28 +2474,24 @@ mod tests {
 
         struct Row {
             id: i64,
-            name: Option<&'static str>,
+            name: Option<String>,
         }
 
         let rows = conn
-            .fetch_all_arena(sql, hash, &[], |stmt, arena| {
+            .fetch_all_arena(sql, hash, &[], |stmt, _arena| {
                 let id = stmt.column_int64(0);
-                let name = match stmt.column_text(1) {
-                    None => None,
-                    Some(bytes) => {
-                        let off = arena.alloc_copy(bytes);
-                        let s = arena.get_str(off, bytes.len()).unwrap();
-                        Some(unsafe { bsql_arena::extend_lifetime_str(s) })
-                    }
-                };
+                let name = stmt
+                    .column_text(1)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .map(|s| s.to_owned());
                 Ok(Row { id, name })
             })
             .unwrap();
 
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].name, Some("present"));
+        assert_eq!(rows[0].name, Some("present".to_owned()));
         assert_eq!(rows[1].name, None);
-        assert_eq!(rows[2].name, Some("also_present"));
+        assert_eq!(rows[2].name, Some("also_present".to_owned()));
 
         drop(rows);
         drop(conn);
@@ -2549,7 +2511,7 @@ mod tests {
             conn.fetch_all_arena(sql, hash, &[], |_stmt, _arena| {
                 Err(SqliteError::Internal("forced error".into()))
             });
-        assert!(result.is_err());
+        assert!(result.is_err(), "should propagate decode error");
 
         drop(conn);
         let _ = std::fs::remove_file(&path);
@@ -2809,8 +2771,6 @@ mod tests {
 
     #[test]
     fn fetch_all_arena_basic() {
-        use bsql_arena::{ArenaRows, extend_lifetime_str};
-
         let path = temp_db_path();
         let mut conn = SqliteConnection::open(&path).unwrap();
         conn.exec("CREATE TABLE t (id INTEGER NOT NULL, name TEXT NOT NULL)")
@@ -2820,20 +2780,21 @@ mod tests {
 
         struct Row {
             id: i64,
-            name: &'static str,
+            name: String,
         }
 
         let sql = "SELECT id, name FROM t ORDER BY id";
         let hash = hash_sql(sql);
 
-        let ar: ArenaRows<Row> = conn
-            .fetch_all_arena(sql, hash, &[], |stmt, arena| {
+        let ar = conn
+            .fetch_all_arena(sql, hash, &[], |stmt, _arena| {
                 let id = stmt.column_int64(0);
-                let text = stmt.column_text(1).unwrap_or(b"");
-                let off = arena.alloc_copy(text);
-                let s = arena.get_str(off, text.len()).unwrap_or("");
-                let s = unsafe { extend_lifetime_str(s) };
-                Ok(Row { id, name: s })
+                let name = stmt
+                    .column_text(1)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .unwrap_or("")
+                    .to_owned();
+                Ok(Row { id, name })
             })
             .unwrap();
 
@@ -2851,8 +2812,6 @@ mod tests {
 
     #[test]
     fn audit_fetch_all_arena_empty() {
-        use bsql_arena::ArenaRows;
-
         let path = temp_db_path();
         let mut conn = SqliteConnection::open(&path).unwrap();
         conn.exec("CREATE TABLE t (id INTEGER NOT NULL)").unwrap();
@@ -2860,7 +2819,7 @@ mod tests {
         let sql = "SELECT id FROM t";
         let hash = hash_sql(sql);
 
-        let ar: ArenaRows<i64> = conn
+        let ar: bsql_arena::ArenaRows<i64> = conn
             .fetch_all_arena(sql, hash, &[], |stmt, _arena| Ok(stmt.column_int64(0)))
             .unwrap();
 
@@ -3016,7 +2975,7 @@ mod tests {
             let id = stmt.column_int64(0);
             assert_eq!(id, count as i64);
             let name_bytes = stmt.column_text(1).unwrap();
-            let name = unsafe { std::str::from_utf8_unchecked(name_bytes) };
+            let name = std::str::from_utf8(name_bytes).unwrap();
             assert_eq!(name, format!("name_{count}"));
             count += 1;
             Ok(())
@@ -3041,7 +3000,7 @@ mod tests {
         conn.for_each(sql, hash, &[], |stmt| {
             // column_text returns &[u8] borrowed directly from SQLite
             let bytes = stmt.column_text(1).unwrap();
-            let s = unsafe { std::str::from_utf8_unchecked(bytes) };
+            let s = std::str::from_utf8(bytes).unwrap();
             assert_eq!(s, "hello world");
             // Verify it's a valid pointer (not copied) by checking length
             assert_eq!(bytes.len(), 11);
