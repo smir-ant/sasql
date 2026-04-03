@@ -4,10 +4,10 @@
 //!
 //! **If it compiles, the SQL is correct.**
 //!
-//! bsql is a proc-macro library that validates every SQL query against a real
-//! PostgreSQL instance at compile time. There is no `query()` function. There is
-//! no escape hatch. There is `query!` — validated, typed, checked. If the binary
-//! is produced, every SQL query in it is correct.
+//! bsql validates every SQL query against a real database at compile time.
+//! There is no `query()` function. There is no escape hatch. There is `query!`
+//! — validated, typed, checked. If the binary is produced, every SQL query in
+//! it is correct.
 //!
 //! ## Quick Start
 //!
@@ -47,31 +47,21 @@
 //! }
 //! ```
 //!
+//! ## Three methods — that's it
+//!
+//! | Method | Returns | Use |
+//! |--------|---------|-----|
+//! | `.fetch(&pool)` | `Vec<Row>` | SELECT queries |
+//! | `.run(&pool)` | `u64` | INSERT, UPDATE, DELETE |
+//! | `.defer(&tx)` | `()` | Buffer in transaction |
+//!
+//! Power users: `fetch_one`, `fetch_optional`, `fetch_stream`, `for_each` also available.
+//!
 //! ## No escape hatch
 //!
 //! There is no `bsql::query()` function. There is no `raw_sql()`. There is no
 //! way to execute unchecked SQL through bsql. If you need unchecked SQL, use
 //! `tokio-postgres` directly. bsql will not become the thing it replaces.
-//!
-//! ## Execution methods
-//!
-//! **Simple API** (recommended):
-//!
-//! | Method | Returns | Use when |
-//! |--------|---------|----------|
-//! | `.fetch(&pool)` | `Vec<T>` | SELECT queries |
-//! | `.run(&pool)` | `u64` (affected rows) | INSERT/UPDATE/DELETE |
-//!
-//! **Full API** (power users):
-//!
-//! | Method | Returns | Use when |
-//! |--------|---------|----------|
-//! | `.fetch_one(&pool)` | `T` | Exactly one row expected |
-//! | `.fetch_all(&pool)` | `Vec<T>` | Same as `.fetch()` |
-//! | `.fetch_optional(&pool)` | `Option<T>` | Zero or one row |
-//! | `.fetch_stream(&pool)` | `impl Stream<Item = Result<T>>` | Large result sets |
-//! | `.execute(&pool)` | `u64` | Same as `.run()` |
-//! | `.defer(&tx)` | `()` | Buffer writes in a transaction pipeline |
 
 // Re-export the query! macro and attribute macros
 pub use bsql_macros::pg_enum;

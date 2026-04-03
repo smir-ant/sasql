@@ -1,17 +1,36 @@
-//! Streaming large result sets from PostgreSQL with bsql.
+//! Streaming large result sets from PostgreSQL.
 //!
-//! Demonstrates: fetch_stream for row-by-row processing without loading
+//! Demonstrates `fetch_stream` for row-by-row processing without loading
 //! the entire result set into memory.
 //!
-//! Uses PostgreSQL's portal / extended query protocol to stream rows
-//! in batches. Each row is decoded and processed before the next batch
-//! is fetched, keeping memory usage constant regardless of result size.
+//! Uses PostgreSQL's portal / extended query protocol to stream rows in
+//! batches of 64. Each row is decoded and processed before the next batch
+//! is fetched. Memory usage stays constant regardless of result set size.
 //!
-//! Requires a PostgreSQL instance with:
-//!   CREATE TABLE events (id SERIAL PRIMARY KEY, kind TEXT NOT NULL, payload TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+//! Use `.fetch()` for normal queries. Use `.fetch_stream()` when you have
+//! millions of rows and cannot afford to hold them all in memory at once.
 //!
-//! Run:
-//!   BSQL_DATABASE_URL=postgres://user:pass@localhost/mydb cargo run --bin pg_streaming
+//! ## Setup
+//!
+//! ```sql
+//! CREATE TABLE events (
+//!     id         SERIAL PRIMARY KEY,
+//!     kind       TEXT NOT NULL,
+//!     payload    TEXT,
+//!     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+//! );
+//! -- Insert some test data:
+//! INSERT INTO events (kind, payload)
+//!     SELECT 'user_signup', 'user_' || i
+//!     FROM generate_series(1, 10000) AS i;
+//! ```
+//!
+//! ## Run
+//!
+//! ```sh
+//! export BSQL_DATABASE_URL=postgres://user:pass@localhost/mydb
+//! cargo run --bin pg_streaming
+//! ```
 
 use bsql::{BsqlError, Pool};
 use futures::StreamExt;
@@ -20,10 +39,11 @@ use futures::StreamExt;
 async fn main() -> Result<(), BsqlError> {
     let pool = Pool::connect("postgres://user:pass@localhost/mydb").await?;
 
-    // --- Stream rows one by one ---
-    // stream returns a Stream<Item = Result<Row>>. Rows are fetched
-    // in batches from PostgreSQL, but yielded one at a time.
-    // Memory usage stays constant even for millions of rows.
+    // ---------------------------------------------------------------
+    // Stream all rows — constant memory regardless of table size
+    // ---------------------------------------------------------------
+    // fetch_stream returns a Stream<Item = Result<Row>>. Rows arrive
+    // in batches of 64, but are yielded one at a time.
     let mut stream = bsql::query!(
         "SELECT id, kind, payload FROM events ORDER BY id"
     )
@@ -35,20 +55,20 @@ async fn main() -> Result<(), BsqlError> {
         let event = event?;
         count += 1;
 
-        // Process each row without accumulating them.
+        // Process each row without accumulating. In a real app, you
+        // might write to a file, send to a queue, or update a cache.
         if count <= 5 {
             println!(
                 "Event {}: kind={}, payload={:?}",
-                event.id,
-                event.kind,
-                event.payload
+                event.id, event.kind, event.payload
             );
         }
     }
     println!("Streamed {count} total events.");
 
-    // --- Streaming with a filter ---
-    // Combine streaming with parameterized queries.
+    // ---------------------------------------------------------------
+    // Streaming with filters — same parameterized query syntax
+    // ---------------------------------------------------------------
     let kind = "user_signup";
     let mut stream = bsql::query!(
         "SELECT id, kind, payload FROM events WHERE kind = $kind: &str ORDER BY id"
@@ -61,8 +81,6 @@ async fn main() -> Result<(), BsqlError> {
         let event = event?;
         signup_count += 1;
 
-        // Example: write each row to a file, send to a queue, etc.
-        // The point is that you never hold more than one row in memory.
         if signup_count <= 3 {
             println!("Signup event {}: {:?}", event.id, event.payload);
         }

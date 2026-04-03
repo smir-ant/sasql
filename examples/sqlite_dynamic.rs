@@ -1,25 +1,34 @@
-//! Dynamic queries with SQLite in bsql.
+//! Dynamic queries with optional WHERE clauses in SQLite.
 //!
-//! Demonstrates: Optional WHERE clauses and sort enums with SQLite.
-//! The syntax is identical to PostgreSQL -- bsql abstracts the backend.
+//! Same syntax as PostgreSQL. Wrap clauses in `[...]` with `Option<T>` params.
+//! bsql generates every combination at compile time and validates each.
 //!
-//! Requires the `sqlite` feature and a SQLite database with:
-//!   CREATE TABLE tickets (
-//!     id INTEGER PRIMARY KEY,
-//!     title TEXT NOT NULL,
+//! Key difference from PostgreSQL: SQLite uses `i64` for integer types.
+//!
+//! ## Setup
+//!
+//! ```sh
+//! sqlite3 myapp.db "CREATE TABLE tickets (
+//!     id            INTEGER PRIMARY KEY,
+//!     title         TEXT NOT NULL,
 //!     department_id INTEGER,
-//!     assignee_id INTEGER,
-//!     priority INTEGER NOT NULL DEFAULT 0,
-//!     created_at TEXT NOT NULL DEFAULT (datetime('now')),
-//!     deleted_at TEXT
-//!   );
+//!     assignee_id   INTEGER,
+//!     priority      INTEGER NOT NULL DEFAULT 0,
+//!     created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+//!     deleted_at    TEXT
+//! );"
+//! ```
 //!
-//! Run:
-//!   BSQL_DATABASE_URL=sqlite:./myapp.db cargo run --bin sqlite_dynamic
+//! ## Run
+//!
+//! ```sh
+//! export BSQL_DATABASE_URL=sqlite:./myapp.db
+//! cargo run --bin sqlite_dynamic
+//! ```
 
 use bsql::{BsqlError, SqlitePool};
 
-// Sort enum works the same for SQLite.
+// Sort enum works identically for SQLite and PostgreSQL.
 #[bsql::sort]
 enum TicketSort {
     #[sql("created_at ASC")]
@@ -32,12 +41,15 @@ enum TicketSort {
 
 #[tokio::main]
 async fn main() -> Result<(), BsqlError> {
-    let pool = SqlitePool::connect("./myapp.db")?;
+    let pool = SqlitePool::open("./myapp.db")?;
 
-    // --- Optional WHERE clauses ---
-    // Same syntax as PostgreSQL. Each combination is validated at compile time.
+    // ---------------------------------------------------------------
+    // Optional WHERE clauses — same syntax as PostgreSQL
+    // ---------------------------------------------------------------
+    // dept=Some(3) includes the clause; assignee=None omits it.
     let dept: Option<i64> = Some(3);
     let assignee: Option<i64> = None;
+
     let tickets = bsql::query!(
         "SELECT id, title, priority FROM tickets
          WHERE deleted_at IS NULL
@@ -46,7 +58,7 @@ async fn main() -> Result<(), BsqlError> {
          ORDER BY created_at DESC
          LIMIT 50"
     )
-    .fetch(&pool) // also available: .fetch_all(&pool)
+    .fetch(&pool)
     .await?;
 
     println!("Found {} tickets for department 3:", tickets.len());
@@ -54,16 +66,19 @@ async fn main() -> Result<(), BsqlError> {
         println!("  [{}] {} (priority={})", t.id, t.title, t.priority);
     }
 
-    // --- Sort enum ---
+    // ---------------------------------------------------------------
+    // Sort enum — compile-time validated ORDER BY
+    // ---------------------------------------------------------------
     let sort = TicketSort::Priority;
     let limit = 20i64;
+
     let sorted = bsql::query!(
         "SELECT id, title, priority FROM tickets
          WHERE deleted_at IS NULL
          ORDER BY $[sort: TicketSort]
          LIMIT $limit: i64"
     )
-    .fetch(&pool) // also available: .fetch_all(&pool)
+    .fetch(&pool)
     .await?;
 
     println!("\nTop {} tickets by priority:", limit);
@@ -71,12 +86,15 @@ async fn main() -> Result<(), BsqlError> {
         println!("  [{}] {} (priority={})", t.id, t.title, t.priority);
     }
 
-    // --- Combining all features ---
+    // ---------------------------------------------------------------
+    // Combining optional clauses + sort + pagination
+    // ---------------------------------------------------------------
     let dept: Option<i64> = None;
     let min_priority: Option<i64> = Some(5);
     let sort = TicketSort::Newest;
     let limit = 10i64;
     let offset = 0i64;
+
     let page = bsql::query!(
         "SELECT id, title, priority FROM tickets
          WHERE deleted_at IS NULL
@@ -85,7 +103,7 @@ async fn main() -> Result<(), BsqlError> {
          ORDER BY $[sort: TicketSort]
          LIMIT $limit: i64 OFFSET $offset: i64"
     )
-    .fetch(&pool) // also available: .fetch_all(&pool)
+    .fetch(&pool)
     .await?;
 
     println!("\nPage of high-priority tickets: {}", page.len());

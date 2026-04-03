@@ -17,6 +17,23 @@ use std::fmt;
 /// - [`Decode`](BsqlError::Decode) — a column value could not be converted to
 ///   the expected Rust type.
 /// - [`Connect`](BsqlError::Connect) — initial connection to PostgreSQL failed.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use bsql::{Pool, BsqlError};
+///
+/// let pool = Pool::connect("postgres://user:pass@localhost/mydb").await?;
+///
+/// // Match on error variants for fine-grained handling
+/// let result = bsql::query!("INSERT INTO users (name) VALUES ($n: &str)")
+///     .run(&pool).await;
+/// match result {
+///     Ok(affected) => println!("inserted {affected}"),
+///     Err(e) if e.is_unique_violation() => println!("already exists"),
+///     Err(e) => return Err(e),
+/// }
+/// ```
 #[derive(Debug)]
 pub enum BsqlError {
     Pool(PoolError),

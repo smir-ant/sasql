@@ -11,8 +11,27 @@ use crate::error::{BsqlError, BsqlResult};
 
 /// A SQLite connection pool.
 ///
-/// Wraps `bsql_driver_sqlite::pool::SqlitePool` with bsql error types.
-/// All operations are synchronous — no async runtime required.
+/// Created via [`SqlitePool::open`] or [`SqlitePool::builder`]. Uses a single
+/// writer connection plus N reader connections (default 4). All operations are
+/// synchronous -- no async runtime required.
+///
+/// bsql automatically configures WAL mode, mmap, and page cache for optimal
+/// performance.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use bsql::SqlitePool;
+///
+/// // Simple: open with defaults (4 readers)
+/// let pool = SqlitePool::open("./myapp.db")?;
+///
+/// // Advanced: configure via builder
+/// let pool = SqlitePool::builder()
+///     .path("./myapp.db")
+///     .reader_count(8)
+///     .build()?;
+/// ```
 pub struct SqlitePool {
     inner: Arc<bsql_driver_sqlite::pool::SqlitePool>,
 }
@@ -370,6 +389,21 @@ impl SqlitePool {
 ///
 /// All write operations during a transaction are routed to the pool's
 /// single writer connection.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use bsql::SqlitePool;
+///
+/// let pool = SqlitePool::open("./myapp.db")?;
+/// let tx = pool.begin()?;
+///
+/// // Execute writes within the transaction...
+/// bsql::query!("INSERT INTO log (msg) VALUES ($msg: &str)")
+///     .run(&tx)?;
+///
+/// tx.commit()?;  // or drop to auto-rollback
+/// ```
 pub struct SqliteTransaction {
     pool: Arc<bsql_driver_sqlite::pool::SqlitePool>,
     finished: bool,

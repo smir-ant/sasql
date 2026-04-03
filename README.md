@@ -194,38 +194,33 @@ No string concatenation. No runtime SQL assembly. 2 optional clauses = 4 variant
 <details>
 <summary>Execution methods</summary>
 
-**Simple API** (recommended):
-
-| Method | Returns | Use when |
+| Method | Returns | Use |
 |---|---|---|
-| `.fetch(&pool)` | `Vec<T>` | SELECT queries |
-| `.run(&pool)` | `u64` (affected rows) | INSERT/UPDATE/DELETE |
+| `.fetch(&pool)` | `Vec<Row>` | SELECT queries |
+| `.run(&pool)` | `u64` | INSERT, UPDATE, DELETE |
+| `.defer(&tx)` | `()` | Buffer in transaction |
 
-**Full API** (power users):
-
-| Method | Returns | Use when |
-|---|---|---|
-| `.fetch_one(&pool)` | `T` | Exactly one row expected |
-| `.fetch_all(&pool)` | `Vec<T>` | Same as `.fetch()` |
-| `.fetch_optional(&pool)` | `Option<T>` | Zero or one row |
-| `.fetch_stream(&pool)` | `impl Stream<Item = Result<T>>` | Large result sets |
-| `.execute(&pool)` | `u64` | Same as `.run()` |
-| `.defer(&tx)` | `()` | Buffer writes in a transaction pipeline |
+Power users: `fetch_one`, `fetch_optional`, `fetch_stream`, `for_each` also available.
 
 </details>
 
 <details>
-<summary>Transactions and savepoints</summary>
+<summary>Transactions and batching</summary>
 
 ```rust
 let tx = pool.begin().await?;
 
-// Queries within the transaction...
-tx.savepoint("sp1").await?;
-// More queries...
-tx.rollback_to("sp1").await?;
+// .defer() buffers writes -- nothing hits the network yet
+bsql::query!("INSERT INTO audit_log (msg) VALUES ($msg: &str)")
+    .defer(&tx).await?;
+bsql::query!("UPDATE accounts SET balance = balance - $amt: i32 WHERE id = $id: i32")
+    .defer(&tx).await?;
+
+// commit() flushes all deferred operations in a single pipeline, then commits
 tx.commit().await?;
 ```
+
+Savepoints are also supported: `tx.savepoint("sp1")`, `tx.rollback_to("sp1")`.
 
 If the transaction is dropped without calling `commit()`, it automatically rolls back.
 
@@ -256,9 +251,9 @@ True PostgreSQL-level streaming. Rows are fetched in batches and yielded one at 
 let mut listener = Listener::connect("postgres://...").await?;
 listener.listen("events").await?;
 
-while let Some(notification) = listener.next().await {
-    let n = notification?;
-    println!("channel={}, payload={}", n.channel, n.payload);
+loop {
+    let n = listener.recv().await?;
+    println!("channel={}, payload={}", n.channel(), n.payload());
 }
 ```
 

@@ -13,12 +13,27 @@ use crate::error::{BsqlError, BsqlResult};
 use crate::stream::QueryStream;
 use crate::transaction::Transaction;
 
-/// A PostgreSQL connection pool with optional read/write splitting.
+/// A PostgreSQL connection pool.
 ///
-/// Wraps `bsql_driver_postgres::Pool` with bsql error types and the `Executor` trait.
-/// When a `replica_url` is configured, `query_raw_readonly` routes to the replica
-/// pool while all writes go to the primary. When no replica is configured,
-/// `query_raw_readonly` falls back to the primary pool.
+/// Created via [`Pool::connect`] or [`Pool::builder`]. The pool manages a set
+/// of connections, automatically acquires/releases them for each query, and
+/// supports optional read/write splitting with a replica.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use bsql::Pool;
+///
+/// let pool = Pool::connect("postgres://user:pass@localhost/mydb").await?;
+///
+/// // Or configure via builder:
+/// let pool = Pool::builder()
+///     .url("postgres://user:pass@localhost/mydb")
+///     .lifetime_secs(900)
+///     .timeout_secs(5)
+///     .build()
+///     .await?;
+/// ```
 pub struct Pool {
     pub(crate) inner: bsql_driver_postgres::Pool,
     /// Optional read replica pool. When present, `query_raw_readonly` routes here.
@@ -26,6 +41,21 @@ pub struct Pool {
 }
 
 /// Builder for configuring a connection pool.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use bsql::Pool;
+///
+/// let pool = Pool::builder()
+///     .url("postgres://user:pass@localhost/mydb")
+///     .max_size(20)
+///     .lifetime_secs(900)
+///     .timeout_secs(5)
+///     .min_idle(2)
+///     .build()
+///     .await?;
+/// ```
 pub struct PoolBuilder {
     url: Option<String>,
     max_size: usize,

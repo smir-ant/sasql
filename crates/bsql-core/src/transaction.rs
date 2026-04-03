@@ -53,11 +53,29 @@ impl fmt::Display for IsolationLevel {
 /// committed via [`commit()`](Transaction::commit). If dropped without
 /// `commit()`, the connection is discarded from the pool and a warning is logged.
 ///
-/// Uses `tokio::sync::Mutex` for interior mutability because the driver's
-/// `Transaction` requires `&mut self` but the `Executor` trait takes `&self`.
-/// The mutex is uncontended in practice — a transaction is used by one task
-/// at a time. `tokio::sync::Mutex` (over `RefCell`) is required because the
-/// future holding the lock must be `Send` for tokio task migration.
+/// Use `.defer(&tx)` on queries to buffer writes, then `tx.commit()` to flush
+/// them all in a single pipeline. Use `.run(&tx)` or `.fetch(&tx)` for immediate
+/// execution within the transaction.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use bsql::Pool;
+///
+/// let pool = Pool::connect("postgres://user:pass@localhost/mydb").await?;
+/// let tx = pool.begin().await?;
+///
+/// // Buffer writes with .defer() — nothing hits the network yet
+/// bsql::query!("INSERT INTO log (msg) VALUES ($msg: &str)")
+///     .defer(&tx).await?;
+///
+/// // Or execute immediately within the transaction
+/// bsql::query!("UPDATE accounts SET balance = 0 WHERE id = $id: i32")
+///     .run(&tx).await?;
+///
+/// // commit() flushes all deferred operations, then commits
+/// tx.commit().await?;
+/// ```
 pub struct Transaction {
     inner: Mutex<Option<bsql_driver_postgres::Transaction>>,
     /// Set to true when commit() or rollback() is called.
