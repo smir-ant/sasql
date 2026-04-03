@@ -80,9 +80,20 @@ pub use bsql_macros::sort;
 
 // Re-export all runtime types
 pub use bsql_core::error::{self, BsqlError, BsqlResult};
+// Used by generated code from `bsql::query!`. Not part of the user-facing API.
+#[doc(hidden)]
 pub use bsql_core::executor::{Executor, OwnedResult};
 pub use bsql_core::listener::{Listener, Notification};
-pub use bsql_core::pool::{Pool, PoolBuilder, PoolConnection, PoolStatus};
+pub use bsql_core::pool::{Pool, PoolBuilder, PoolStatus};
+
+/// A connection borrowed from the pool via [`Pool::acquire()`].
+///
+/// Most users should use `Pool` directly (query methods acquire and release
+/// connections automatically). `PoolConnection` is for advanced use cases
+/// where you need to hold a connection across multiple queries without a
+/// transaction.
+#[doc(hidden)]
+pub use bsql_core::pool::PoolConnection;
 pub use bsql_core::stream::QueryStream;
 pub use bsql_core::transaction::{IsolationLevel, Transaction};
 

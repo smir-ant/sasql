@@ -229,6 +229,7 @@ impl Transaction {
     /// Any read operation (`query_inner`, `for_each_raw`, `simple_query`, etc.)
     /// automatically flushes deferred operations first to ensure
     /// read-your-writes consistency.
+    #[doc(hidden)]
     pub async fn defer_execute(
         &self,
         sql: &str,
@@ -246,6 +247,7 @@ impl Transaction {
     ///
     /// Sends all buffered Bind+Execute messages + one Sync in a single TCP write.
     /// Returns the affected row count for each deferred operation.
+    #[doc(hidden)]
     pub async fn flush_deferred(&self) -> BsqlResult<Vec<u64>> {
         let mut guard = self.inner.lock().await;
         let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;

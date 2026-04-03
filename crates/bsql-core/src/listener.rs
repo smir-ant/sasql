@@ -227,14 +227,8 @@ impl Listener {
             .ok_or_else(|| ConnectError::create("listener connection closed"))
     }
 
-    /// Alias for [`recv`](Self::recv) — matches async iterator/stream naming
-    /// conventions.
-    pub async fn next(&mut self) -> BsqlResult<Notification> {
-        self.recv().await
-    }
-
     /// Non-blocking receive. Returns `Ok(None)` if no notification is
-    /// available right now (as opposed to `recv()`/`next()` which await).
+    /// available right now (as opposed to `recv()` which awaits).
     ///
     /// Returns `Err` only if the listener connection has been closed.
     pub fn try_recv(&mut self) -> BsqlResult<Option<Notification>> {
