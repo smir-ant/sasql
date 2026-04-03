@@ -973,6 +973,7 @@ mod tests {
         let blob_arena = Arena::new();
 
         #[derive(Debug)]
+        #[allow(dead_code)]
         struct Inner {
             id: i64,
             name_start: u32,
@@ -1291,6 +1292,7 @@ mod tests {
         let offset = arena.alloc_copy(b"stored data");
 
         #[derive(Debug)]
+        #[allow(dead_code)]
         struct Inner {
             off: usize,
             len: usize,

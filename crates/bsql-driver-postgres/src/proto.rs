@@ -839,7 +839,7 @@ mod tests {
 
     #[test]
     fn ready_for_query_parses() {
-        let msg = parse_backend_message(b'Z', &[b'I']).unwrap();
+        let msg = parse_backend_message(b'Z', b"I").unwrap();
         match msg {
             BackendMessage::ReadyForQuery { status } => assert_eq!(status, b'I'),
             _ => panic!("expected ReadyForQuery"),
@@ -858,7 +858,7 @@ mod tests {
 
     #[test]
     fn parameter_status_parses() {
-        let payload = b"server_version\015.2\0".to_vec();
+        let payload = b"server_version\x0015.2\0".to_vec();
         let msg = parse_backend_message(b'S', &payload).unwrap();
         match msg {
             BackendMessage::ParameterStatus { name, value } => {

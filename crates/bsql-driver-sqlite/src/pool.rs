@@ -574,6 +574,7 @@ impl SqlitePoolBuilder {
 }
 
 #[cfg(test)]
+#[allow(clippy::approx_constant)]
 mod tests {
     use super::*;
 
@@ -1943,6 +1944,7 @@ mod tests {
         let sql = "SELECT id, name FROM t ORDER BY id";
         let sql_hash = hash_sql(sql);
 
+        #[allow(dead_code)]
         struct Row {
             id: i64,
             name: String,
@@ -2044,6 +2046,7 @@ mod tests {
         let sql = "SELECT id, name FROM t ORDER BY id";
         let sql_hash = hash_sql(sql);
 
+        #[allow(dead_code)]
         struct Row {
             id: i64,
             name: String,

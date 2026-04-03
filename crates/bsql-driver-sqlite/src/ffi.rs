@@ -564,6 +564,7 @@ impl Drop for StmtHandle {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::approx_constant)]
 mod tests {
     use super::*;
 
@@ -1040,7 +1041,7 @@ mod tests {
     fn exec_null_in_sql() {
         let path = temp_db_path();
         let db = DbHandle::open(&path, rw_flags()).unwrap();
-        let result = db.exec("SELECT\01");
+        let result = db.exec("SELECT\x001");
         assert!(result.is_err());
         match result {
             Err(SqliteError::Internal(msg)) => assert!(msg.contains("null")),

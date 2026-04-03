@@ -1436,6 +1436,7 @@ fn build_bind_template(write_buf: &[u8], param_count: usize) -> Option<BindTempl
 }
 
 #[cfg(test)]
+#[allow(clippy::approx_constant)]
 mod tests {
     use super::*;
     use crate::conn::hash_sql;

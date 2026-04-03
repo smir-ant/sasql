@@ -836,6 +836,7 @@ impl QueryResult {
 }
 
 #[cfg(test)]
+#[allow(clippy::approx_constant)]
 mod tests {
     use super::*;
 
@@ -2437,6 +2438,7 @@ mod tests {
         let sql = "SELECT id, data FROM t ORDER BY id";
         let hash = hash_sql(sql);
 
+        #[allow(dead_code)]
         struct Row {
             id: i64,
             data: Vec<u8>,
@@ -2472,6 +2474,7 @@ mod tests {
         let sql = "SELECT id, name FROM t ORDER BY id";
         let hash = hash_sql(sql);
 
+        #[allow(dead_code)]
         struct Row {
             id: i64,
             name: Option<String>,
@@ -3643,6 +3646,7 @@ mod tests {
         let hash = hash_sql(sql);
 
         #[derive(Debug)]
+        #[allow(dead_code)]
         struct Row {
             id: i64,
             data_offset: usize,

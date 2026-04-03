@@ -1108,11 +1108,7 @@ async fn streaming_1000_rows() {
             .await
             .unwrap();
 
-        let row_count = if num_cols > 0 {
-            col_offsets.len() / num_cols
-        } else {
-            0
-        };
+        let row_count = col_offsets.len().checked_div(num_cols).unwrap_or(0);
 
         for i in 0..row_count {
             let (offset, len) = col_offsets[i * num_cols];

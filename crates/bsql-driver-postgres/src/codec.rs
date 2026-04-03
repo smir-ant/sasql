@@ -1303,6 +1303,7 @@ pub fn decode_numeric_decimal(data: &[u8]) -> Result<rust_decimal::Decimal, Driv
 }
 
 #[cfg(test)]
+#[allow(clippy::approx_constant)]
 mod tests {
     use super::*;
 
@@ -1312,11 +1313,11 @@ mod tests {
     fn bool_roundtrip() {
         let mut buf = Vec::new();
         true.encode_binary(&mut buf);
-        assert_eq!(decode_bool(&buf).unwrap(), true);
+        assert!(decode_bool(&buf).unwrap());
 
         buf.clear();
         false.encode_binary(&mut buf);
-        assert_eq!(decode_bool(&buf).unwrap(), false);
+        assert!(!decode_bool(&buf).unwrap());
     }
 
     #[test]

@@ -172,6 +172,7 @@ pub fn decode_i16(data: &[u8]) -> Option<i16> {
 }
 
 #[cfg(test)]
+#[allow(clippy::approx_constant)]
 mod tests {
     use super::*;
 

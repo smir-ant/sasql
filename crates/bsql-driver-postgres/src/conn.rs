@@ -2706,6 +2706,7 @@ pub fn hash_sql(sql: &str) -> u64 {
 }
 
 #[cfg(test)]
+#[allow(clippy::approx_constant)]
 mod tests {
     use super::*;
 
