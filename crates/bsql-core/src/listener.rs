@@ -227,6 +227,26 @@ impl Listener {
             .ok_or_else(|| ConnectError::create("listener connection closed"))
     }
 
+    /// Alias for [`recv`](Self::recv) — matches async iterator/stream naming
+    /// conventions.
+    pub async fn next(&mut self) -> BsqlResult<Notification> {
+        self.recv().await
+    }
+
+    /// Non-blocking receive. Returns `Ok(None)` if no notification is
+    /// available right now (as opposed to `recv()`/`next()` which await).
+    ///
+    /// Returns `Err` only if the listener connection has been closed.
+    pub fn try_recv(&mut self) -> BsqlResult<Option<Notification>> {
+        match self.rx.try_recv() {
+            Ok(notif) => Ok(Some(notif)),
+            Err(mpsc::error::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                Err(ConnectError::create("listener connection closed"))
+            }
+        }
+    }
+
     /// Send a NOTIFY on a channel with a payload.
     ///
     /// The payload must not exceed 7999 bytes (PostgreSQL's limit).

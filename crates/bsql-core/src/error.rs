@@ -164,6 +164,63 @@ impl BsqlError {
         matches!(self, BsqlError::Query(q) if q.pg_code.as_deref() == Some("40001"))
     }
 
+    /// Whether this error is a unique constraint violation (SQLSTATE 23505).
+    ///
+    /// Common when inserting a row that would duplicate a unique index key.
+    /// The error message typically includes which constraint was violated.
+    pub fn is_unique_violation(&self) -> bool {
+        matches!(self, BsqlError::Query(q) if q.pg_code.as_deref() == Some("23505"))
+    }
+
+    /// Whether this error is a foreign key violation (SQLSTATE 23503).
+    ///
+    /// Raised when an INSERT or UPDATE references a row that does not exist
+    /// in the referenced table, or a DELETE would leave dangling references.
+    pub fn is_foreign_key_violation(&self) -> bool {
+        matches!(self, BsqlError::Query(q) if q.pg_code.as_deref() == Some("23503"))
+    }
+
+    /// Whether this error is a NOT NULL violation (SQLSTATE 23502).
+    ///
+    /// Raised when an INSERT or UPDATE sets a NOT NULL column to NULL.
+    pub fn is_not_null_violation(&self) -> bool {
+        matches!(self, BsqlError::Query(q) if q.pg_code.as_deref() == Some("23502"))
+    }
+
+    /// Whether this error is a check constraint violation (SQLSTATE 23514).
+    pub fn is_check_violation(&self) -> bool {
+        matches!(self, BsqlError::Query(q) if q.pg_code.as_deref() == Some("23514"))
+    }
+
+    /// Whether this error is a deadlock (SQLSTATE 40P01).
+    ///
+    /// PostgreSQL detected a deadlock between two or more transactions and
+    /// chose this one as the victim. The correct response is to retry.
+    pub fn is_deadlock(&self) -> bool {
+        matches!(self, BsqlError::Query(q) if q.pg_code.as_deref() == Some("40P01"))
+    }
+
+    /// The PostgreSQL SQLSTATE code, if this is a query error with a code.
+    ///
+    /// Returns `None` for non-query errors or query errors without a code
+    /// (e.g., I/O errors during query execution).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// match err.pg_code() {
+    ///     Some("23505") => println!("unique violation"),
+    ///     Some("23503") => println!("foreign key violation"),
+    ///     _ => {}
+    /// }
+    /// ```
+    pub fn pg_code(&self) -> Option<&str> {
+        match self {
+            BsqlError::Query(q) => q.pg_code.as_deref(),
+            _ => None,
+        }
+    }
+
     /// Convert a `DriverError` that occurred during query execution.
     ///
     /// Unlike the blanket `From<DriverError>` impl (which maps `Io` to `Connect`),
@@ -582,5 +639,178 @@ mod tests {
         let e =
             BsqlError::from_driver_query(bsql_driver_postgres::DriverError::Pool("test".into()));
         assert!(matches!(e, BsqlError::Pool(_)));
+    }
+
+    // --- is_unique_violation ---
+
+    #[test]
+    fn is_unique_violation_true_for_23505() {
+        let e = BsqlError::Query(QueryError {
+            message: Cow::Borrowed("duplicate key value violates unique constraint"),
+            pg_code: Some(Box::from("23505")),
+            source: None,
+        });
+        assert!(e.is_unique_violation());
+    }
+
+    #[test]
+    fn is_unique_violation_false_for_other_codes() {
+        let e = BsqlError::Query(QueryError {
+            message: Cow::Borrowed("timeout"),
+            pg_code: Some(Box::from("57014")),
+            source: None,
+        });
+        assert!(!e.is_unique_violation());
+    }
+
+    #[test]
+    fn is_unique_violation_false_for_non_query() {
+        let e = PoolError::exhausted();
+        assert!(!e.is_unique_violation());
+    }
+
+    // --- is_foreign_key_violation ---
+
+    #[test]
+    fn is_foreign_key_violation_true_for_23503() {
+        let e = BsqlError::Query(QueryError {
+            message: Cow::Borrowed("insert or update violates foreign key constraint"),
+            pg_code: Some(Box::from("23503")),
+            source: None,
+        });
+        assert!(e.is_foreign_key_violation());
+    }
+
+    #[test]
+    fn is_foreign_key_violation_false_for_other_codes() {
+        let e = BsqlError::Query(QueryError {
+            message: Cow::Borrowed("unique"),
+            pg_code: Some(Box::from("23505")),
+            source: None,
+        });
+        assert!(!e.is_foreign_key_violation());
+    }
+
+    #[test]
+    fn is_foreign_key_violation_false_for_non_query() {
+        let e = ConnectError::create("down");
+        assert!(!e.is_foreign_key_violation());
+    }
+
+    // --- is_not_null_violation ---
+
+    #[test]
+    fn is_not_null_violation_true_for_23502() {
+        let e = BsqlError::Query(QueryError {
+            message: Cow::Borrowed("null value in column \"name\" violates not-null constraint"),
+            pg_code: Some(Box::from("23502")),
+            source: None,
+        });
+        assert!(e.is_not_null_violation());
+    }
+
+    #[test]
+    fn is_not_null_violation_false_for_other_codes() {
+        let e = BsqlError::Query(QueryError {
+            message: Cow::Borrowed("unique"),
+            pg_code: Some(Box::from("23505")),
+            source: None,
+        });
+        assert!(!e.is_not_null_violation());
+    }
+
+    // --- is_check_violation ---
+
+    #[test]
+    fn is_check_violation_true_for_23514() {
+        let e = BsqlError::Query(QueryError {
+            message: Cow::Borrowed("new row violates check constraint"),
+            pg_code: Some(Box::from("23514")),
+            source: None,
+        });
+        assert!(e.is_check_violation());
+    }
+
+    #[test]
+    fn is_check_violation_false_for_other_codes() {
+        let e = BsqlError::Query(QueryError {
+            message: Cow::Borrowed("unique"),
+            pg_code: Some(Box::from("23505")),
+            source: None,
+        });
+        assert!(!e.is_check_violation());
+    }
+
+    // --- is_deadlock ---
+
+    #[test]
+    fn is_deadlock_true_for_40p01() {
+        let e = BsqlError::Query(QueryError {
+            message: Cow::Borrowed("deadlock detected"),
+            pg_code: Some(Box::from("40P01")),
+            source: None,
+        });
+        assert!(e.is_deadlock());
+    }
+
+    #[test]
+    fn is_deadlock_false_for_other_codes() {
+        let e = BsqlError::Query(QueryError {
+            message: Cow::Borrowed("serialization"),
+            pg_code: Some(Box::from("40001")),
+            source: None,
+        });
+        assert!(!e.is_deadlock());
+    }
+
+    #[test]
+    fn is_deadlock_false_for_non_query() {
+        let e = PoolError::exhausted();
+        assert!(!e.is_deadlock());
+    }
+
+    // --- pg_code ---
+
+    #[test]
+    fn pg_code_returns_code_for_query_error() {
+        let e = BsqlError::Query(QueryError {
+            message: Cow::Borrowed("duplicate key"),
+            pg_code: Some(Box::from("23505")),
+            source: None,
+        });
+        assert_eq!(e.pg_code(), Some("23505"));
+    }
+
+    #[test]
+    fn pg_code_returns_none_for_query_without_code() {
+        let e = BsqlError::Query(QueryError {
+            message: Cow::Borrowed("I/O error"),
+            pg_code: None,
+            source: None,
+        });
+        assert_eq!(e.pg_code(), None);
+    }
+
+    #[test]
+    fn pg_code_returns_none_for_pool_error() {
+        let e = PoolError::exhausted();
+        assert_eq!(e.pg_code(), None);
+    }
+
+    #[test]
+    fn pg_code_returns_none_for_connect_error() {
+        let e = ConnectError::create("refused");
+        assert_eq!(e.pg_code(), None);
+    }
+
+    #[test]
+    fn pg_code_returns_none_for_decode_error() {
+        let e = BsqlError::Decode(DecodeError {
+            column: Cow::Borrowed("col"),
+            expected: "i32",
+            actual: Cow::Borrowed("text"),
+            source: None,
+        });
+        assert_eq!(e.pg_code(), None);
     }
 }

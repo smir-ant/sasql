@@ -62,6 +62,12 @@ impl PoolBuilder {
         self
     }
 
+    /// Set the maximum lifetime in seconds. Convenience for
+    /// `max_lifetime(Some(Duration::from_secs(secs)))`.
+    pub fn max_lifetime_secs(self, secs: u64) -> Self {
+        self.max_lifetime(Some(Duration::from_secs(secs)))
+    }
+
     /// Set the maximum time to wait for a connection when the pool is
     /// exhausted. Default: 5 seconds.
     ///
@@ -69,6 +75,12 @@ impl PoolBuilder {
     pub fn acquire_timeout(mut self, d: Option<Duration>) -> Self {
         self.acquire_timeout = Some(d);
         self
+    }
+
+    /// Set the acquire timeout in seconds. Convenience for
+    /// `acquire_timeout(Some(Duration::from_secs(secs)))`.
+    pub fn acquire_timeout_secs(self, secs: u64) -> Self {
+        self.acquire_timeout(Some(Duration::from_secs(secs)))
     }
 
     /// Set the minimum number of idle connections to maintain. Default: 0.
@@ -460,6 +472,20 @@ mod tests {
     fn builder_min_idle() {
         let b = Pool::builder().min_idle(5);
         assert_eq!(b.min_idle, Some(5));
+    }
+
+    // --- Convenience methods ---
+
+    #[test]
+    fn builder_max_lifetime_secs() {
+        let b = Pool::builder().max_lifetime_secs(1800);
+        assert_eq!(b.max_lifetime, Some(Some(Duration::from_secs(1800))));
+    }
+
+    #[test]
+    fn builder_acquire_timeout_secs() {
+        let b = Pool::builder().acquire_timeout_secs(5);
+        assert_eq!(b.acquire_timeout, Some(Some(Duration::from_secs(5))));
     }
 
     // --- Task 2: Read/write splitting ---

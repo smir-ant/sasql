@@ -255,6 +255,11 @@ impl Transaction {
     }
 
     /// Number of operations currently buffered for deferred execution.
+    ///
+    /// This is a diagnostic method primarily for testing. Most users should
+    /// not need to call this -- deferred operations are flushed automatically
+    /// on commit or before any read.
+    #[doc(hidden)]
     pub async fn deferred_count(&self) -> usize {
         let guard = self.inner.lock().await;
         match guard.as_ref() {

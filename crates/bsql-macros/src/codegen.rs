@@ -400,7 +400,7 @@ fn gen_result_struct(parsed: &ParsedQuery, validation: &ValidationResult) -> Tok
             .chain(std::iter::once(quote! { #[doc = "**Query plan:**"] }))
             .chain(std::iter::once(quote! { #[doc = "```text"] }))
             .chain(plan.lines().map(|line| {
-                let line_str = format!("{line}");
+                let line_str = line.to_string();
                 quote! { #[doc = #line_str] }
             }))
             .chain(std::iter::once(quote! { #[doc = "```"] }))
