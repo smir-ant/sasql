@@ -192,6 +192,45 @@ impl SqlitePool {
             .map_err(BsqlError::from_sqlite)
     }
 
+    /// Process each row in-place via a closure. Zero-copy -- text columns
+    /// borrow directly from SQLite's internal buffer.
+    pub fn for_each<F>(
+        &self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&dyn bsql_driver_sqlite::codec::SqliteEncode],
+        is_write: bool,
+        f: F,
+    ) -> BsqlResult<()>
+    where
+        F: FnMut(
+            &bsql_driver_sqlite::ffi::StmtHandle,
+        ) -> Result<(), bsql_driver_sqlite::SqliteError>,
+    {
+        self.inner
+            .for_each(sql, sql_hash, params, is_write, f)
+            .map_err(BsqlError::from_sqlite)
+    }
+
+    /// Process each row in-place, collecting results into a `Vec`.
+    pub fn for_each_collect<F, T>(
+        &self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&dyn bsql_driver_sqlite::codec::SqliteEncode],
+        is_write: bool,
+        f: F,
+    ) -> BsqlResult<Vec<T>>
+    where
+        F: FnMut(
+            &bsql_driver_sqlite::ffi::StmtHandle,
+        ) -> Result<T, bsql_driver_sqlite::SqliteError>,
+    {
+        self.inner
+            .for_each_collect(sql, sql_hash, params, is_write, f)
+            .map_err(BsqlError::from_sqlite)
+    }
+
     /// Execute a statement via direct param binding — zero arena/ParamValue overhead.
     ///
     /// Takes `&[&dyn SqliteEncode]` directly instead of `SmallVec<ParamValue>`.

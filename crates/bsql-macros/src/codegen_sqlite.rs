@@ -25,6 +25,7 @@ pub fn generate_sqlite_query_code(
     let sqlite_sql = pg_to_sqlite_params(&parsed.positional_sql);
     let result_struct = gen_result_struct(parsed, validation);
     let arena_result_struct = gen_arena_result_struct(parsed, validation);
+    let for_each_row_struct = gen_for_each_row_struct(parsed, validation);
     let executor_struct = gen_executor_struct(parsed);
     let executor_impls = gen_executor_impls(parsed, validation, &sqlite_sql);
     let constructor = gen_constructor(parsed);
@@ -33,6 +34,7 @@ pub fn generate_sqlite_query_code(
         {
             #result_struct
             #arena_result_struct
+            #for_each_row_struct
             #executor_struct
             #executor_impls
             #constructor
@@ -139,6 +141,187 @@ fn gen_arena_result_struct(parsed: &ParsedQuery, validation: &ValidationResult) 
         pub struct #struct_name {
             #(#fields,)*
         }
+    }
+}
+
+// --- ForEach row struct (borrowed from StmtHandle) ---
+
+fn for_each_row_struct_name(parsed: &ParsedQuery) -> proc_macro2::Ident {
+    format_ident!("BsqlForEachRow_{}", &parsed.statement_name)
+}
+
+/// Convert a column rust_type to its for_each borrowed equivalent.
+/// String -> &'a str, Vec<u8> -> &'a [u8], Option<String> -> Option<&'a str>, etc.
+/// Scalar types (i64, f64, bool) remain as-is (they are Copy).
+fn for_each_result_type(type_str: &str) -> TokenStream {
+    match type_str {
+        "String" => quote! { &'a str },
+        "Vec<u8>" => quote! { &'a [u8] },
+        _ => {
+            if let Some(inner) = type_str
+                .strip_prefix("Option<")
+                .and_then(|s| s.strip_suffix('>'))
+            {
+                match inner {
+                    "String" => quote! { Option<&'a str> },
+                    "Vec<u8>" => quote! { Option<&'a [u8]> },
+                    _ => parse_result_type(type_str),
+                }
+            } else {
+                parse_result_type(type_str)
+            }
+        }
+    }
+}
+
+fn gen_for_each_row_struct(parsed: &ParsedQuery, validation: &ValidationResult) -> TokenStream {
+    if validation.columns.is_empty() {
+        return TokenStream::new();
+    }
+
+    let struct_name = for_each_row_struct_name(parsed);
+    let deduped_names = deduplicate_column_names(&validation.columns);
+    let fields = validation.columns.iter().enumerate().map(|(i, col)| {
+        let field_name = format_ident!("{}", deduped_names[i]);
+        let field_type = for_each_result_type(&col.rust_type);
+        quote! { pub #field_name: #field_type }
+    });
+
+    quote! {
+        #[derive(Debug)]
+        #[allow(non_camel_case_types)]
+        pub struct #struct_name<'a> {
+            #(#fields,)*
+        }
+    }
+}
+
+// --- ForEach decode (zero-copy, borrowed from StmtHandle) ---
+
+fn gen_for_each_decode(validation: &ValidationResult) -> TokenStream {
+    let deduped_names = deduplicate_column_names(&validation.columns);
+    let fields = deduped_names.iter().enumerate().map(|(i, name)| {
+        let field_name = format_ident!("{}", name);
+        let col_idx = i as i32;
+        let col = &validation.columns[i];
+        let decode_expr = gen_for_each_column_decode(col_idx, &col.rust_type);
+        quote! { #field_name: #decode_expr }
+    });
+    quote! { #(#fields),* }
+}
+
+fn gen_for_each_column_decode(idx: i32, rust_type: &str) -> TokenStream {
+    if let Some(inner) = rust_type
+        .strip_prefix("Option<")
+        .and_then(|s| s.strip_suffix('>'))
+    {
+        gen_for_each_nullable_decode(idx, inner)
+    } else {
+        gen_for_each_not_null_decode(idx, rust_type)
+    }
+}
+
+fn gen_for_each_not_null_decode(idx: i32, rust_type: &str) -> TokenStream {
+    let col_idx_str = idx.to_string();
+    match rust_type {
+        "bool" => {
+            let err = gen_direct_decode_error(&col_idx_str, "bool");
+            quote! {
+                {
+                    if _bsql_stmt.column_type(#idx) == ::bsql_core::driver_sqlite::SQLITE_NULL {
+                        return Err(#err);
+                    }
+                    _bsql_stmt.column_int64(#idx) != 0
+                }
+            }
+        }
+        "i64" => {
+            let err = gen_direct_decode_error(&col_idx_str, "i64");
+            quote! {
+                {
+                    if _bsql_stmt.column_type(#idx) == ::bsql_core::driver_sqlite::SQLITE_NULL {
+                        return Err(#err);
+                    }
+                    _bsql_stmt.column_int64(#idx)
+                }
+            }
+        }
+        "f64" => {
+            let err = gen_direct_decode_error(&col_idx_str, "f64");
+            quote! {
+                {
+                    if _bsql_stmt.column_type(#idx) == ::bsql_core::driver_sqlite::SQLITE_NULL {
+                        return Err(#err);
+                    }
+                    _bsql_stmt.column_double(#idx)
+                }
+            }
+        }
+        // Zero-copy: borrow &str directly from SQLite's buffer
+        "String" => {
+            let err = gen_direct_decode_error(&col_idx_str, "&str");
+            quote! {
+                {
+                    let _bsql_bytes = _bsql_stmt.column_text(#idx)
+                        .ok_or_else(|| #err)?;
+                    unsafe { ::std::str::from_utf8_unchecked(_bsql_bytes) }
+                }
+            }
+        }
+        // Zero-copy: borrow &[u8] directly from SQLite's buffer
+        "Vec<u8>" => {
+            let err = gen_direct_decode_error(&col_idx_str, "&[u8]");
+            quote! {
+                {
+                    if _bsql_stmt.column_type(#idx) == ::bsql_core::driver_sqlite::SQLITE_NULL {
+                        return Err(#err);
+                    }
+                    _bsql_stmt.column_blob(#idx)
+                }
+            }
+        }
+        // Scalar types that don't need borrowing
+        _ => gen_sqlite_direct_not_null_decode(idx, rust_type),
+    }
+}
+
+fn gen_for_each_nullable_decode(idx: i32, inner_type: &str) -> TokenStream {
+    match inner_type {
+        "bool" => quote! {
+            if _bsql_stmt.column_type(#idx) == ::bsql_core::driver_sqlite::SQLITE_NULL {
+                None
+            } else {
+                Some(_bsql_stmt.column_int64(#idx) != 0)
+            }
+        },
+        "i64" => quote! {
+            if _bsql_stmt.column_type(#idx) == ::bsql_core::driver_sqlite::SQLITE_NULL {
+                None
+            } else {
+                Some(_bsql_stmt.column_int64(#idx))
+            }
+        },
+        "f64" => quote! {
+            if _bsql_stmt.column_type(#idx) == ::bsql_core::driver_sqlite::SQLITE_NULL {
+                None
+            } else {
+                Some(_bsql_stmt.column_double(#idx))
+            }
+        },
+        // Zero-copy: Option<&str> borrowed from SQLite
+        "String" => quote! {
+            _bsql_stmt.column_text(#idx)
+                .map(|b| unsafe { ::std::str::from_utf8_unchecked(b) })
+        },
+        // Zero-copy: Option<&[u8]> borrowed from SQLite
+        "Vec<u8>" => quote! {
+            if _bsql_stmt.column_type(#idx) == ::bsql_core::driver_sqlite::SQLITE_NULL {
+                None
+            } else {
+                Some(_bsql_stmt.column_blob(#idx))
+            }
+        },
+        _ => gen_sqlite_direct_nullable_decode(idx, inner_type),
     }
 }
 
@@ -345,6 +528,73 @@ fn gen_executor_impls(
         TokenStream::new()
     };
 
+    let for_each_methods = if has_columns {
+        let for_each_row_name = for_each_row_struct_name(parsed);
+        let for_each_decode = gen_for_each_decode(validation);
+
+        quote! {
+            /// Process each row in-place via a closure. Zero-copy -- text/blob
+            /// columns borrow directly from SQLite's internal buffer.
+            ///
+            /// The row struct cannot escape the closure -- column pointers are
+            /// invalidated by the next step().
+            pub fn for_each<_BsqlForEachF>(
+                self,
+                pool: &::bsql_core::SqlitePool,
+                mut f: _BsqlForEachF,
+            ) -> ::bsql_core::BsqlResult<()>
+            where
+                _BsqlForEachF: FnMut(#for_each_row_name<'_>) -> Result<(), ::bsql_core::BsqlError>,
+            {
+                #direct_params_build
+                pool.for_each(
+                    #sql_lit,
+                    #sql_hash_val,
+                    _bsql_params,
+                    #is_write,
+                    |_bsql_stmt| {
+                        let _bsql_row = #for_each_row_name {
+                            #for_each_decode
+                        };
+                        f(_bsql_row).map_err(|e| match e {
+                            ::bsql_core::BsqlError::Query(q) => ::bsql_core::driver_sqlite::SqliteError::Internal(q.message.to_string()),
+                            other => ::bsql_core::driver_sqlite::SqliteError::Internal(other.to_string()),
+                        })
+                    },
+                )
+            }
+
+            /// Process each row in-place, collecting mapped results into a `Vec`.
+            ///
+            /// Same zero-copy semantics as `for_each`, but the closure returns a
+            /// value of type `T` that is collected.
+            pub fn for_each_map<_BsqlForEachF, _BsqlForEachT>(
+                self,
+                pool: &::bsql_core::SqlitePool,
+                mut f: _BsqlForEachF,
+            ) -> ::bsql_core::BsqlResult<Vec<_BsqlForEachT>>
+            where
+                _BsqlForEachF: FnMut(#for_each_row_name<'_>) -> _BsqlForEachT,
+            {
+                #direct_params_build
+                pool.for_each_collect(
+                    #sql_lit,
+                    #sql_hash_val,
+                    _bsql_params,
+                    #is_write,
+                    |_bsql_stmt| {
+                        let _bsql_row = #for_each_row_name {
+                            #for_each_decode
+                        };
+                        Ok(f(_bsql_row))
+                    },
+                )
+            }
+        }
+    } else {
+        TokenStream::new()
+    };
+
     let execute_method = quote! {
         /// Execute the statement (INSERT/UPDATE/DELETE), return affected rows.
         pub fn execute(
@@ -360,6 +610,7 @@ fn gen_executor_impls(
         #[allow(non_camel_case_types)]
         impl<'_bsql> #executor_name<'_bsql> {
             #fetch_methods
+            #for_each_methods
             #execute_method
         }
     }
@@ -991,6 +1242,7 @@ pub fn generate_dynamic_sqlite_query_code(
 ) -> TokenStream {
     let result_struct = gen_result_struct(parsed, validation);
     let arena_result_struct = gen_arena_result_struct(parsed, validation);
+    let for_each_row_struct = gen_for_each_row_struct(parsed, validation);
     let executor_struct = gen_dynamic_executor_struct(parsed);
     let executor_impls = gen_dynamic_executor_impls(parsed, validation, variants);
     let constructor = gen_dynamic_constructor(parsed);
@@ -999,6 +1251,7 @@ pub fn generate_dynamic_sqlite_query_code(
         {
             #result_struct
             #arena_result_struct
+            #for_each_row_struct
             #executor_struct
             #executor_impls
             #constructor
@@ -1185,6 +1438,80 @@ fn gen_dynamic_executor_impls(
         TokenStream::new()
     };
 
+    let for_each_methods = if has_columns {
+        let for_each_row_name = for_each_row_struct_name(parsed);
+        let for_each_decode = gen_for_each_decode(validation);
+
+        let for_each_dispatcher = gen_sqlite_direct_variant_dispatcher(
+            parsed,
+            variants,
+            false,
+            |sql_lit, sql_hash| {
+                quote! {
+                    pool.for_each(
+                        #sql_lit,
+                        #sql_hash,
+                        _bsql_params,
+                        #is_write,
+                        |_bsql_stmt| {
+                            let _bsql_row = #for_each_row_name {
+                                #for_each_decode
+                            };
+                            f(_bsql_row).map_err(|e| match e {
+                                ::bsql_core::BsqlError::Query(q) => ::bsql_core::driver_sqlite::SqliteError::Internal(q.message.to_string()),
+                                other => ::bsql_core::driver_sqlite::SqliteError::Internal(other.to_string()),
+                            })
+                        },
+                    )
+                }
+            },
+        );
+
+        let for_each_map_dispatcher =
+            gen_sqlite_direct_variant_dispatcher(parsed, variants, false, |sql_lit, sql_hash| {
+                quote! {
+                    pool.for_each_collect(
+                        #sql_lit,
+                        #sql_hash,
+                        _bsql_params,
+                        #is_write,
+                        |_bsql_stmt| {
+                            let _bsql_row = #for_each_row_name {
+                                #for_each_decode
+                            };
+                            Ok(f(_bsql_row))
+                        },
+                    )
+                }
+            });
+
+        quote! {
+            pub fn for_each<_BsqlForEachF>(
+                self,
+                pool: &::bsql_core::SqlitePool,
+                mut f: _BsqlForEachF,
+            ) -> ::bsql_core::BsqlResult<()>
+            where
+                _BsqlForEachF: FnMut(#for_each_row_name<'_>) -> Result<(), ::bsql_core::BsqlError>,
+            {
+                #for_each_dispatcher
+            }
+
+            pub fn for_each_map<_BsqlForEachF, _BsqlForEachT>(
+                self,
+                pool: &::bsql_core::SqlitePool,
+                mut f: _BsqlForEachF,
+            ) -> ::bsql_core::BsqlResult<Vec<_BsqlForEachT>>
+            where
+                _BsqlForEachF: FnMut(#for_each_row_name<'_>) -> _BsqlForEachT,
+            {
+                #for_each_map_dispatcher
+            }
+        }
+    } else {
+        TokenStream::new()
+    };
+
     let execute_dispatcher =
         gen_sqlite_direct_variant_dispatcher(parsed, variants, false, |sql_lit, sql_hash| {
             quote! {
@@ -1205,6 +1532,7 @@ fn gen_dynamic_executor_impls(
         #[allow(non_camel_case_types)]
         impl<'_bsql> #executor_name<'_bsql> {
             #fetch_methods
+            #for_each_methods
             #execute_method
         }
     }

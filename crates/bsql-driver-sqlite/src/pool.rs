@@ -283,6 +283,53 @@ impl SqlitePool {
         }
     }
 
+    /// Process each row in-place via a closure. Zero-copy -- text columns
+    /// borrow directly from SQLite's internal buffer.
+    ///
+    /// Routes to writer or reader based on `is_write`.
+    pub fn for_each<F>(
+        &self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&dyn SqliteEncode],
+        is_write: bool,
+        f: F,
+    ) -> Result<(), SqliteError>
+    where
+        F: FnMut(&StmtHandle) -> Result<(), SqliteError>,
+    {
+        if is_write {
+            let mut conn = self.acquire_writer()?;
+            conn.for_each(sql, sql_hash, params, f)
+        } else {
+            let mut conn = self.acquire_reader()?;
+            conn.for_each(sql, sql_hash, params, f)
+        }
+    }
+
+    /// Process each row in-place, collecting results into a `Vec`.
+    ///
+    /// Routes to writer or reader based on `is_write`.
+    pub fn for_each_collect<F, T>(
+        &self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&dyn SqliteEncode],
+        is_write: bool,
+        f: F,
+    ) -> Result<Vec<T>, SqliteError>
+    where
+        F: FnMut(&StmtHandle) -> Result<T, SqliteError>,
+    {
+        if is_write {
+            let mut conn = self.acquire_writer()?;
+            conn.for_each_collect(sql, sql_hash, params, f)
+        } else {
+            let mut conn = self.acquire_reader()?;
+            conn.for_each_collect(sql, sql_hash, params, f)
+        }
+    }
+
     /// Execute a statement via direct param binding — zero arena/ParamValue overhead.
     ///
     /// Takes `&[&dyn SqliteEncode]` directly instead of `SmallVec<ParamValue>`.
@@ -1986,6 +2033,135 @@ mod tests {
         assert!(rows.arena_allocated() > 0);
 
         drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- for_each ----
+
+    #[test]
+    fn pool_for_each_zero_rows() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER, name TEXT)")
+            .unwrap();
+
+        let sql = "SELECT id, name FROM t";
+        let hash = hash_sql(sql);
+        let mut count = 0usize;
+        pool.for_each(sql, hash, &[], false, |_stmt| {
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, 0);
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pool_for_each_multiple_rows() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER, name TEXT)")
+            .unwrap();
+        for i in 0..10 {
+            pool.simple_exec(&format!("INSERT INTO t VALUES ({i}, 'name_{i}')"))
+                .unwrap();
+        }
+
+        let sql = "SELECT id, name FROM t ORDER BY id";
+        let hash = hash_sql(sql);
+        let mut count = 0usize;
+        pool.for_each(sql, hash, &[], false, |stmt| {
+            let id = stmt.column_int64(0);
+            assert_eq!(id, count as i64);
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, 10);
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pool_for_each_writer_route() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER)").unwrap();
+        pool.simple_exec("INSERT INTO t VALUES (42)").unwrap();
+
+        let sql = "SELECT id FROM t";
+        let hash = hash_sql(sql);
+        let mut found = 0i64;
+        pool.for_each(sql, hash, &[], true, |stmt| {
+            found = stmt.column_int64(0);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(found, 42);
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- for_each_collect ----
+
+    #[test]
+    fn pool_for_each_collect_builds_vec() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER, name TEXT)")
+            .unwrap();
+        pool.simple_exec("INSERT INTO t VALUES (1, 'alice')")
+            .unwrap();
+        pool.simple_exec("INSERT INTO t VALUES (2, 'bob')").unwrap();
+
+        let sql = "SELECT id, name FROM t ORDER BY id";
+        let hash = hash_sql(sql);
+        let results: Vec<i64> = pool
+            .for_each_collect(sql, hash, &[], false, |stmt| Ok(stmt.column_int64(0)))
+            .unwrap();
+        assert_eq!(results, vec![1, 2]);
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pool_for_each_collect_empty() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER)").unwrap();
+
+        let sql = "SELECT id FROM t";
+        let hash = hash_sql(sql);
+        let results: Vec<i64> = pool
+            .for_each_collect(sql, hash, &[], false, |stmt| Ok(stmt.column_int64(0)))
+            .unwrap();
+        assert!(results.is_empty());
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pool_for_each_closed_pool_errors() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.close();
+
+        let sql = "SELECT 1";
+        let hash = hash_sql(sql);
+        let result = pool.for_each(sql, hash, &[], false, |_| Ok(()));
+        assert!(result.is_err());
+
+        let result: Result<Vec<i64>, _> =
+            pool.for_each_collect(sql, hash, &[], false, |_| Ok(0i64));
+        assert!(result.is_err());
+
         let _ = std::fs::remove_file(&path);
     }
 }
