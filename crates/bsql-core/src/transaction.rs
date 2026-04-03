@@ -213,6 +213,56 @@ impl Transaction {
             .map_err(BsqlError::from_driver_query)
     }
 
+    // --- Deferred pipeline API ---
+
+    /// Buffer an execute for deferred pipeline flush.
+    ///
+    /// The operation is not sent to the server immediately. Instead, the
+    /// Bind+Execute message bytes are buffered internally. The buffered
+    /// operations are sent as a single pipeline on [`commit()`](Self::commit)
+    /// or [`flush_deferred()`](Self::flush_deferred).
+    ///
+    /// If the statement has not been prepared yet, a single round-trip is
+    /// made to prepare it. After that, the Bind+Execute bytes are buffered
+    /// with no I/O.
+    ///
+    /// Any read operation (`query_inner`, `for_each_raw`, `simple_query`, etc.)
+    /// automatically flushes deferred operations first to ensure
+    /// read-your-writes consistency.
+    pub async fn defer_execute(
+        &self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+    ) -> BsqlResult<()> {
+        let mut guard = self.inner.lock().await;
+        let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
+        tx.defer_execute(sql, sql_hash, params)
+            .await
+            .map_err(BsqlError::from_driver_query)
+    }
+
+    /// Flush all deferred operations as a single pipeline.
+    ///
+    /// Sends all buffered Bind+Execute messages + one Sync in a single TCP write.
+    /// Returns the affected row count for each deferred operation.
+    pub async fn flush_deferred(&self) -> BsqlResult<Vec<u64>> {
+        let mut guard = self.inner.lock().await;
+        let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
+        tx.flush_deferred()
+            .await
+            .map_err(BsqlError::from_driver_query)
+    }
+
+    /// Number of operations currently buffered for deferred execution.
+    pub async fn deferred_count(&self) -> usize {
+        let guard = self.inner.lock().await;
+        match guard.as_ref() {
+            Some(tx) => tx.deferred_count(),
+            None => 0,
+        }
+    }
+
     /// Process each row directly from the wire buffer within this transaction.
     ///
     /// Zero arena allocation — the closure receives a `PgDataRow` that reads

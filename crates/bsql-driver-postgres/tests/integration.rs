@@ -1339,3 +1339,297 @@ fn simd_utf8_accepts_valid() {
     assert_eq!(decode_str(b"").unwrap(), "");
     assert_eq!(decode_str("\u{1f600}".as_bytes()).unwrap(), "\u{1f600}");
 }
+
+// ---------------------------------------------------------------------------
+// Deferred pipeline (defer_execute / flush_deferred)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn defer_execute_commit_auto_flushes() {
+    let url = require_db!();
+    let pool = Pool::connect(&url).await.unwrap();
+
+    let sql = "INSERT INTO bench_users (name, email, active, score) VALUES ($1, $2, true, 0.0)";
+    let hash = hash_sql(sql);
+
+    let mut tx = pool.begin().await.unwrap();
+    for i in 0..5i32 {
+        let name = format!("defer_commit_{i}");
+        let email = format!("defer_commit_{i}@test.com");
+        tx.defer_execute(sql, hash, &[&name, &email]).await.unwrap();
+    }
+    assert_eq!(tx.deferred_count(), 5);
+    tx.commit().await.unwrap();
+
+    // Verify all 5 rows were inserted
+    let mut conn = pool.acquire().await.unwrap();
+    let mut arena = Arena::new();
+    let count_sql = "SELECT count(*)::int4 AS c FROM bench_users WHERE name LIKE 'defer_commit_%'";
+    let count_hash = hash_sql(count_sql);
+    let result = conn
+        .query(count_sql, count_hash, &[], &mut arena)
+        .await
+        .unwrap();
+    let row = result.row(0, &arena);
+    assert_eq!(row.get_i32(0), Some(5));
+
+    // Clean up
+    conn.simple_query("DELETE FROM bench_users WHERE name LIKE 'defer_commit_%'")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn defer_execute_flush_returns_affected_rows() {
+    let url = require_db!();
+    let pool = Pool::connect(&url).await.unwrap();
+
+    let sql = "INSERT INTO bench_users (name, email, active, score) VALUES ($1, $2, true, 0.0)";
+    let hash = hash_sql(sql);
+
+    let mut tx = pool.begin().await.unwrap();
+    for i in 0..3i32 {
+        let name = format!("defer_flush_{i}");
+        let email = format!("defer_flush_{i}@test.com");
+        tx.defer_execute(sql, hash, &[&name, &email]).await.unwrap();
+    }
+
+    let results = tx.flush_deferred().await.unwrap();
+    assert_eq!(results.len(), 3);
+    for &r in &results {
+        assert_eq!(r, 1); // each INSERT affects 1 row
+    }
+    assert_eq!(tx.deferred_count(), 0);
+
+    tx.commit().await.unwrap();
+
+    // Clean up
+    let mut conn = pool.acquire().await.unwrap();
+    conn.simple_query("DELETE FROM bench_users WHERE name LIKE 'defer_flush_%'")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn defer_execute_auto_flushes_before_query() {
+    let url = require_db!();
+    let pool = Pool::connect(&url).await.unwrap();
+
+    let sql = "INSERT INTO bench_users (name, email, active, score) VALUES ($1, $2, true, 0.0)";
+    let hash = hash_sql(sql);
+
+    let mut tx = pool.begin().await.unwrap();
+
+    let name = "defer_before_query".to_string();
+    let email = "defer_before_query@test.com".to_string();
+    tx.defer_execute(sql, hash, &[&name, &email]).await.unwrap();
+    assert_eq!(tx.deferred_count(), 1);
+
+    // Query should auto-flush the deferred insert first
+    let mut arena = Arena::new();
+    let q_sql = "SELECT count(*)::int4 AS c FROM bench_users WHERE name = 'defer_before_query'";
+    let q_hash = hash_sql(q_sql);
+    let result = tx.query(q_sql, q_hash, &[], &mut arena).await.unwrap();
+    let row = result.row(0, &arena);
+    assert_eq!(row.get_i32(0), Some(1));
+    assert_eq!(tx.deferred_count(), 0);
+
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn defer_execute_empty_commit_is_noop() {
+    let url = require_db!();
+    let pool = Pool::connect(&url).await.unwrap();
+
+    // No deferred operations — commit should succeed without pipeline flush
+    let tx = pool.begin().await.unwrap();
+    assert_eq!(tx.deferred_count(), 0);
+    tx.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn defer_execute_100_inserts() {
+    let url = require_db!();
+    let pool = Pool::connect(&url).await.unwrap();
+
+    let sql = "INSERT INTO bench_users (name, email, active, score) VALUES ($1, $2, true, 0.0)";
+    let hash = hash_sql(sql);
+
+    let mut tx = pool.begin().await.unwrap();
+    for i in 0..100i32 {
+        let name = format!("defer_100_{i}");
+        let email = format!("defer_100_{i}@test.com");
+        tx.defer_execute(sql, hash, &[&name, &email]).await.unwrap();
+    }
+    assert_eq!(tx.deferred_count(), 100);
+    tx.commit().await.unwrap();
+
+    // Verify all 100 rows
+    let mut conn = pool.acquire().await.unwrap();
+    let mut arena = Arena::new();
+    let count_sql = "SELECT count(*)::int4 AS c FROM bench_users WHERE name LIKE 'defer_100_%'";
+    let count_hash = hash_sql(count_sql);
+    let result = conn
+        .query(count_sql, count_hash, &[], &mut arena)
+        .await
+        .unwrap();
+    let row = result.row(0, &arena);
+    assert_eq!(row.get_i32(0), Some(100));
+
+    // Clean up
+    conn.simple_query("DELETE FROM bench_users WHERE name LIKE 'defer_100_%'")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn defer_execute_mixed_with_regular_execute() {
+    let url = require_db!();
+    let pool = Pool::connect(&url).await.unwrap();
+
+    let sql = "INSERT INTO bench_users (name, email, active, score) VALUES ($1, $2, true, 0.0)";
+    let hash = hash_sql(sql);
+
+    let mut tx = pool.begin().await.unwrap();
+
+    // Deferred
+    let name = "defer_mixed_d1".to_string();
+    let email = "defer_mixed_d1@test.com".to_string();
+    tx.defer_execute(sql, hash, &[&name, &email]).await.unwrap();
+
+    // Regular execute (does NOT flush deferred)
+    let name2 = "defer_mixed_r1".to_string();
+    let email2 = "defer_mixed_r1@test.com".to_string();
+    let affected = tx.execute(sql, hash, &[&name2, &email2]).await.unwrap();
+    assert_eq!(affected, 1);
+
+    // Another deferred
+    let name3 = "defer_mixed_d2".to_string();
+    let email3 = "defer_mixed_d2@test.com".to_string();
+    tx.defer_execute(sql, hash, &[&name3, &email3])
+        .await
+        .unwrap();
+    assert_eq!(tx.deferred_count(), 2);
+
+    tx.commit().await.unwrap();
+
+    // All 3 rows should exist
+    let mut conn = pool.acquire().await.unwrap();
+    let mut arena = Arena::new();
+    let count_sql = "SELECT count(*)::int4 AS c FROM bench_users WHERE name LIKE 'defer_mixed_%'";
+    let count_hash = hash_sql(count_sql);
+    let result = conn
+        .query(count_sql, count_hash, &[], &mut arena)
+        .await
+        .unwrap();
+    let row = result.row(0, &arena);
+    assert_eq!(row.get_i32(0), Some(3));
+
+    conn.simple_query("DELETE FROM bench_users WHERE name LIKE 'defer_mixed_%'")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn defer_execute_rollback_discards_deferred() {
+    let url = require_db!();
+    let pool = Pool::connect(&url).await.unwrap();
+
+    let sql = "INSERT INTO bench_users (name, email, active, score) VALUES ($1, $2, true, 0.0)";
+    let hash = hash_sql(sql);
+
+    let mut tx = pool.begin().await.unwrap();
+    let name = "defer_rollback".to_string();
+    let email = "defer_rollback@test.com".to_string();
+    tx.defer_execute(sql, hash, &[&name, &email]).await.unwrap();
+    assert_eq!(tx.deferred_count(), 1);
+
+    // Rollback discards deferred ops without sending them
+    tx.rollback().await.unwrap();
+
+    // Verify nothing was inserted
+    let mut conn = pool.acquire().await.unwrap();
+    let mut arena = Arena::new();
+    let count_sql = "SELECT count(*)::int4 AS c FROM bench_users WHERE name = 'defer_rollback'";
+    let count_hash = hash_sql(count_sql);
+    let result = conn
+        .query(count_sql, count_hash, &[], &mut arena)
+        .await
+        .unwrap();
+    let row = result.row(0, &arena);
+    assert_eq!(row.get_i32(0), Some(0));
+}
+
+#[tokio::test]
+async fn defer_execute_auto_flushes_before_for_each() {
+    let url = require_db!();
+    let pool = Pool::connect(&url).await.unwrap();
+
+    let sql = "INSERT INTO bench_users (name, email, active, score) VALUES ($1, $2, true, 0.0)";
+    let hash = hash_sql(sql);
+
+    let mut tx = pool.begin().await.unwrap();
+    let name = "defer_before_foreach".to_string();
+    let email = "defer_before_foreach@test.com".to_string();
+    tx.defer_execute(sql, hash, &[&name, &email]).await.unwrap();
+
+    // for_each should auto-flush first
+    let q_sql = "SELECT name FROM bench_users WHERE name = 'defer_before_foreach'";
+    let q_hash = hash_sql(q_sql);
+    let mut found = false;
+    tx.for_each(q_sql, q_hash, &[], |_row| {
+        found = true;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert!(found, "for_each should see the deferred insert");
+
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn defer_execute_auto_flushes_before_simple_query() {
+    let url = require_db!();
+    let pool = Pool::connect(&url).await.unwrap();
+
+    let sql = "INSERT INTO bench_users (name, email, active, score) VALUES ($1, $2, true, 0.0)";
+    let hash = hash_sql(sql);
+
+    let mut tx = pool.begin().await.unwrap();
+    let name = "defer_before_simple".to_string();
+    let email = "defer_before_simple@test.com".to_string();
+    tx.defer_execute(sql, hash, &[&name, &email]).await.unwrap();
+    assert_eq!(tx.deferred_count(), 1);
+
+    // simple_query should auto-flush first
+    tx.simple_query("SELECT 1").await.unwrap();
+    assert_eq!(tx.deferred_count(), 0);
+
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn defer_execute_param_count_exceeds_max() {
+    let url = require_db!();
+    let pool = Pool::connect(&url).await.unwrap();
+
+    let mut tx = pool.begin().await.unwrap();
+
+    // Build a param list that exceeds i16::MAX
+    let too_many: Vec<&(dyn bsql_driver_postgres::Encode + Sync)> =
+        vec![&1i32 as &(dyn bsql_driver_postgres::Encode + Sync); 32768];
+    let result = tx
+        .defer_execute("SELECT 1", hash_sql("SELECT 1"), &too_many)
+        .await;
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        DriverError::Protocol(msg) => {
+            assert!(msg.contains("parameter count"), "msg: {msg}");
+        }
+        other => panic!("expected Protocol error, got: {other:?}"),
+    }
+
+    tx.rollback().await.unwrap();
+}

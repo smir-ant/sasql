@@ -174,20 +174,25 @@ fn bench_sqlite_insert_batch_optimized(c: &mut Criterion) {
 
             let tx = bsql_pool.begin().unwrap();
 
-            let sql = "INSERT INTO bench_users (name, email, active, score) VALUES (?1, ?2, 1, 0.0)";
+            let sql =
+                "INSERT INTO bench_users (name, email, active, score) VALUES (?1, ?2, 1, 0.0)";
             let sql_hash = bsql_driver_sqlite::conn::hash_sql(sql);
 
             let names: Vec<String> = (0..100).map(|i| format!("batch_{i}")).collect();
             let emails: Vec<String> = (0..100).map(|i| format!("batch_{i}@example.com")).collect();
 
-            let param_sets: Vec<[&dyn SqliteEncode; 2]> =
-                names.iter().zip(emails.iter())
-                    .map(|(n, e)| [n as &dyn SqliteEncode, e as &dyn SqliteEncode])
-                    .collect();
+            let param_sets: Vec<[&dyn SqliteEncode; 2]> = names
+                .iter()
+                .zip(emails.iter())
+                .map(|(n, e)| [n as &dyn SqliteEncode, e as &dyn SqliteEncode])
+                .collect();
             let param_refs: Vec<&[&dyn SqliteEncode]> =
                 param_sets.iter().map(|p| p.as_slice()).collect();
 
-            bsql_pool.__inner().execute_batch(sql, sql_hash, &param_refs).unwrap();
+            bsql_pool
+                .__inner()
+                .execute_batch(sql, sql_hash, &param_refs)
+                .unwrap();
 
             tx.commit().unwrap();
         });

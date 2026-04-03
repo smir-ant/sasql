@@ -161,9 +161,7 @@ fn bench_pg_insert_batch_pipeline(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let url = bench_database_url();
 
-    let pool = rt.block_on(async {
-        bsql_driver_postgres::Pool::connect(&url).await.unwrap()
-    });
+    let pool = rt.block_on(async { bsql_driver_postgres::Pool::connect(&url).await.unwrap() });
 
     let mut group = c.benchmark_group("pg_insert_batch_100_pipeline");
 
@@ -179,12 +177,14 @@ fn bench_pg_insert_batch_pipeline(c: &mut Criterion) {
 
                 // Pre-build parameter sets
                 let names: Vec<String> = (0..100).map(|i| format!("batch_{i}")).collect();
-                let emails: Vec<String> = (0..100).map(|i| format!("batch_{i}@example.com")).collect();
+                let emails: Vec<String> =
+                    (0..100).map(|i| format!("batch_{i}@example.com")).collect();
 
-                let param_sets: Vec<[&(dyn bsql_driver_postgres::Encode + Sync); 2]> =
-                    names.iter().zip(emails.iter())
-                        .map(|(n, e)| [n as &(dyn bsql_driver_postgres::Encode + Sync), e as _])
-                        .collect();
+                let param_sets: Vec<[&(dyn bsql_driver_postgres::Encode + Sync); 2]> = names
+                    .iter()
+                    .zip(emails.iter())
+                    .map(|(n, e)| [n as &(dyn bsql_driver_postgres::Encode + Sync), e as _])
+                    .collect();
 
                 let param_refs: Vec<&[&(dyn bsql_driver_postgres::Encode + Sync)]> =
                     param_sets.iter().map(|p| p.as_slice()).collect();
@@ -201,10 +201,53 @@ fn bench_pg_insert_batch_pipeline(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_pg_insert_batch_deferred(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let url = bench_database_url();
+
+    let pool = rt.block_on(async { bsql_driver_postgres::Pool::connect(&url).await.unwrap() });
+
+    let mut group = c.benchmark_group("pg_insert_batch_100_deferred");
+
+    let sql = "INSERT INTO bench_users (name, email, active, score) VALUES ($1, $2, true, 0.0)";
+    let sql_hash = bsql_driver_postgres::hash_sql(sql);
+
+    // -- bsql deferred pipeline: 100 defer_execute + commit auto-flush --
+    group.bench_function("bsql_deferred", |b| {
+        b.to_async(&rt).iter(|| {
+            let pool = &pool;
+            async move {
+                let mut tx = pool.begin().await.unwrap();
+
+                for i in 0..100i32 {
+                    let name = format!("batch_{i}");
+                    let email = format!("batch_{i}@example.com");
+                    tx.defer_execute(
+                        sql,
+                        sql_hash,
+                        &[
+                            &name as &(dyn bsql_driver_postgres::Encode + Sync),
+                            &email as _,
+                        ],
+                    )
+                    .await
+                    .unwrap();
+                }
+
+                // commit() auto-flushes all 100 as one pipeline + COMMIT
+                tx.commit().await.unwrap();
+            }
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_pg_insert_single,
     bench_pg_insert_batch,
-    bench_pg_insert_batch_pipeline
+    bench_pg_insert_batch_pipeline,
+    bench_pg_insert_batch_deferred
 );
 criterion_main!(benches);

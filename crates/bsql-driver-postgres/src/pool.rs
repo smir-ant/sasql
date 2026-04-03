@@ -306,6 +306,8 @@ impl Pool {
         Ok(Transaction {
             guard,
             committed: false,
+            deferred_buf: Vec::new(),
+            deferred_count: 0,
         })
     }
 
@@ -900,6 +902,66 @@ impl PoolGuard {
         }
         false
     }
+
+    // --- Deferred pipeline support ---
+
+    /// Ensure a statement is prepared and cached.
+    ///
+    /// Returns the cached statement name. No-op if already cached.
+    pub(crate) async fn ensure_stmt_prepared(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+    ) -> Result<Box<str>, DriverError> {
+        let slot = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| DriverError::Pool("connection already taken".into()))?;
+        match slot {
+            PoolSlot::Async(conn) => conn.ensure_stmt_prepared(sql, sql_hash, params).await,
+            #[cfg(unix)]
+            PoolSlot::Sync(conn) => {
+                tokio::task::block_in_place(|| conn.ensure_stmt_prepared(sql, sql_hash, params))
+            }
+        }
+    }
+
+    /// Write Bind+Execute bytes for a prepared statement into an external buffer.
+    ///
+    /// The statement must already be prepared via `ensure_stmt_prepared`.
+    pub(crate) fn write_deferred_bind_execute(
+        &self,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+        buf: &mut Vec<u8>,
+    ) {
+        let slot = self.conn.as_ref().expect("connection taken");
+        match slot {
+            PoolSlot::Async(conn) => conn.write_deferred_bind_execute(sql_hash, params, buf),
+            #[cfg(unix)]
+            PoolSlot::Sync(conn) => conn.write_deferred_bind_execute(sql_hash, params, buf),
+        }
+    }
+
+    /// Flush a buffer of deferred Bind+Execute messages as a single pipeline.
+    pub(crate) async fn flush_deferred_pipeline(
+        &mut self,
+        buf: &mut Vec<u8>,
+        count: usize,
+    ) -> Result<Vec<u64>, DriverError> {
+        let slot = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| DriverError::Pool("connection already taken".into()))?;
+        match slot {
+            PoolSlot::Async(conn) => conn.flush_deferred_pipeline(buf, count).await,
+            #[cfg(unix)]
+            PoolSlot::Sync(conn) => {
+                tokio::task::block_in_place(|| conn.flush_deferred_pipeline(buf, count))
+            }
+        }
+    }
 }
 
 impl Drop for PoolGuard {
@@ -952,24 +1014,40 @@ impl Drop for PoolGuard {
 pub struct Transaction {
     guard: PoolGuard,
     committed: bool,
+    /// Accumulated Bind+Execute message bytes for deferred operations.
+    deferred_buf: Vec<u8>,
+    /// Number of deferred operations buffered.
+    deferred_count: usize,
 }
 
 impl Transaction {
     /// Commit the transaction.
+    ///
+    /// Automatically flushes any deferred operations before committing.
     pub async fn commit(mut self) -> Result<(), DriverError> {
+        if self.deferred_count > 0 {
+            self.flush_deferred().await?;
+        }
         self.guard.simple_query("COMMIT").await?;
         self.committed = true;
         Ok(())
     }
 
     /// Rollback the transaction explicitly.
+    ///
+    /// Discards any deferred operations without sending them.
     pub async fn rollback(mut self) -> Result<(), DriverError> {
+        self.deferred_buf.clear();
+        self.deferred_count = 0;
         self.guard.simple_query("ROLLBACK").await?;
         self.committed = true; // prevent double rollback in drop
         Ok(())
     }
 
     /// Execute a prepared query within the transaction.
+    ///
+    /// Automatically flushes any deferred operations before executing the query,
+    /// ensuring read-your-writes consistency.
     pub async fn query(
         &mut self,
         sql: &str,
@@ -977,6 +1055,9 @@ impl Transaction {
         params: &[&(dyn Encode + Sync)],
         arena: &mut Arena,
     ) -> Result<QueryResult, DriverError> {
+        if self.deferred_count > 0 {
+            self.flush_deferred().await?;
+        }
         self.guard.query(sql, sql_hash, params, arena).await
     }
 
@@ -1004,6 +1085,8 @@ impl Transaction {
     }
 
     /// Process each row directly from the wire buffer within a transaction.
+    ///
+    /// Automatically flushes any deferred operations first.
     pub async fn for_each<F>(
         &mut self,
         sql: &str,
@@ -1014,6 +1097,9 @@ impl Transaction {
     where
         F: FnMut(crate::conn::PgDataRow<'_>) -> Result<(), DriverError>,
     {
+        if self.deferred_count > 0 {
+            self.flush_deferred().await?;
+        }
         self.guard.for_each(sql, sql_hash, params, f).await
     }
 
@@ -1021,6 +1107,8 @@ impl Transaction {
     ///
     /// The closure receives the raw DataRow message payload. Generated code
     /// decodes columns sequentially inline — no PgDataRow, no SmallVec.
+    ///
+    /// Automatically flushes any deferred operations first.
     pub async fn for_each_raw<F>(
         &mut self,
         sql: &str,
@@ -1031,12 +1119,106 @@ impl Transaction {
     where
         F: FnMut(&[u8]) -> Result<(), DriverError>,
     {
+        if self.deferred_count > 0 {
+            self.flush_deferred().await?;
+        }
         self.guard.for_each_raw(sql, sql_hash, params, f).await
     }
 
     /// Simple query within the transaction.
+    ///
+    /// Automatically flushes any deferred operations first.
     pub async fn simple_query(&mut self, sql: &str) -> Result<(), DriverError> {
+        if self.deferred_count > 0 {
+            self.flush_deferred().await?;
+        }
         self.guard.simple_query(sql).await
+    }
+
+    // --- Deferred pipeline API ---
+
+    /// Buffer an execute for deferred pipeline flush.
+    ///
+    /// The operation is not sent to the server immediately. Instead, the
+    /// Bind+Execute message bytes are buffered internally. The buffered
+    /// operations are sent as a single pipeline on [`commit()`](Self::commit)
+    /// or [`flush_deferred()`](Self::flush_deferred).
+    ///
+    /// If the statement has not been prepared yet, a single round-trip is
+    /// made to prepare it (Parse+Describe+Sync). After that, the Bind+Execute
+    /// bytes are buffered with no I/O.
+    ///
+    /// **Note**: Because execution is deferred, the affected row count is not
+    /// available until flush. Use `flush_deferred()` if you need per-operation
+    /// counts, or `commit()` if you only need correctness.
+    ///
+    /// Any read operation (`query`, `for_each`, `for_each_raw`, `simple_query`)
+    /// automatically flushes deferred operations first to ensure
+    /// read-your-writes consistency.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), bsql_driver_postgres::DriverError> {
+    /// # let pool = bsql_driver_postgres::Pool::connect("postgres://u:p@localhost/db").await?;
+    /// let mut tx = pool.begin().await?;
+    /// let sql = "INSERT INTO t (v) VALUES ($1)";
+    /// let hash = bsql_driver_postgres::hash_sql(sql);
+    ///
+    /// // These are buffered, not sent:
+    /// tx.defer_execute(sql, hash, &[&1i32]).await?;
+    /// tx.defer_execute(sql, hash, &[&2i32]).await?;
+    /// tx.defer_execute(sql, hash, &[&3i32]).await?;
+    ///
+    /// // commit() flushes all 3 as one pipeline + COMMIT = 2 round-trips total
+    /// tx.commit().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn defer_execute(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+    ) -> Result<(), DriverError> {
+        if params.len() > i16::MAX as usize {
+            return Err(DriverError::Protocol(format!(
+                "parameter count {} exceeds maximum {}",
+                params.len(),
+                i16::MAX
+            )));
+        }
+
+        // Ensure statement is prepared (may require one round-trip on first call)
+        self.guard
+            .ensure_stmt_prepared(sql, sql_hash, params)
+            .await?;
+
+        // Buffer the Bind+Execute bytes — no I/O
+        self.guard
+            .write_deferred_bind_execute(sql_hash, params, &mut self.deferred_buf);
+        self.deferred_count += 1;
+        Ok(())
+    }
+
+    /// Flush all deferred operations as a single pipeline.
+    ///
+    /// Sends all buffered Bind+Execute messages + one Sync in a single TCP write.
+    /// Returns the affected row count for each deferred operation.
+    ///
+    /// After this call, the deferred buffer is empty and new operations can be
+    /// deferred again.
+    pub async fn flush_deferred(&mut self) -> Result<Vec<u64>, DriverError> {
+        let count = self.deferred_count;
+        self.deferred_count = 0;
+        self.guard
+            .flush_deferred_pipeline(&mut self.deferred_buf, count)
+            .await
+    }
+
+    /// Number of operations currently buffered for deferred execution.
+    pub fn deferred_count(&self) -> usize {
+        self.deferred_count
     }
 }
 

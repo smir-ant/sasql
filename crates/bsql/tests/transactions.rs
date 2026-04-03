@@ -442,3 +442,129 @@ async fn transaction_execute_returns_affected_rows() {
 
     tx.rollback().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// deferred pipeline (defer_execute / flush_deferred / auto-flush)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn transaction_defer_execute_commit() {
+    let pool = pool().await;
+
+    let tx = pool.begin().await.unwrap();
+
+    let title = "defer_commit_bsql";
+    let uid = 1i32;
+    let sql = "INSERT INTO tickets (title, status, created_by_user_id) VALUES ($1, 'new', $2)";
+    let hash = bsql_driver_postgres::hash_sql(sql);
+    let params: &[&(dyn bsql_driver_postgres::Encode + Sync)] = &[&title, &uid];
+
+    tx.defer_execute(sql, hash, params).await.unwrap();
+    tx.defer_execute(sql, hash, params).await.unwrap();
+    assert_eq!(tx.deferred_count().await, 2);
+
+    tx.commit().await.unwrap();
+
+    // Verify rows were inserted (use existing cached query by id pattern)
+    let search = "defer_commit_bsql";
+    let rows = bsql::query!("SELECT id FROM tickets WHERE title = $search: &str")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+
+    // Clean up — delete by each id
+    for row in &rows {
+        let id = row.id;
+        bsql::query!("DELETE FROM tickets WHERE id = $id: i32")
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn transaction_defer_execute_flush_returns_counts() {
+    let pool = pool().await;
+
+    let tx = pool.begin().await.unwrap();
+
+    let title = "defer_flush_bsql";
+    let uid = 1i32;
+    let sql = "INSERT INTO tickets (title, status, created_by_user_id) VALUES ($1, 'new', $2)";
+    let hash = bsql_driver_postgres::hash_sql(sql);
+    let params: &[&(dyn bsql_driver_postgres::Encode + Sync)] = &[&title, &uid];
+
+    tx.defer_execute(sql, hash, params).await.unwrap();
+    tx.defer_execute(sql, hash, params).await.unwrap();
+
+    let results = tx.flush_deferred().await.unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0], 1);
+    assert_eq!(results[1], 1);
+    assert_eq!(tx.deferred_count().await, 0);
+
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn transaction_defer_execute_auto_flushes_before_read() {
+    let pool = pool().await;
+
+    let tx = pool.begin().await.unwrap();
+
+    let title = "defer_autoflush_bsql";
+    let uid = 1i32;
+    let sql = "INSERT INTO tickets (title, status, created_by_user_id) VALUES ($1, 'new', $2)";
+    let hash = bsql_driver_postgres::hash_sql(sql);
+    let params: &[&(dyn bsql_driver_postgres::Encode + Sync)] = &[&title, &uid];
+
+    tx.defer_execute(sql, hash, params).await.unwrap();
+    assert_eq!(tx.deferred_count().await, 1);
+
+    // SELECT triggers auto-flush, so we can read-your-writes
+    let search = "defer_autoflush_bsql";
+    let rows = bsql::query!("SELECT id FROM tickets WHERE title = $search: &str")
+        .fetch_all(&tx)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(tx.deferred_count().await, 0);
+
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn transaction_defer_execute_rollback_discards() {
+    let pool = pool().await;
+
+    let tx = pool.begin().await.unwrap();
+
+    let title = "defer_rollback_bsql";
+    let uid = 1i32;
+    let sql = "INSERT INTO tickets (title, status, created_by_user_id) VALUES ($1, 'new', $2)";
+    let hash = bsql_driver_postgres::hash_sql(sql);
+    let params: &[&(dyn bsql_driver_postgres::Encode + Sync)] = &[&title, &uid];
+
+    tx.defer_execute(sql, hash, params).await.unwrap();
+    tx.rollback().await.unwrap();
+
+    // Nothing should have been inserted
+    let search = "defer_rollback_bsql";
+    let found = bsql::query!("SELECT id FROM tickets WHERE title = $search: &str")
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+    assert!(found.is_none());
+}
+
+#[tokio::test]
+async fn transaction_defer_execute_empty_flush_is_noop() {
+    let pool = pool().await;
+
+    let tx = pool.begin().await.unwrap();
+    let results = tx.flush_deferred().await.unwrap();
+    assert!(results.is_empty());
+    assert_eq!(tx.deferred_count().await, 0);
+    tx.commit().await.unwrap();
+}

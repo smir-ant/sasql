@@ -1537,6 +1537,138 @@ impl Connection {
         Ok(results)
     }
 
+    /// Ensure a statement is prepared and cached, doing a round-trip if needed.
+    ///
+    /// Returns the cached statement name. If the statement is already cached,
+    /// this is a no-op (hash lookup only). Otherwise, sends Parse+Describe+Sync
+    /// and waits for the response.
+    ///
+    /// Used by deferred pipeline execution to separate the prepare step
+    /// (which requires I/O) from the Bind+Execute buffering step (which doesn't).
+    pub(crate) async fn ensure_stmt_prepared(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+    ) -> Result<Box<str>, DriverError> {
+        if let Some(info) = self.stmts.get(&sql_hash) {
+            return Ok(info.name.clone());
+        }
+
+        // Cache miss: Parse+Describe+Sync round-trip
+        let name = make_stmt_name(sql_hash);
+        if params.len() > i16::MAX as usize {
+            return Err(DriverError::Protocol(format!(
+                "parameter count {} exceeds maximum {}",
+                params.len(),
+                i16::MAX
+            )));
+        }
+        let param_oids: smallvec::SmallVec<[u32; 8]> =
+            params.iter().map(|p| p.type_oid()).collect();
+
+        self.write_buf.clear();
+        proto::write_parse(&mut self.write_buf, &name, sql, &param_oids);
+        proto::write_describe(&mut self.write_buf, b'S', &name);
+        proto::write_sync(&mut self.write_buf);
+        self.flush_write().await?;
+
+        self.expect_message(|m| matches!(m, BackendMessage::ParseComplete))
+            .await?;
+        let columns = self.read_column_description().await?;
+        self.expect_ready().await?;
+
+        self.query_counter += 1;
+        let stmt_name = name.clone();
+        self.cache_stmt(
+            sql_hash,
+            StmtInfo {
+                name,
+                columns,
+                last_used: self.query_counter,
+                bind_template: None,
+            },
+        );
+
+        Ok(stmt_name)
+    }
+
+    /// Write Bind+Execute message bytes for a prepared statement into an
+    /// external buffer. Does NOT send anything on the wire.
+    ///
+    /// The statement must already be prepared (call `ensure_stmt_prepared` first).
+    /// Panics in debug mode if the statement is not cached.
+    pub(crate) fn write_deferred_bind_execute(
+        &self,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+        buf: &mut Vec<u8>,
+    ) {
+        let stmt_name = &self.stmts[&sql_hash].name;
+        proto::write_bind_params(buf, "", stmt_name, params);
+        buf.extend_from_slice(proto::EXECUTE_ONLY);
+    }
+
+    /// Flush a buffer of deferred Bind+Execute messages as a single pipeline.
+    ///
+    /// Appends Sync to the buffer, writes everything in one TCP write, then
+    /// reads `count` x (BindComplete + CommandComplete) + ReadyForQuery.
+    /// Returns the affected row count for each deferred operation.
+    pub(crate) async fn flush_deferred_pipeline(
+        &mut self,
+        buf: &mut Vec<u8>,
+        count: usize,
+    ) -> Result<Vec<u64>, DriverError> {
+        if count == 0 {
+            buf.clear();
+            return Ok(Vec::new());
+        }
+
+        buf.extend_from_slice(proto::SYNC_ONLY);
+
+        // Write the entire buffer in one TCP write
+        self.stream.write_all(buf).await.map_err(DriverError::Io)?;
+        self.stream.flush().await.map_err(DriverError::Io)?;
+        buf.clear();
+
+        // Read count x (BindComplete + CommandComplete) + ReadyForQuery
+        let mut results = Vec::with_capacity(count);
+        for _ in 0..count {
+            self.expect_message(|m| matches!(m, BackendMessage::BindComplete))
+                .await?;
+
+            let mut affected_rows: u64 = 0;
+            loop {
+                let msg = self.read_one_message().await?;
+                match msg {
+                    BackendMessage::DataRow { .. } => {}
+                    BackendMessage::CommandComplete { tag } => {
+                        affected_rows = proto::parse_command_tag(tag);
+                        break;
+                    }
+                    BackendMessage::EmptyQuery => break,
+                    BackendMessage::NoticeResponse { .. } => {}
+                    BackendMessage::ErrorResponse { data } => {
+                        let fields = proto::parse_error_response(data);
+                        self.drain_to_ready().await?;
+                        return Err(self.make_server_error(fields));
+                    }
+                    other => {
+                        return Err(DriverError::Protocol(format!(
+                            "unexpected message during flush_deferred_pipeline: {other:?}"
+                        )));
+                    }
+                }
+            }
+            results.push(affected_rows);
+        }
+
+        self.expect_ready().await?;
+        self.shrink_buffers();
+        self.touch();
+        Ok(results)
+    }
+
     /// Process each row directly from the wire buffer via a closure.
     ///
     /// Zero arena allocation — the closure receives a [`PgDataRow`] that reads

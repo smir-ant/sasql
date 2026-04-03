@@ -658,6 +658,125 @@ impl SyncConnection {
         Ok(results)
     }
 
+    /// Ensure a statement is prepared and cached, doing a round-trip if needed.
+    ///
+    /// Returns the cached statement name. If the statement is already cached,
+    /// this is a no-op (hash lookup only). Otherwise, sends Parse+Describe+Sync
+    /// and waits for the response.
+    pub(crate) fn ensure_stmt_prepared(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+    ) -> Result<Box<str>, DriverError> {
+        if let Some(info) = self.stmts.get(&sql_hash) {
+            return Ok(info.name.clone());
+        }
+
+        let name = make_stmt_name(sql_hash);
+        if params.len() > i16::MAX as usize {
+            return Err(DriverError::Protocol(format!(
+                "parameter count {} exceeds maximum {}",
+                params.len(),
+                i16::MAX
+            )));
+        }
+        let param_oids: smallvec::SmallVec<[u32; 8]> =
+            params.iter().map(|p| p.type_oid()).collect();
+
+        self.write_buf.clear();
+        proto::write_parse(&mut self.write_buf, &name, sql, &param_oids);
+        proto::write_describe(&mut self.write_buf, b'S', &name);
+        proto::write_sync(&mut self.write_buf);
+        self.flush_write()?;
+
+        self.expect_message(|m| matches!(m, BackendMessage::ParseComplete))?;
+        let columns = self.read_column_description()?;
+        self.expect_ready()?;
+
+        self.query_counter += 1;
+        let stmt_name = name.clone();
+        self.cache_stmt(
+            sql_hash,
+            StmtInfo {
+                name,
+                columns,
+                last_used: self.query_counter,
+                bind_template: None,
+            },
+        );
+
+        Ok(stmt_name)
+    }
+
+    /// Write Bind+Execute message bytes for a prepared statement into an
+    /// external buffer. Does NOT send anything on the wire.
+    pub(crate) fn write_deferred_bind_execute(
+        &self,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+        buf: &mut Vec<u8>,
+    ) {
+        let stmt_name = &self.stmts[&sql_hash].name;
+        proto::write_bind_params(buf, "", stmt_name, params);
+        buf.extend_from_slice(proto::EXECUTE_ONLY);
+    }
+
+    /// Flush a buffer of deferred Bind+Execute messages as a single pipeline.
+    ///
+    /// Appends Sync to the buffer, writes everything in one write, then
+    /// reads `count` x (BindComplete + CommandComplete) + ReadyForQuery.
+    pub(crate) fn flush_deferred_pipeline(
+        &mut self,
+        buf: &mut Vec<u8>,
+        count: usize,
+    ) -> Result<Vec<u64>, DriverError> {
+        if count == 0 {
+            buf.clear();
+            return Ok(Vec::new());
+        }
+
+        buf.extend_from_slice(proto::SYNC_ONLY);
+
+        self.stream.write_all(buf).map_err(DriverError::Io)?;
+        buf.clear();
+
+        let mut results = Vec::with_capacity(count);
+        for _ in 0..count {
+            self.expect_message(|m| matches!(m, BackendMessage::BindComplete))?;
+
+            let mut affected_rows: u64 = 0;
+            loop {
+                let msg = self.read_one_message()?;
+                match msg {
+                    BackendMessage::DataRow { .. } => {}
+                    BackendMessage::CommandComplete { tag } => {
+                        affected_rows = proto::parse_command_tag(tag);
+                        break;
+                    }
+                    BackendMessage::EmptyQuery => break,
+                    BackendMessage::NoticeResponse { .. } => {}
+                    BackendMessage::ErrorResponse { data } => {
+                        let fields = proto::parse_error_response(data);
+                        self.drain_to_ready()?;
+                        return Err(self.make_server_error(fields));
+                    }
+                    other => {
+                        return Err(DriverError::Protocol(format!(
+                            "unexpected message during flush_deferred_pipeline: {other:?}"
+                        )));
+                    }
+                }
+            }
+            results.push(affected_rows);
+        }
+
+        self.expect_ready()?;
+        self.shrink_buffers();
+        self.touch();
+        Ok(results)
+    }
+
     /// Process each row via a closure with zero-copy `PgDataRow`.
     pub fn for_each<F>(
         &mut self,
