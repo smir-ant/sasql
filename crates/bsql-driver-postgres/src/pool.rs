@@ -670,6 +670,35 @@ impl PoolGuard {
         }
     }
 
+    // --- Introspection dispatch methods ---
+
+    /// Get the backend process ID for this connection.
+    pub fn pid(&self) -> i32 {
+        match self.conn.as_ref().expect("connection taken") {
+            PoolSlot::Async(conn) => conn.pid(),
+            #[cfg(unix)]
+            PoolSlot::Sync(conn) => conn.pid(),
+        }
+    }
+
+    /// Whether the connection is idle (not in a transaction).
+    pub fn is_idle(&self) -> bool {
+        match self.conn.as_ref().expect("connection taken") {
+            PoolSlot::Async(conn) => conn.is_idle(),
+            #[cfg(unix)]
+            PoolSlot::Sync(conn) => conn.is_idle(),
+        }
+    }
+
+    /// Whether the connection is inside a transaction.
+    pub fn is_in_transaction(&self) -> bool {
+        match self.conn.as_ref().expect("connection taken") {
+            PoolSlot::Async(conn) => conn.is_in_transaction(),
+            #[cfg(unix)]
+            PoolSlot::Sync(conn) => conn.is_in_transaction(),
+        }
+    }
+
     // --- Query dispatch methods ---
 
     /// Execute a prepared query and return rows in arena-allocated storage.
