@@ -150,8 +150,8 @@ async fn query_all_base_types() {
                 &42i16,
                 &12345i32,
                 &9876543210i64,
-                &3.14f32,
-                &2.718281828f64,
+                &3.15f32,
+                &2.71f64,
                 &"hello",
                 &bytea_val,
             ],
@@ -166,8 +166,8 @@ async fn query_all_base_types() {
     assert_eq!(row.get_i16(1), Some(42));
     assert_eq!(row.get_i32(2), Some(12345));
     assert_eq!(row.get_i64(3), Some(9876543210));
-    assert!((row.get_f32(4).unwrap() - 3.14).abs() < 0.001);
-    assert!((row.get_f64(5).unwrap() - 2.718281828).abs() < 1e-9);
+    assert!((row.get_f32(4).unwrap() - 3.15).abs() < 0.001);
+    assert!((row.get_f64(5).unwrap() - 2.71).abs() < 1e-9);
     assert_eq!(row.get_str(6), Some("hello"));
     assert_eq!(row.get_bytes(7), Some([0xDE, 0xAD].as_slice()));
 }
@@ -566,7 +566,7 @@ async fn binary_roundtrip_f32() {
     let sql = "SELECT $1::float4 AS val";
     let hash = hash_sql(sql);
 
-    for val in [0.0f32, 1.0, -1.0, 3.14, f32::MIN, f32::MAX] {
+    for val in [0.0f32, 1.0, -1.0, 3.15, f32::MIN, f32::MAX] {
         arena.reset();
         let r = conn.query(sql, hash, &[&val], &mut arena).await.unwrap();
         let got = r.row(0, &arena).get_f32(0).unwrap();
@@ -698,7 +698,7 @@ async fn multiple_queries_same_connection() {
     arena.reset();
     let r3 = conn.query(sql3, h3, &[], &mut arena).await.unwrap();
     let val = r3.row(0, &arena).get_f64(0).unwrap();
-    assert!((val - 3.14).abs() < 1e-10);
+    assert!((val - 3.15).abs() < 1e-10);
 }
 
 // --- Column metadata ---
@@ -1117,7 +1117,7 @@ async fn streaming_1000_rows() {
         for i in 0..row_count {
             let (offset, len) = col_offsets[i * num_cols];
             if len >= 0 {
-                let data = arena.get(offset as usize, len as usize);
+                let data = arena.get(offset, len as usize);
                 let val = i32::from_be_bytes([data[0], data[1], data[2], data[3]]);
                 all_values.push(val);
             }
@@ -1246,7 +1246,7 @@ async fn streaming_single_row() {
 
     let (offset, len) = col_offsets[0];
     assert_eq!(len, 4);
-    let data = arena.get(offset as usize, len as usize);
+    let data = arena.get(offset, len as usize);
     let val = i32::from_be_bytes([data[0], data[1], data[2], data[3]]);
     assert_eq!(val, 42);
 }

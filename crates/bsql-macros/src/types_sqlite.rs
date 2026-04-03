@@ -40,16 +40,15 @@ pub fn resolve_sqlite_type(declared_type: Option<&str>) -> &'static str {
     if upper == "DATETIME" || upper == "TIMESTAMP" {
         #[cfg(feature = "time")]
         return "::time::PrimitiveDateTime";
-        #[cfg(feature = "chrono")]
+        #[cfg(all(feature = "chrono", not(feature = "time")))]
         return "::chrono::NaiveDateTime";
-        // Without time/chrono feature, fall through to String
         #[cfg(not(any(feature = "time", feature = "chrono")))]
         return "String";
     }
     if upper == "DATE" {
         #[cfg(feature = "time")]
         return "::time::Date";
-        #[cfg(feature = "chrono")]
+        #[cfg(all(feature = "chrono", not(feature = "time")))]
         return "::chrono::NaiveDate";
         #[cfg(not(any(feature = "time", feature = "chrono")))]
         return "String";
@@ -57,7 +56,7 @@ pub fn resolve_sqlite_type(declared_type: Option<&str>) -> &'static str {
     if upper == "TIME" {
         #[cfg(feature = "time")]
         return "::time::Time";
-        #[cfg(feature = "chrono")]
+        #[cfg(all(feature = "chrono", not(feature = "time")))]
         return "::chrono::NaiveTime";
         #[cfg(not(any(feature = "time", feature = "chrono")))]
         return "String";
