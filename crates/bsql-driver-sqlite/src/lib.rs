@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn error_source_io() {
-        let inner = std::io::Error::new(std::io::ErrorKind::Other, "test");
+        let inner = std::io::Error::other("test");
         let e = SqliteError::Io(inner);
         assert!(std::error::Error::source(&e).is_some());
     }
@@ -228,9 +228,54 @@ mod tests {
 
     #[test]
     fn error_from_io_preserves_message() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "custom message");
+        let io_err = std::io::Error::other("custom message");
         let e: SqliteError = io_err.into();
         assert!(e.to_string().contains("custom message"));
+    }
+
+    // --- SqliteError variant completeness ---
+
+    #[test]
+    fn error_sqlite_high_code() {
+        let e = SqliteError::Sqlite {
+            code: 2067, // SQLITE_CONSTRAINT_UNIQUE
+            message: "UNIQUE constraint failed".into(),
+        };
+        let s = e.to_string();
+        assert!(s.contains("2067"));
+        assert!(s.contains("UNIQUE constraint failed"));
+    }
+
+    #[test]
+    fn error_sqlite_long_message() {
+        let long_msg = "x".repeat(1000);
+        let e = SqliteError::Sqlite {
+            code: 1,
+            message: long_msg.clone(),
+        };
+        assert!(e.to_string().contains(&long_msg));
+    }
+
+    #[test]
+    fn error_internal_unicode() {
+        let e = SqliteError::Internal("\u{1F600} emoji error".into());
+        assert!(e.to_string().contains("\u{1F600}"));
+    }
+
+    #[test]
+    fn error_pool_long_message() {
+        let long_msg = "p".repeat(500);
+        let e = SqliteError::Pool(long_msg.clone());
+        assert!(e.to_string().contains(&long_msg));
+    }
+
+    #[test]
+    fn error_io_connection_refused() {
+        let e = SqliteError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "refused",
+        ));
+        assert!(e.to_string().contains("refused"));
     }
 
     // --- Debug ---
@@ -248,7 +293,7 @@ mod tests {
 
     #[test]
     fn error_debug_io() {
-        let e = SqliteError::Io(std::io::Error::new(std::io::ErrorKind::Other, "boom"));
+        let e = SqliteError::Io(std::io::Error::other("boom"));
         let dbg = format!("{e:?}");
         assert!(dbg.contains("Io"));
     }

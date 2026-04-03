@@ -1287,4 +1287,271 @@ mod tests {
         let config = Config::from_url("postgres://user:pass@localhost/db").unwrap();
         assert!(!config.host_is_uds());
     }
+
+    // ===============================================================
+    // Pool::is_uds — extended tests
+    // ===============================================================
+
+    #[tokio::test]
+    async fn pool_is_uds_false_for_hostname() {
+        let pool = Pool::connect("postgres://user:pass@db.example.com/db")
+            .await
+            .unwrap();
+        assert!(!pool.is_uds());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pool_is_uds_true_for_tmp() {
+        let pool = Pool::connect("postgres://user@localhost/db?host=/tmp")
+            .await
+            .unwrap();
+        assert!(pool.is_uds());
+    }
+
+    // ===============================================================
+    // Pool close semantics
+    // ===============================================================
+
+    #[tokio::test]
+    async fn pool_close_then_acquire_fails() {
+        let pool = PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .max_size(5)
+            .build()
+            .await
+            .unwrap();
+        pool.close().await;
+        let result = pool.acquire().await;
+        assert!(result.is_err());
+        match result {
+            Err(DriverError::Pool(msg)) => {
+                assert!(msg.contains("closed"), "should say closed: {msg}")
+            }
+            Err(e) => panic!("expected Pool error, got: {e:?}"),
+            Ok(_) => panic!("expected error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pool_is_closed_before_and_after() {
+        let pool = Pool::connect("postgres://user:pass@localhost/db")
+            .await
+            .unwrap();
+        assert!(!pool.is_closed());
+        pool.close().await;
+        assert!(pool.is_closed());
+    }
+
+    // ===============================================================
+    // Pool exhaustion (fail-fast without timeout)
+    // ===============================================================
+
+    #[tokio::test]
+    async fn pool_exhausted_no_timeout() {
+        let pool = PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .max_size(0)
+            .acquire_timeout(None) // fail-fast
+            .build()
+            .await
+            .unwrap();
+        let result = pool.acquire().await;
+        assert!(result.is_err());
+        match result {
+            Err(DriverError::Pool(msg)) => {
+                assert!(msg.contains("exhausted"), "should say exhausted: {msg}")
+            }
+            Err(e) => panic!("expected Pool error, got: {e:?}"),
+            Ok(_) => panic!("expected error"),
+        }
+    }
+
+    // ===============================================================
+    // PoolBuilder validation
+    // ===============================================================
+
+    #[tokio::test]
+    async fn pool_builder_no_url_error() {
+        let result = PoolBuilder::new().max_size(5).build().await;
+        assert!(result.is_err());
+        match result {
+            Err(DriverError::Pool(msg)) => {
+                assert!(msg.contains("URL"), "should mention URL: {msg}")
+            }
+            Err(e) => panic!("expected Pool error, got: {e:?}"),
+            Ok(_) => panic!("expected error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pool_builder_invalid_url_error() {
+        let result = PoolBuilder::new().url("ftp://something").build().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn pool_builder_stmt_cache_size_zero() {
+        let pool = PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .max_stmt_cache_size(0)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(pool.inner.max_stmt_cache_size, 0);
+    }
+
+    // ===============================================================
+    // PoolStatus
+    // ===============================================================
+
+    #[tokio::test]
+    async fn pool_status_reflects_max_size() {
+        let pool = PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .max_size(20)
+            .build()
+            .await
+            .unwrap();
+        let status = pool.status();
+        assert_eq!(status.max_size, 20);
+        assert_eq!(status.idle, 0);
+        assert_eq!(status.active, 0);
+        assert_eq!(status.open, 0);
+    }
+
+    // ===============================================================
+    // Pool clone
+    // ===============================================================
+
+    #[tokio::test]
+    async fn pool_clone_shares_config() {
+        let pool = PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .max_size(7)
+            .build()
+            .await
+            .unwrap();
+        let p2 = pool.clone();
+        assert_eq!(pool.max_size(), 7);
+        assert_eq!(p2.max_size(), 7);
+        assert_eq!(pool.open_count(), p2.open_count());
+    }
+
+    // ===============================================================
+    // set_warmup_sqls
+    // ===============================================================
+
+    #[tokio::test]
+    async fn pool_set_warmup_sqls_empty() {
+        let pool = Pool::connect("postgres://user:pass@localhost/db")
+            .await
+            .unwrap();
+        pool.set_warmup_sqls(&[]);
+        let sqls = pool
+            .inner
+            .warmup_sqls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert!(sqls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pool_set_warmup_sqls_multiple() {
+        let pool = Pool::connect("postgres://user:pass@localhost/db")
+            .await
+            .unwrap();
+        pool.set_warmup_sqls(&["SELECT 1", "SELECT 2", "SELECT 3"]);
+        let sqls = pool
+            .inner
+            .warmup_sqls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert_eq!(sqls.len(), 3);
+        assert_eq!(&*sqls[0], "SELECT 1");
+        assert_eq!(&*sqls[1], "SELECT 2");
+        assert_eq!(&*sqls[2], "SELECT 3");
+    }
+
+    #[tokio::test]
+    async fn pool_set_warmup_sqls_overwrite() {
+        let pool = Pool::connect("postgres://user:pass@localhost/db")
+            .await
+            .unwrap();
+        pool.set_warmup_sqls(&["SELECT 1"]);
+        pool.set_warmup_sqls(&["SELECT 99"]);
+        let sqls = pool
+            .inner
+            .warmup_sqls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert_eq!(sqls.len(), 1);
+        assert_eq!(&*sqls[0], "SELECT 99");
+    }
+
+    // ===============================================================
+    // PoolStatus Debug
+    // ===============================================================
+
+    #[tokio::test]
+    async fn pool_status_debug() {
+        let pool = Pool::connect("postgres://user:pass@localhost/db")
+            .await
+            .unwrap();
+        let status = pool.status();
+        let dbg = format!("{status:?}");
+        assert!(dbg.contains("PoolStatus"));
+        assert!(dbg.contains("idle"));
+        assert!(dbg.contains("active"));
+        assert!(dbg.contains("open"));
+        assert!(dbg.contains("max_size"));
+    }
+
+    // ===============================================================
+    // Config host_is_uds via pool (structural tests)
+    // ===============================================================
+
+    #[test]
+    fn config_host_is_uds_returns_true_for_slash() {
+        let config = Config::from_url("postgres://user@localhost/db?host=/tmp").unwrap();
+        assert!(config.host_is_uds());
+    }
+
+    #[test]
+    fn config_host_is_uds_returns_false_for_tcp() {
+        let config = Config::from_url("postgres://user:pass@localhost/db").unwrap();
+        assert!(!config.host_is_uds());
+    }
+
+    #[test]
+    fn config_host_is_uds_returns_false_for_ip() {
+        let config = Config::from_url("postgres://user:pass@192.168.1.1/db").unwrap();
+        assert!(!config.host_is_uds());
+    }
+
+    // ===============================================================
+    // PoolBuilder chaining
+    // ===============================================================
+
+    #[tokio::test]
+    async fn pool_builder_full_chain() {
+        let pool = PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .max_size(3)
+            .max_lifetime(Some(Duration::from_secs(600)))
+            .acquire_timeout(Some(Duration::from_secs(5)))
+            .min_idle(1)
+            .max_stmt_cache_size(128)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(pool.max_size(), 3);
+        assert_eq!(pool.inner.max_lifetime, Some(Duration::from_secs(600)));
+        assert_eq!(pool.inner.acquire_timeout, Some(Duration::from_secs(5)));
+        assert_eq!(pool.inner.min_idle, 1);
+        assert_eq!(pool.inner.max_stmt_cache_size, 128);
+    }
 }

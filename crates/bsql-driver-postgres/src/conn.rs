@@ -3711,4 +3711,384 @@ mod tests {
         assert!(cfg.host_is_uds());
         assert_eq!(cfg.database, "mydb");
     }
+
+    // ===============================================================
+    // PgDataRow — comprehensive tests
+    // ===============================================================
+
+    #[test]
+    fn pg_data_row_all_null_columns() {
+        let data = make_data_row(&[None, None, None, None, None]);
+        let row = PgDataRow::new(&data).unwrap();
+        assert_eq!(row.column_count(), 5);
+        for i in 0..5 {
+            assert!(row.is_null(i), "column {i} should be null");
+            assert_eq!(row.get_raw(i), None);
+            assert_eq!(row.get_i32(i), None);
+            assert_eq!(row.get_i64(i), None);
+            assert_eq!(row.get_str(i), None);
+            assert_eq!(row.get_bool(i), None);
+            assert_eq!(row.get_f64(i), None);
+        }
+    }
+
+    #[test]
+    fn pg_data_row_very_long_text() {
+        let long_text = "x".repeat(2048);
+        let data = make_data_row(&[Some(long_text.as_bytes())]);
+        let row = PgDataRow::new(&data).unwrap();
+        assert_eq!(row.get_str(0), Some(long_text.as_str()));
+    }
+
+    #[test]
+    fn pg_data_row_empty_text() {
+        let data = make_data_row(&[Some(b"")]);
+        let row = PgDataRow::new(&data).unwrap();
+        assert!(!row.is_null(0));
+        assert_eq!(row.get_str(0), Some(""));
+        assert_eq!(row.get_bytes(0), Some(&[][..]));
+    }
+
+    #[test]
+    fn pg_data_row_20_columns_exceeds_inline() {
+        let col_data: Vec<[u8; 4]> = (0..20).map(|i: i32| i.to_be_bytes()).collect();
+        let cols: Vec<Option<&[u8]>> = col_data.iter().map(|b| Some(b.as_slice())).collect();
+        let data = make_data_row(&cols);
+        let row = PgDataRow::new(&data).unwrap();
+        assert_eq!(row.column_count(), 20);
+        for i in 0..20 {
+            assert_eq!(row.get_i32(i), Some(i as i32));
+        }
+    }
+
+    #[test]
+    fn pg_data_row_is_null_each_position() {
+        // 3 columns: data, null, data
+        let data = make_data_row(&[Some(&1i32.to_be_bytes()), None, Some(&3i32.to_be_bytes())]);
+        let row = PgDataRow::new(&data).unwrap();
+        assert!(!row.is_null(0));
+        assert!(row.is_null(1));
+        assert!(!row.is_null(2));
+    }
+
+    #[test]
+    fn pg_data_row_negative_column_count() {
+        let data = (-1i16).to_be_bytes();
+        assert!(PgDataRow::new(&data).is_err());
+    }
+
+    #[test]
+    fn pg_data_row_get_str_invalid_utf8() {
+        let invalid_utf8 = &[0xFF, 0xFE, 0x80];
+        let data = make_data_row(&[Some(invalid_utf8)]);
+        let row = PgDataRow::new(&data).unwrap();
+        // get_str returns None for invalid UTF-8, but get_bytes returns the raw data
+        assert_eq!(row.get_str(0), None);
+        assert_eq!(row.get_bytes(0), Some(&[0xFF, 0xFE, 0x80][..]));
+    }
+
+    #[test]
+    fn pg_data_row_get_i32_wrong_length() {
+        // i32 needs exactly 4 bytes; give it 2
+        let data = make_data_row(&[Some(&7i16.to_be_bytes())]);
+        let row = PgDataRow::new(&data).unwrap();
+        assert_eq!(row.get_i32(0), None); // 2 bytes != 4 bytes
+        assert_eq!(row.get_i16(0), Some(7)); // but i16 works
+    }
+
+    #[test]
+    fn pg_data_row_get_i64_wrong_length() {
+        // i64 needs 8 bytes; give it 4
+        let data = make_data_row(&[Some(&42i32.to_be_bytes())]);
+        let row = PgDataRow::new(&data).unwrap();
+        assert_eq!(row.get_i64(0), None);
+    }
+
+    #[test]
+    fn pg_data_row_get_f64_wrong_length() {
+        let data = make_data_row(&[Some(&2.5f32.to_be_bytes())]);
+        let row = PgDataRow::new(&data).unwrap();
+        assert_eq!(row.get_f64(0), None); // 4 bytes != 8 bytes
+    }
+
+    #[test]
+    fn pg_data_row_get_f32_wrong_length() {
+        let data = make_data_row(&[Some(&3.14f64.to_be_bytes())]);
+        let row = PgDataRow::new(&data).unwrap();
+        assert_eq!(row.get_f32(0), None); // 8 bytes != 4 bytes
+    }
+
+    #[test]
+    fn pg_data_row_get_bool_wrong_length() {
+        // bool needs 1 byte; give it 4
+        let data = make_data_row(&[Some(&42i32.to_be_bytes())]);
+        let row = PgDataRow::new(&data).unwrap();
+        assert_eq!(row.get_bool(0), None);
+    }
+
+    #[test]
+    fn pg_data_row_unicode_text() {
+        let texts = [
+            "\u{1F600}\u{1F4A9}\u{1F680}", // emoji
+            "\u{4e16}\u{754c}",            // CJK
+            "\u{0645}\u{0631}\u{062D}",    // Arabic
+            "\u{1F468}\u{200D}\u{1F469}",  // ZWJ
+        ];
+        for text in &texts {
+            let data = make_data_row(&[Some(text.as_bytes())]);
+            let row = PgDataRow::new(&data).unwrap();
+            assert_eq!(row.get_str(0), Some(*text));
+        }
+    }
+
+    #[test]
+    fn pg_data_row_i32_boundary_values() {
+        for &val in &[i32::MIN, -1, 0, 1, i32::MAX] {
+            let data = make_data_row(&[Some(&val.to_be_bytes())]);
+            let row = PgDataRow::new(&data).unwrap();
+            assert_eq!(row.get_i32(0), Some(val), "failed for {val}");
+        }
+    }
+
+    #[test]
+    fn pg_data_row_i64_boundary_values() {
+        for &val in &[i64::MIN, -1, 0, 1, i64::MAX] {
+            let data = make_data_row(&[Some(&val.to_be_bytes())]);
+            let row = PgDataRow::new(&data).unwrap();
+            assert_eq!(row.get_i64(0), Some(val), "failed for {val}");
+        }
+    }
+
+    #[test]
+    fn pg_data_row_f64_special_values() {
+        let data = make_data_row(&[Some(&f64::INFINITY.to_be_bytes())]);
+        let row = PgDataRow::new(&data).unwrap();
+        assert_eq!(row.get_f64(0), Some(f64::INFINITY));
+
+        let data = make_data_row(&[Some(&f64::NEG_INFINITY.to_be_bytes())]);
+        let row = PgDataRow::new(&data).unwrap();
+        assert_eq!(row.get_f64(0), Some(f64::NEG_INFINITY));
+
+        let data = make_data_row(&[Some(&f64::NAN.to_be_bytes())]);
+        let row = PgDataRow::new(&data).unwrap();
+        assert!(row.get_f64(0).unwrap().is_nan());
+    }
+
+    #[test]
+    fn pg_data_row_f32_special_values() {
+        let data = make_data_row(&[Some(&f32::INFINITY.to_be_bytes())]);
+        let row = PgDataRow::new(&data).unwrap();
+        assert_eq!(row.get_f32(0), Some(f32::INFINITY));
+
+        let data = make_data_row(&[Some(&f32::NAN.to_be_bytes())]);
+        let row = PgDataRow::new(&data).unwrap();
+        assert!(row.get_f32(0).unwrap().is_nan());
+    }
+
+    #[test]
+    fn pg_data_row_i16_boundary_values() {
+        for &val in &[i16::MIN, -1, 0, 1, i16::MAX] {
+            let data = make_data_row(&[Some(&val.to_be_bytes())]);
+            let row = PgDataRow::new(&data).unwrap();
+            assert_eq!(row.get_i16(0), Some(val));
+        }
+    }
+
+    // ===============================================================
+    // DataRow flat parsing — comprehensive edge cases
+    // ===============================================================
+
+    #[test]
+    fn data_row_flat_all_null() {
+        let mut arena = Arena::new();
+        let mut out = Vec::new();
+        let mut data = Vec::new();
+        data.extend_from_slice(&4i16.to_be_bytes());
+        for _ in 0..4 {
+            data.extend_from_slice(&(-1i32).to_be_bytes());
+        }
+        parse_data_row_flat(&data, &mut arena, &mut out).unwrap();
+        assert_eq!(out.len(), 4);
+        for (_, len) in &out {
+            assert_eq!(*len, -1);
+        }
+    }
+
+    #[test]
+    fn data_row_flat_long_text() {
+        let mut arena = Arena::new();
+        let mut out = Vec::new();
+        let long = vec![b'A'; 1024];
+        let mut data = Vec::new();
+        data.extend_from_slice(&1i16.to_be_bytes());
+        data.extend_from_slice(&(long.len() as i32).to_be_bytes());
+        data.extend_from_slice(&long);
+        parse_data_row_flat(&data, &mut arena, &mut out).unwrap();
+        assert_eq!(out[0].1, 1024);
+        let stored = arena.get(out[0].0, 1024);
+        assert!(stored.iter().all(|&b| b == b'A'));
+    }
+
+    #[test]
+    fn data_row_flat_empty_text() {
+        let mut arena = Arena::new();
+        let mut out = Vec::new();
+        let mut data = Vec::new();
+        data.extend_from_slice(&1i16.to_be_bytes());
+        data.extend_from_slice(&0i32.to_be_bytes()); // 0-length, not null
+        parse_data_row_flat(&data, &mut arena, &mut out).unwrap();
+        assert_eq!(out[0].1, 0);
+    }
+
+    // ===============================================================
+    // QueryResult edge cases
+    // ===============================================================
+
+    #[test]
+    fn query_result_from_parts() {
+        let result = QueryResult::from_parts(vec![(0, 4), (0, -1)], 2, Arc::from(Vec::new()), 5);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result.num_cols, 2);
+        assert_eq!(result.affected_rows, 5);
+    }
+
+    #[test]
+    fn query_result_affected_rows() {
+        let result = QueryResult {
+            all_col_offsets: vec![],
+            num_cols: 0,
+            columns: Arc::from(Vec::new()),
+            affected_rows: 42,
+        };
+        assert_eq!(result.affected_rows, 42);
+        assert!(result.is_empty());
+    }
+
+    // ===============================================================
+    // DriverError edge cases
+    // ===============================================================
+
+    #[test]
+    fn driver_error_server_with_hint() {
+        let e = DriverError::Server {
+            code: "42601".into(),
+            message: "syntax error".into(),
+            detail: None,
+            hint: Some("check your SQL".into()),
+            position: Some(10),
+        };
+        let s = e.to_string();
+        assert!(s.contains("HINT: check your SQL"));
+        assert!(s.contains("(at position 10)"));
+    }
+
+    #[test]
+    fn driver_error_server_with_all_fields() {
+        let e = DriverError::Server {
+            code: "23505".into(),
+            message: "unique violation".into(),
+            detail: Some("Key (id)=(1) already exists.".into()),
+            hint: Some("change the id".into()),
+            position: Some(1),
+        };
+        let s = e.to_string();
+        assert!(s.contains("23505"));
+        assert!(s.contains("unique violation"));
+        assert!(s.contains("Key (id)=(1) already exists."));
+        assert!(s.contains("change the id"));
+        assert!(s.contains("(at position 1)"));
+    }
+
+    // ===============================================================
+    // Config edge cases
+    // ===============================================================
+
+    #[test]
+    fn config_statement_timeout_default() {
+        let cfg = Config::from_url("postgres://user:pass@localhost/db").unwrap();
+        assert_eq!(cfg.statement_timeout_secs, 30);
+    }
+
+    #[test]
+    fn config_statement_timeout_custom() {
+        let cfg =
+            Config::from_url("postgres://user:pass@localhost/db?statement_timeout=120").unwrap();
+        assert_eq!(cfg.statement_timeout_secs, 120);
+    }
+
+    #[test]
+    fn config_statement_timeout_zero() {
+        let cfg =
+            Config::from_url("postgres://user:pass@localhost/db?statement_timeout=0").unwrap();
+        assert_eq!(cfg.statement_timeout_secs, 0);
+    }
+
+    #[test]
+    fn config_statement_timeout_invalid_falls_back() {
+        let cfg =
+            Config::from_url("postgres://user:pass@localhost/db?statement_timeout=notanumber")
+                .unwrap();
+        assert_eq!(cfg.statement_timeout_secs, 30); // fallback
+    }
+
+    #[test]
+    fn config_uds_path_format() {
+        let cfg = Config::from_url("postgres://user@localhost/db?host=/tmp").unwrap();
+        assert_eq!(cfg.uds_path(), "/tmp/.s.PGSQL.5432");
+    }
+
+    #[test]
+    fn config_uds_path_custom_port() {
+        let cfg = Config::from_url("postgres://user@localhost:5433/db?host=/tmp").unwrap();
+        assert_eq!(cfg.uds_path(), "/tmp/.s.PGSQL.5433");
+    }
+
+    // ===============================================================
+    // url_decode edge cases
+    // ===============================================================
+
+    #[test]
+    fn url_decode_empty_string() {
+        assert_eq!(url_decode("").unwrap(), "");
+    }
+
+    #[test]
+    fn url_decode_no_encoding() {
+        assert_eq!(url_decode("hello").unwrap(), "hello");
+    }
+
+    #[test]
+    fn url_decode_all_ascii_hex() {
+        // Uppercase hex
+        assert_eq!(url_decode("%2F").unwrap(), "/");
+        assert_eq!(url_decode("%2f").unwrap(), "/");
+    }
+
+    // ===============================================================
+    // hash_sql edge cases
+    // ===============================================================
+
+    #[test]
+    fn hash_sql_empty() {
+        let _h = hash_sql(""); // should not panic
+    }
+
+    #[test]
+    fn hash_sql_whitespace_only() {
+        let h = hash_sql("   ");
+        assert_ne!(h, hash_sql(""));
+    }
+
+    #[test]
+    fn hash_sql_very_long() {
+        let long_sql = "SELECT ".to_string() + &"x".repeat(10_000);
+        let h = hash_sql(&long_sql);
+        assert_eq!(h, hash_sql(&long_sql));
+    }
+
+    #[test]
+    fn hash_sql_unicode() {
+        let h = hash_sql("SELECT '\u{1F600}'");
+        assert_ne!(h, hash_sql("SELECT 'x'"));
+    }
 }

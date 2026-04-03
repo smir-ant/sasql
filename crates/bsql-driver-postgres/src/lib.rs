@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn driver_error_source_io() {
-        let inner = std::io::Error::new(std::io::ErrorKind::Other, "test");
+        let inner = std::io::Error::other("test");
         let e = DriverError::Io(inner);
         assert!(std::error::Error::source(&e).is_some());
     }
@@ -253,5 +253,175 @@ mod tests {
     fn forbid_unsafe_code() {
         // This test exists to document the safety guarantee.
         // The `#![forbid(unsafe_code)]` at the crate root ensures this at compile time.
+    }
+
+    // ===============================================================
+    // DriverError — extended coverage
+    // ===============================================================
+
+    #[test]
+    fn driver_error_display_server_all_none() {
+        let e = DriverError::Server {
+            code: "00000".into(),
+            message: "successful completion".into(),
+            detail: None,
+            hint: None,
+            position: None,
+        };
+        let s = e.to_string();
+        assert_eq!(s, "server error [00000]: successful completion");
+        // Should NOT contain DETAIL, HINT, or position
+        assert!(!s.contains("DETAIL"));
+        assert!(!s.contains("HINT"));
+        assert!(!s.contains("position"));
+    }
+
+    #[test]
+    fn driver_error_display_server_detail_only() {
+        let e = DriverError::Server {
+            code: "23505".into(),
+            message: "duplicate key".into(),
+            detail: Some("Key (id)=(1) exists.".into()),
+            hint: None,
+            position: None,
+        };
+        let s = e.to_string();
+        assert!(s.contains("DETAIL: Key (id)=(1) exists."));
+        assert!(!s.contains("HINT"));
+    }
+
+    #[test]
+    fn driver_error_display_server_hint_only() {
+        let e = DriverError::Server {
+            code: "42601".into(),
+            message: "syntax error".into(),
+            detail: None,
+            hint: Some("check SQL".into()),
+            position: None,
+        };
+        let s = e.to_string();
+        assert!(s.contains("HINT: check SQL"));
+        assert!(!s.contains("DETAIL"));
+    }
+
+    #[test]
+    fn driver_error_display_server_position_only() {
+        let e = DriverError::Server {
+            code: "42601".into(),
+            message: "syntax error".into(),
+            detail: None,
+            hint: None,
+            position: Some(15),
+        };
+        let s = e.to_string();
+        assert!(s.contains("(at position 15)"));
+    }
+
+    #[test]
+    fn driver_error_display_server_all_fields() {
+        let e = DriverError::Server {
+            code: "42P01".into(),
+            message: "relation does not exist".into(),
+            detail: Some("table was dropped".into()),
+            hint: Some("recreate the table".into()),
+            position: Some(42),
+        };
+        let s = e.to_string();
+        assert!(s.contains("[42P01]"));
+        assert!(s.contains("relation does not exist"));
+        assert!(s.contains("(at position 42)"));
+        assert!(s.contains("DETAIL: table was dropped"));
+        assert!(s.contains("HINT: recreate the table"));
+    }
+
+    #[test]
+    fn driver_error_io_preserves_kind() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        let e = DriverError::Io(io_err);
+        match &e {
+            DriverError::Io(inner) => {
+                assert_eq!(inner.kind(), std::io::ErrorKind::ConnectionRefused);
+            }
+            _ => panic!("expected Io variant"),
+        }
+    }
+
+    #[test]
+    fn driver_error_io_timeout() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::TimedOut, "connection timed out");
+        let e = DriverError::Io(io_err);
+        let s = e.to_string();
+        assert!(s.contains("timed out"));
+    }
+
+    #[test]
+    fn driver_error_io_unexpected_eof() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "connection closed");
+        let e: DriverError = io_err.into();
+        let s = e.to_string();
+        assert!(s.contains("connection closed"));
+    }
+
+    #[test]
+    fn driver_error_auth_empty() {
+        let e = DriverError::Auth(String::new());
+        assert_eq!(e.to_string(), "auth error: ");
+    }
+
+    #[test]
+    fn driver_error_protocol_empty() {
+        let e = DriverError::Protocol(String::new());
+        assert_eq!(e.to_string(), "protocol error: ");
+    }
+
+    #[test]
+    fn driver_error_pool_empty() {
+        let e = DriverError::Pool(String::new());
+        assert_eq!(e.to_string(), "pool error: ");
+    }
+
+    #[test]
+    fn driver_error_source_protocol_is_none() {
+        let e = DriverError::Protocol("test".into());
+        assert!(std::error::Error::source(&e).is_none());
+    }
+
+    #[test]
+    fn driver_error_source_server_is_none() {
+        let e = DriverError::Server {
+            code: "42601".into(),
+            message: "err".into(),
+            detail: None,
+            hint: None,
+            position: None,
+        };
+        assert!(std::error::Error::source(&e).is_none());
+    }
+
+    #[test]
+    fn driver_error_source_pool_is_none() {
+        let e = DriverError::Pool("test".into());
+        assert!(std::error::Error::source(&e).is_none());
+    }
+
+    #[test]
+    fn driver_error_debug_all_variants() {
+        let variants: Vec<DriverError> = vec![
+            DriverError::Io(std::io::Error::other("io")),
+            DriverError::Auth("auth".into()),
+            DriverError::Protocol("proto".into()),
+            DriverError::Server {
+                code: "00000".into(),
+                message: "ok".into(),
+                detail: None,
+                hint: None,
+                position: None,
+            },
+            DriverError::Pool("pool".into()),
+        ];
+        for v in &variants {
+            let dbg = format!("{v:?}");
+            assert!(!dbg.is_empty());
+        }
     }
 }

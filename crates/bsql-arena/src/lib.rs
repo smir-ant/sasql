@@ -1078,4 +1078,256 @@ mod tests {
         let arena = Arena::new();
         assert_eq!(arena.get_str(0, 0), Some(""));
     }
+
+    // ===============================================================
+    // ValidatedRows — comprehensive tests
+    // ===============================================================
+
+    #[test]
+    fn validated_rows_empty_text_buf() {
+        let vr: ValidatedRows<i64> = ValidatedRows::new(vec![1, 2, 3], String::new(), Arena::new());
+        assert_eq!(vr.text(), "");
+        assert_eq!(vr.text_len(), 0);
+        assert_eq!(vr.len(), 3);
+    }
+
+    #[test]
+    fn validated_rows_blob_only_no_text() {
+        let mut blob_arena = Arena::new();
+        let o1 = blob_arena.alloc_copy(&[0x01, 0x02, 0x03]);
+        let o2 = blob_arena.alloc_copy(&[0xAA, 0xBB]);
+
+        #[derive(Debug)]
+        struct Inner {
+            off: u32,
+            len: u32,
+        }
+
+        let rows = vec![
+            Inner {
+                off: o1 as u32,
+                len: 3,
+            },
+            Inner {
+                off: o2 as u32,
+                len: 2,
+            },
+        ];
+        let vr = ValidatedRows::new(rows, String::new(), blob_arena);
+        assert_eq!(vr.text_len(), 0);
+        assert_eq!(vr.blob_slice(vr[0].off, vr[0].len), &[0x01, 0x02, 0x03]);
+        assert_eq!(vr.blob_slice(vr[1].off, vr[1].len), &[0xAA, 0xBB]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn validated_rows_text_slice_out_of_bounds() {
+        let vr: ValidatedRows<i64> = ValidatedRows::new(vec![], String::from("hi"), Arena::new());
+        // end is beyond the text buffer
+        vr.text_slice(0, 100);
+    }
+
+    #[test]
+    #[should_panic]
+    fn validated_rows_blob_slice_out_of_bounds() {
+        let blob_arena = Arena::new();
+        let vr: ValidatedRows<i64> = ValidatedRows::new(vec![], String::new(), blob_arena);
+        // nothing allocated in blob arena
+        vr.blob_slice(0, 100);
+    }
+
+    #[test]
+    fn validated_rows_large_10k_rows() {
+        let mut text_buf = String::new();
+        let blob_arena = Arena::new();
+
+        #[derive(Debug)]
+        struct Inner {
+            start: u32,
+            end: u32,
+        }
+
+        let mut rows = Vec::with_capacity(10_000);
+        for i in 0..10_000u32 {
+            let start = text_buf.len() as u32;
+            text_buf.push_str(&format!("row_{i}"));
+            let end = text_buf.len() as u32;
+            rows.push(Inner { start, end });
+        }
+
+        let vr = ValidatedRows::new(rows, text_buf, blob_arena);
+        assert_eq!(vr.len(), 10_000);
+        assert_eq!(vr.text_slice(vr[0].start, vr[0].end), "row_0");
+        assert_eq!(vr.text_slice(vr[9999].start, vr[9999].end), "row_9999");
+    }
+
+    #[test]
+    fn validated_rows_text_slice_empty_range() {
+        let vr: ValidatedRows<i64> =
+            ValidatedRows::new(vec![], String::from("hello"), Arena::new());
+        assert_eq!(vr.text_slice(0, 0), "");
+        assert_eq!(vr.text_slice(3, 3), "");
+    }
+
+    #[test]
+    fn validated_rows_get_inner() {
+        let vr: ValidatedRows<i64> =
+            ValidatedRows::new(vec![10, 20, 30], String::new(), Arena::new());
+        assert_eq!(vr.get_inner(0), Some(&10));
+        assert_eq!(vr.get_inner(1), Some(&20));
+        assert_eq!(vr.get_inner(2), Some(&30));
+        assert_eq!(vr.get_inner(3), None);
+    }
+
+    #[test]
+    fn validated_rows_iter_inner() {
+        let vr: ValidatedRows<i64> = ValidatedRows::new(vec![5, 10], String::new(), Arena::new());
+        let vals: Vec<&i64> = vr.iter_inner().collect();
+        assert_eq!(vals, vec![&5, &10]);
+    }
+
+    #[test]
+    fn validated_rows_blob_allocated_zero() {
+        let vr: ValidatedRows<i64> = ValidatedRows::new(vec![], String::new(), Arena::new());
+        assert_eq!(vr.blob_allocated(), 0);
+    }
+
+    // ===============================================================
+    // Arena — additional edge cases
+    // ===============================================================
+
+    #[test]
+    fn arena_get_zero_len() {
+        let arena = Arena::new();
+        let data = arena.get(0, 0);
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn arena_alloc_copy_zero_len() {
+        let mut arena = Arena::new();
+        let offset = arena.alloc_copy(b"");
+        assert_eq!(arena.get(offset, 0), &[]);
+    }
+
+    #[test]
+    fn arena_global_offset_initial() {
+        let arena = Arena::new();
+        assert_eq!(arena.global_offset(), 0);
+    }
+
+    #[test]
+    fn arena_global_offset_advances() {
+        let mut arena = Arena::new();
+        arena.alloc_copy(b"12345");
+        assert_eq!(arena.global_offset(), 5);
+        arena.alloc_copy(b"67890");
+        assert_eq!(arena.global_offset(), 10);
+    }
+
+    #[test]
+    fn arena_multiple_resets() {
+        let mut arena = Arena::new();
+        for _ in 0..10 {
+            arena.alloc_copy(b"data");
+            assert_eq!(arena.allocated(), 4);
+            arena.reset();
+            assert_eq!(arena.allocated(), 0);
+        }
+    }
+
+    #[test]
+    fn arena_get_str_unicode() {
+        let texts = [
+            "\u{1F600}\u{1F4A9}",         // emoji
+            "\u{4e16}\u{754c}",           // CJK
+            "caf\u{00e9}",                // accented
+            "\u{1F468}\u{200D}\u{1F469}", // ZWJ
+        ];
+        for text in &texts {
+            let mut arena = Arena::new();
+            let offset = arena.alloc_copy(text.as_bytes());
+            assert_eq!(
+                arena.get_str(offset, text.len()),
+                Some(*text),
+                "failed for text: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn arena_get_str_partial_utf8_returns_none() {
+        // 0xC3 is the start of a 2-byte UTF-8 sequence, incomplete without the second byte
+        let mut arena = Arena::new();
+        let offset = arena.alloc_copy(&[0xC3]);
+        assert_eq!(arena.get_str(offset, 1), None);
+    }
+
+    #[test]
+    fn arena_default_is_new() {
+        let a1 = Arena::new();
+        let a2 = Arena::default();
+        assert_eq!(a1.allocated(), a2.allocated());
+        assert_eq!(a1.capacity(), a2.capacity());
+    }
+
+    // ===============================================================
+    // ArenaRows — additional edge cases
+    // ===============================================================
+
+    #[test]
+    fn arena_rows_large() {
+        let arena = Arena::new();
+        let rows: Vec<i64> = (0..1000).collect();
+        let ar = ArenaRows::new(rows, arena);
+        assert_eq!(ar.len(), 1000);
+        assert_eq!(ar[0], 0);
+        assert_eq!(ar[999], 999);
+    }
+
+    #[test]
+    fn arena_rows_with_arena_data() {
+        let mut arena = Arena::new();
+        let offset = arena.alloc_copy(b"stored data");
+
+        #[derive(Debug)]
+        struct Inner {
+            off: usize,
+            len: usize,
+        }
+
+        let ar = ArenaRows::new(
+            vec![Inner {
+                off: offset,
+                len: 11,
+            }],
+            arena,
+        );
+        assert_eq!(ar.len(), 1);
+    }
+
+    // ===============================================================
+    // Thread-local pool edge cases
+    // ===============================================================
+
+    #[test]
+    fn thread_local_pool_acquire_fresh() {
+        // Drain the pool first
+        ARENA_POOL.with(|pool| pool.borrow_mut().clear());
+        let arena = acquire_arena();
+        assert_eq!(arena.allocated(), 0);
+        release_arena(arena);
+    }
+
+    #[test]
+    fn thread_local_pool_recycle_resets() {
+        let mut arena = Arena::new();
+        arena.alloc_copy(b"something");
+        assert!(arena.allocated() > 0);
+        release_arena(arena);
+
+        let arena2 = acquire_arena();
+        assert_eq!(arena2.allocated(), 0, "recycled arena should be reset");
+        release_arena(arena2);
+    }
 }

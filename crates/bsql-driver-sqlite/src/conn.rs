@@ -3169,4 +3169,613 @@ mod tests {
         drop(conn);
         let _ = std::fs::remove_file(&path);
     }
+
+    // ===============================================================
+    // for_each — NULL values in various positions
+    // ===============================================================
+
+    #[test]
+    fn for_each_null_values_in_all_positions() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (a TEXT, b INTEGER, c REAL, d BLOB)")
+            .unwrap();
+        conn.exec("INSERT INTO t VALUES (NULL, NULL, NULL, NULL)")
+            .unwrap();
+        conn.exec("INSERT INTO t VALUES ('x', NULL, 1.5, NULL)")
+            .unwrap();
+        conn.exec("INSERT INTO t VALUES (NULL, 42, NULL, X'DEADBEEF')")
+            .unwrap();
+
+        let sql = "SELECT a, b, c, d FROM t ORDER BY rowid";
+        let hash = hash_sql(sql);
+        let mut rows_seen = 0usize;
+        conn.for_each(sql, hash, &[], |stmt| {
+            match rows_seen {
+                0 => {
+                    // All NULL
+                    assert!(
+                        stmt.column_text(0).is_none() || stmt.column_type(0) == raw::SQLITE_NULL
+                    );
+                }
+                1 => {
+                    // 'x', NULL, 1.5, NULL
+                    let text = stmt.column_text(0);
+                    assert_eq!(text, Some(b"x" as &[u8]));
+                }
+                2 => {
+                    // NULL, 42, NULL, blob
+                    assert_eq!(stmt.column_int64(1), 42);
+                }
+                _ => {}
+            }
+            rows_seen += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rows_seen, 3);
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ===============================================================
+    // for_each — mixed types in one query
+    // ===============================================================
+
+    #[test]
+    fn for_each_mixed_types() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (i INTEGER, t TEXT, b BLOB, f REAL, bo INTEGER)")
+            .unwrap();
+        conn.exec("INSERT INTO t VALUES (42, 'hello', X'CAFE', 3.14, 1)")
+            .unwrap();
+
+        let sql = "SELECT i, t, b, f, bo FROM t";
+        let hash = hash_sql(sql);
+        conn.for_each(sql, hash, &[], |stmt| {
+            assert_eq!(stmt.column_int64(0), 42);
+            assert_eq!(stmt.column_text(1), Some(b"hello" as &[u8]));
+            assert_eq!(stmt.column_blob(2), &[0xCA, 0xFE]);
+            let f = stmt.column_double(3);
+            assert!((f - 3.14).abs() < 1e-10);
+            assert_eq!(stmt.column_int64(4), 1);
+            Ok(())
+        })
+        .unwrap();
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ===============================================================
+    // for_each_collect with transformation
+    // ===============================================================
+
+    #[test]
+    fn for_each_collect_with_transform() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (name TEXT)").unwrap();
+        conn.exec("INSERT INTO t VALUES ('alice')").unwrap();
+        conn.exec("INSERT INTO t VALUES ('bob')").unwrap();
+        conn.exec("INSERT INTO t VALUES ('charlie')").unwrap();
+
+        let sql = "SELECT name FROM t ORDER BY rowid";
+        let hash = hash_sql(sql);
+        let upper: Vec<String> = conn
+            .for_each_collect(sql, hash, &[], |stmt| {
+                let name = stmt
+                    .column_text(0)
+                    .and_then(|b| std::str::from_utf8(b).ok())
+                    .unwrap_or("");
+                Ok(name.to_uppercase())
+            })
+            .unwrap();
+        assert_eq!(upper, vec!["ALICE", "BOB", "CHARLIE"]);
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ===============================================================
+    // for_each — zero rows
+    // ===============================================================
+
+    #[test]
+    fn for_each_zero_rows_closure_not_called() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER)").unwrap();
+
+        let sql = "SELECT id FROM t";
+        let hash = hash_sql(sql);
+        let mut count = 0usize;
+        conn.for_each(sql, hash, &[], |_| {
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, 0);
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ===============================================================
+    // Error paths
+    // ===============================================================
+
+    #[test]
+    fn exec_invalid_sql_error() {
+        let path = temp_db_path();
+        let conn = SqliteConnection::open(&path).unwrap();
+        let result = conn.exec("NOT VALID SQL AT ALL");
+        assert!(result.is_err());
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn query_invalid_sql_error() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        let mut arena = Arena::new();
+        let sql = "SELECTTTT GARBAGE";
+        let hash = hash_sql(sql);
+        let result = conn.query(sql, hash, &[], &mut arena);
+        assert!(result.is_err());
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn connection_usable_after_query_error() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER)").unwrap();
+
+        // First: trigger an error
+        let mut arena = Arena::new();
+        let bad_sql = "SELECT nonexistent_column FROM nonexistent_table";
+        let bad_hash = hash_sql(bad_sql);
+        let result = conn.query(bad_sql, bad_hash, &[], &mut arena);
+        assert!(result.is_err());
+
+        // Then: verify connection is still usable
+        arena.reset();
+        let good_sql = "SELECT 1";
+        let good_hash = hash_sql(good_sql);
+        let result = conn.query(good_sql, good_hash, &[], &mut arena);
+        assert!(result.is_ok());
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fetch_one_direct_zero_rows_error() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER)").unwrap();
+
+        let sql = "SELECT id FROM t";
+        let hash = hash_sql(sql);
+        let result = conn.fetch_one_direct(sql, hash, &[], |stmt| Ok(stmt.column_int64(0)));
+        assert!(result.is_err());
+        match result {
+            Err(SqliteError::Internal(msg)) => {
+                assert!(msg.contains("expected 1 row, got 0"));
+            }
+            other => panic!("expected Internal error, got: {other:?}"),
+        }
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fetch_optional_direct_zero_rows_none() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER)").unwrap();
+
+        let sql = "SELECT id FROM t";
+        let hash = hash_sql(sql);
+        let result = conn
+            .fetch_optional_direct(sql, hash, &[], |stmt| Ok(stmt.column_int64(0)))
+            .unwrap();
+        assert!(result.is_none());
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fetch_optional_direct_one_row_some() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER)").unwrap();
+        conn.exec("INSERT INTO t VALUES (42)").unwrap();
+
+        let sql = "SELECT id FROM t";
+        let hash = hash_sql(sql);
+        let result = conn
+            .fetch_optional_direct(sql, hash, &[], |stmt| Ok(stmt.column_int64(0)))
+            .unwrap();
+        assert_eq!(result, Some(42));
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ===============================================================
+    // Edge cases — SQL content
+    // ===============================================================
+
+    #[test]
+    fn empty_sql_string_exec() {
+        let path = temp_db_path();
+        let conn = SqliteConnection::open(&path).unwrap();
+        // Empty SQL is valid in SQLite (no-op)
+        let result = conn.exec("");
+        assert!(result.is_ok());
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn whitespace_only_sql_exec() {
+        let path = temp_db_path();
+        let conn = SqliteConnection::open(&path).unwrap();
+        let result = conn.exec("   ");
+        assert!(result.is_ok());
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn very_long_sql() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (val TEXT)").unwrap();
+        // Build a 10KB SQL string
+        let long_val = "x".repeat(10_000);
+        let sql_ins = "INSERT INTO t VALUES (?1)";
+        let hash_ins = hash_sql(sql_ins);
+        conn.execute(sql_ins, hash_ins, &[&long_val.as_str()])
+            .unwrap();
+
+        let mut arena = Arena::new();
+        let sql_sel = "SELECT val FROM t";
+        let hash_sel = hash_sql(sql_sel);
+        let result = conn.query(sql_sel, hash_sel, &[], &mut arena).unwrap();
+        assert_eq!(result.get_str(0, 0, &arena), Some(long_val.as_str()));
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ===============================================================
+    // Edge cases — parameter values
+    // ===============================================================
+
+    #[test]
+    fn param_empty_string() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (val TEXT)").unwrap();
+        let sql = "INSERT INTO t VALUES (?1)";
+        let hash = hash_sql(sql);
+        let empty: &str = "";
+        conn.execute(sql, hash, &[&empty]).unwrap();
+
+        let mut arena = Arena::new();
+        let sel = "SELECT val FROM t";
+        let sel_hash = hash_sql(sel);
+        let result = conn.query(sel, sel_hash, &[], &mut arena).unwrap();
+        assert!(!result.is_null(0, 0));
+        assert_eq!(result.get_str(0, 0, &arena), Some(""));
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn param_unicode_emoji_zwj_rtl() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (val TEXT)").unwrap();
+
+        let texts = [
+            "\u{1F600}\u{1F4A9}\u{1F680}",                 // emoji
+            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}", // ZWJ family
+            "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}",    // Arabic (RTL)
+            "\u{202E}reversed\u{202C}",                    // RTL override
+        ];
+        let sql = "INSERT INTO t VALUES (?1)";
+        let hash = hash_sql(sql);
+        for text in &texts {
+            conn.execute(sql, hash, &[text]).unwrap();
+        }
+
+        let mut arena = Arena::new();
+        let sel = "SELECT val FROM t ORDER BY rowid";
+        let sel_hash = hash_sql(sel);
+        let result = conn.query(sel, sel_hash, &[], &mut arena).unwrap();
+        for (i, text) in texts.iter().enumerate() {
+            assert_eq!(result.get_str(i, 0, &arena), Some(*text), "row {i}");
+        }
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn param_i64_min_max() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (val INTEGER)").unwrap();
+        let sql = "INSERT INTO t VALUES (?1)";
+        let hash = hash_sql(sql);
+        conn.execute(sql, hash, &[&i64::MIN]).unwrap();
+        conn.execute(sql, hash, &[&i64::MAX]).unwrap();
+
+        let mut arena = Arena::new();
+        let sel = "SELECT val FROM t ORDER BY rowid";
+        let sel_hash = hash_sql(sel);
+        let result = conn.query(sel, sel_hash, &[], &mut arena).unwrap();
+        assert_eq!(result.get_i64(0, 0, &arena), Some(i64::MIN));
+        assert_eq!(result.get_i64(1, 0, &arena), Some(i64::MAX));
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn param_f64_nan_infinity() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (val REAL)").unwrap();
+        let sql = "INSERT INTO t VALUES (?1)";
+        let hash = hash_sql(sql);
+        let nan: f64 = f64::NAN;
+        conn.execute(sql, hash, &[&nan]).unwrap();
+        let inf: f64 = f64::INFINITY;
+        conn.execute(sql, hash, &[&inf]).unwrap();
+        let neg_inf: f64 = f64::NEG_INFINITY;
+        conn.execute(sql, hash, &[&neg_inf]).unwrap();
+
+        let mut arena = Arena::new();
+        let sel = "SELECT val FROM t ORDER BY rowid";
+        let sel_hash = hash_sql(sel);
+        let result = conn.query(sel, sel_hash, &[], &mut arena).unwrap();
+        // NaN behavior: SQLite may store NaN as NULL
+        // Infinity and neg infinity should round-trip
+        let nan_val = result.get_f64(0, 0, &arena);
+        if let Some(v) = nan_val {
+            assert!(v.is_nan());
+        }
+        // else: SQLite stored NaN as NULL, which is acceptable
+        assert_eq!(result.get_f64(1, 0, &arena), Some(f64::INFINITY));
+        assert_eq!(result.get_f64(2, 0, &arena), Some(f64::NEG_INFINITY));
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn param_null_option() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (val INTEGER)").unwrap();
+        let sql = "INSERT INTO t VALUES (?1)";
+        let hash = hash_sql(sql);
+        let null_val: Option<i64> = None;
+        conn.execute(sql, hash, &[&null_val]).unwrap();
+        let some_val: Option<i64> = Some(42);
+        conn.execute(sql, hash, &[&some_val]).unwrap();
+
+        let mut arena = Arena::new();
+        let sel = "SELECT val FROM t ORDER BY rowid";
+        let sel_hash = hash_sql(sel);
+        let result = conn.query(sel, sel_hash, &[], &mut arena).unwrap();
+        assert!(result.is_null(0, 0));
+        assert_eq!(result.get_i64(1, 0, &arena), Some(42));
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ===============================================================
+    // execute_direct
+    // ===============================================================
+
+    #[test]
+    fn execute_direct_insert_and_verify() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER, val TEXT)").unwrap();
+
+        let sql = "INSERT INTO t VALUES (?1, ?2)";
+        let hash = hash_sql(sql);
+        let id: i64 = 1;
+        let val: &str = "hello";
+        let affected = conn.execute_direct(sql, hash, &[&id, &val]).unwrap();
+        assert_eq!(affected, 1);
+
+        let mut arena = Arena::new();
+        let sel = "SELECT id, val FROM t";
+        let sel_hash = hash_sql(sel);
+        let result = conn.query(sel, sel_hash, &[], &mut arena).unwrap();
+        assert_eq!(result.get_i64(0, 0, &arena), Some(1));
+        assert_eq!(result.get_str(0, 1, &arena), Some("hello"));
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ===============================================================
+    // QueryResult boundary assertions
+    // ===============================================================
+
+    #[test]
+    #[should_panic(expected = "row")]
+    fn query_result_cell_out_of_range_row() {
+        let result = QueryResult {
+            col_count: 1,
+            row_count: 1,
+            col_offsets: vec![(0, 8)],
+        };
+        result.cell(5, 0); // row 5 out of range
+    }
+
+    #[test]
+    #[should_panic(expected = "col")]
+    fn query_result_cell_out_of_range_col() {
+        let result = QueryResult {
+            col_count: 1,
+            row_count: 1,
+            col_offsets: vec![(0, 8)],
+        };
+        result.cell(0, 5); // col 5 out of range
+    }
+
+    // ===============================================================
+    // fetch_all_arena
+    // ===============================================================
+
+    #[test]
+    fn fetch_all_arena_with_blobs() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER, data BLOB)").unwrap();
+        conn.exec("INSERT INTO t VALUES (1, X'CAFE')").unwrap();
+        conn.exec("INSERT INTO t VALUES (2, X'BEEF')").unwrap();
+
+        let sql = "SELECT id, data FROM t ORDER BY id";
+        let hash = hash_sql(sql);
+
+        #[derive(Debug)]
+        struct Row {
+            id: i64,
+            data_offset: usize,
+            data_len: usize,
+        }
+
+        let ar = conn
+            .fetch_all_arena(sql, hash, &[], |stmt, arena| {
+                let id = stmt.column_int64(0);
+                let blob = stmt.column_blob(1);
+                let offset = arena.alloc_copy(blob);
+                Ok(Row {
+                    id,
+                    data_offset: offset,
+                    data_len: blob.len(),
+                })
+            })
+            .unwrap();
+
+        assert_eq!(ar.len(), 2);
+        assert_eq!(ar[0].id, 1);
+        assert_eq!(ar[1].id, 2);
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ===============================================================
+    // streaming — chunk_size=1
+    // ===============================================================
+
+    #[test]
+    fn streaming_chunk_size_one() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER)").unwrap();
+        conn.exec("INSERT INTO t VALUES (10)").unwrap();
+        conn.exec("INSERT INTO t VALUES (20)").unwrap();
+        conn.exec("INSERT INTO t VALUES (30)").unwrap();
+
+        let sql = "SELECT id FROM t ORDER BY id";
+        let sql_hash = hash_sql(sql);
+        let mut streaming = conn.query_streaming(sql, sql_hash, &[], 1).unwrap();
+
+        for expected in [10i64, 20, 30] {
+            let mut arena = Arena::new();
+            let chunk = conn
+                .streaming_next_chunk(&mut streaming, &mut arena)
+                .unwrap();
+            assert_eq!(chunk.row_count, 1);
+            assert_eq!(chunk.get_i64(0, 0, &arena), Some(expected));
+        }
+
+        let mut arena_end = Arena::new();
+        let chunk_end = conn
+            .streaming_next_chunk(&mut streaming, &mut arena_end)
+            .unwrap();
+        assert_eq!(chunk_end.row_count, 0);
+        assert!(streaming.finished);
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ===============================================================
+    // Multiple prepare_only calls
+    // ===============================================================
+
+    #[test]
+    fn prepare_only_idempotent() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER)").unwrap();
+        let sql = "SELECT id FROM t";
+        let hash = hash_sql(sql);
+        conn.prepare_only(sql, hash).unwrap();
+        assert_eq!(conn.stmts.len(), 1);
+        conn.prepare_only(sql, hash).unwrap();
+        assert_eq!(conn.stmts.len(), 1); // no duplicate
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ===============================================================
+    // Multiple mixed operations on same connection
+    // ===============================================================
+
+    #[test]
+    fn mixed_operations_stress() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER, name TEXT, val REAL)")
+            .unwrap();
+
+        // Insert
+        let ins = "INSERT INTO t VALUES (?1, ?2, ?3)";
+        let ins_hash = hash_sql(ins);
+        for i in 0..100 {
+            let id: i64 = i;
+            let name = format!("row_{i}");
+            let val: f64 = i as f64 * 1.5;
+            conn.execute(ins, ins_hash, &[&id, &name.as_str(), &val])
+                .unwrap();
+        }
+
+        // Query
+        let mut arena = Arena::new();
+        let sel = "SELECT id, name, val FROM t ORDER BY id";
+        let sel_hash = hash_sql(sel);
+        let result = conn.query(sel, sel_hash, &[], &mut arena).unwrap();
+        assert_eq!(result.len(), 100);
+
+        // Update
+        let upd = "UPDATE t SET name = ?1 WHERE id = ?2";
+        let upd_hash = hash_sql(upd);
+        let new_name: &str = "updated";
+        let id: i64 = 50;
+        let affected = conn.execute(upd, upd_hash, &[&new_name, &id]).unwrap();
+        assert_eq!(affected, 1);
+
+        // Delete
+        let del = "DELETE FROM t WHERE id > ?1";
+        let del_hash = hash_sql(del);
+        let threshold: i64 = 90;
+        let affected = conn.execute(del, del_hash, &[&threshold]).unwrap();
+        assert_eq!(affected, 9);
+
+        // Verify final count
+        arena.reset();
+        let count_sql = "SELECT COUNT(*) FROM t";
+        let count_hash = hash_sql(count_sql);
+        let result = conn.query(count_sql, count_hash, &[], &mut arena).unwrap();
+        assert_eq!(result.get_i64(0, 0, &arena), Some(91));
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
 }
