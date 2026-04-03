@@ -1937,11 +1937,12 @@ impl Connection {
     /// by TcpStream) may still buffer. Always flushing ensures data reaches
     /// the wire immediately for both plain TCP and TLS.
     async fn flush_write(&mut self) -> Result<(), DriverError> {
+        // TCP_NODELAY is set — write_all pushes to the kernel buffer immediately.
+        // No flush needed (TCP doesn't buffer at application level).
         self.stream
             .write_all(&self.write_buf)
             .await
             .map_err(DriverError::Io)?;
-        self.stream.flush().await.map_err(DriverError::Io)?;
         Ok(())
     }
 
