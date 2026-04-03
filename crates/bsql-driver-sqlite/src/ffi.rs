@@ -95,7 +95,7 @@ pub enum StepResult {
 /// # Thread safety
 ///
 /// `DbHandle` is `Send` but not `Sync`. When opened with
-/// `SQLITE_OPEN_FULLMUTEX`, the underlying SQLite handle serializes all
+/// `SQLITE_OPEN_NOMUTEX`, the underlying SQLite handle serializes all
 /// API calls internally, making it safe to move between threads. The pool
 /// wraps each connection in a `Mutex<SqliteConnection>` which prevents
 /// concurrent access to the same handle (interleaved step() calls).
@@ -112,7 +112,7 @@ pub enum StepResult {
 /// use bsql_driver_sqlite::ffi::DbHandle;
 /// use libsqlite3_sys as raw;
 ///
-/// let flags = raw::SQLITE_OPEN_READWRITE | raw::SQLITE_OPEN_CREATE | raw::SQLITE_OPEN_FULLMUTEX;
+/// let flags = raw::SQLITE_OPEN_READWRITE | raw::SQLITE_OPEN_CREATE | raw::SQLITE_OPEN_NOMUTEX;
 /// let db = DbHandle::open("/tmp/test.db", flags).unwrap();
 /// db.exec("CREATE TABLE t (id INTEGER)").unwrap();
 /// // db is closed when dropped
@@ -121,10 +121,11 @@ pub struct DbHandle {
     ptr: *mut raw::sqlite3,
 }
 
-// SAFETY: DbHandle is opened with SQLITE_OPEN_FULLMUTEX which makes the
-// sqlite3 handle safe to use from any thread — SQLite serializes all API
-// calls internally. We further serialize access via Mutex<SqliteConnection>
-// in the pool to prevent interleaved step() calls on the same connection.
+// SAFETY: DbHandle is opened with SQLITE_OPEN_NOMUTEX. SQLite's internal
+// mutex is disabled for maximum performance. Thread safety is guaranteed by
+// Mutex<SqliteConnection> in the pool — at most one thread accesses the
+// connection at any time. The handle moves between threads (Send) but is
+// never accessed concurrently.
 unsafe impl Send for DbHandle {}
 
 impl DbHandle {
@@ -252,13 +253,13 @@ impl Drop for DbHandle {
 /// # Thread safety
 ///
 /// `StmtHandle` is `Send` because the parent `DbHandle` is opened with
-/// `SQLITE_OPEN_FULLMUTEX`. Prepared statements are tied to a connection,
+/// `SQLITE_OPEN_NOMUTEX`. Prepared statements are tied to a connection,
 /// and we serialize access via `Mutex<SqliteConnection>`.
 pub struct StmtHandle {
     ptr: *mut raw::sqlite3_stmt,
 }
 
-// SAFETY: StmtHandle is tied to a DbHandle opened with SQLITE_OPEN_FULLMUTEX.
+// SAFETY: StmtHandle is tied to a DbHandle opened with SQLITE_OPEN_NOMUTEX.
 // Access is serialized via Mutex<SqliteConnection> in the pool. The statement
 // is only used while the connection mutex is held.
 unsafe impl Send for StmtHandle {}
@@ -566,7 +567,7 @@ mod tests {
     }
 
     fn rw_flags() -> i32 {
-        raw::SQLITE_OPEN_READWRITE | raw::SQLITE_OPEN_CREATE | raw::SQLITE_OPEN_FULLMUTEX
+        raw::SQLITE_OPEN_READWRITE | raw::SQLITE_OPEN_CREATE | raw::SQLITE_OPEN_NOMUTEX
     }
 
     // ---- open ----
@@ -593,14 +594,14 @@ mod tests {
     #[test]
     fn open_nonexistent_directory() {
         let flags =
-            raw::SQLITE_OPEN_READWRITE | raw::SQLITE_OPEN_CREATE | raw::SQLITE_OPEN_FULLMUTEX;
+            raw::SQLITE_OPEN_READWRITE | raw::SQLITE_OPEN_CREATE | raw::SQLITE_OPEN_NOMUTEX;
         let result = DbHandle::open("/no/such/directory/db.sqlite", flags);
         assert!(result.is_err());
     }
 
     #[test]
     fn open_readonly_nonexistent_file() {
-        let flags = raw::SQLITE_OPEN_READONLY | raw::SQLITE_OPEN_FULLMUTEX;
+        let flags = raw::SQLITE_OPEN_READONLY | raw::SQLITE_OPEN_NOMUTEX;
         let result = DbHandle::open("/tmp/bsql_does_not_exist_ever.db", flags);
         assert!(result.is_err());
     }

@@ -74,7 +74,7 @@ pub fn hash_sql(sql: &str) -> u64 {
 /// A single SQLite database connection with a statement cache.
 ///
 /// `SqliteConnection` is `Send` because the underlying `DbHandle` is opened
-/// with `SQLITE_OPEN_FULLMUTEX` (serialized mode). The sync pool wraps each
+/// with `SQLITE_OPEN_NOMUTEX` (multi-thread mode). The sync pool wraps each
 /// connection in `Mutex<SqliteConnection>` to prevent interleaved step() calls.
 pub struct SqliteConnection {
     db: DbHandle,
@@ -87,11 +87,12 @@ impl SqliteConnection {
     /// Sets WAL mode, synchronous=NORMAL, 256MB mmap, 64MB cache, and
     /// busy_timeout=0 (fail-fast per CREDO #17).
     ///
-    /// Connections are opened with `SQLITE_OPEN_FULLMUTEX` (serialized mode)
-    /// making the handle safe to move between threads.
+    /// Connections are opened with `SQLITE_OPEN_NOMUTEX` (multi-thread mode).
+    /// Thread safety is provided by `Mutex<SqliteConnection>` in the pool —
+    /// SQLite's internal locking is redundant and adds ~15-20ns per API call.
     pub fn open(path: &str) -> Result<Self, SqliteError> {
         let flags =
-            raw::SQLITE_OPEN_READWRITE | raw::SQLITE_OPEN_CREATE | raw::SQLITE_OPEN_FULLMUTEX;
+            raw::SQLITE_OPEN_READWRITE | raw::SQLITE_OPEN_CREATE | raw::SQLITE_OPEN_NOMUTEX;
         let db = DbHandle::open(path, flags)?;
 
         db.exec("PRAGMA journal_mode = WAL")?;
@@ -113,10 +114,10 @@ impl SqliteConnection {
     /// Used by readers in the pool. Does not set journal_mode (only
     /// the writer sets that).
     ///
-    /// Connections are opened with `SQLITE_OPEN_FULLMUTEX` (serialized mode)
-    /// making the handle safe to move between threads.
+    /// Connections are opened with `SQLITE_OPEN_NOMUTEX` (multi-thread mode).
+    /// Thread safety is provided by `Mutex<SqliteConnection>` in the pool.
     pub fn open_readonly(path: &str) -> Result<Self, SqliteError> {
-        let flags = raw::SQLITE_OPEN_READONLY | raw::SQLITE_OPEN_FULLMUTEX;
+        let flags = raw::SQLITE_OPEN_READONLY | raw::SQLITE_OPEN_NOMUTEX;
         let db = DbHandle::open(path, flags)?;
 
         db.exec("PRAGMA synchronous = NORMAL")?;
