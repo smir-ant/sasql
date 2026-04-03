@@ -321,8 +321,9 @@ struct StmtInfo {
     name: Box<str>,
     /// Column metadata from RowDescription.
     columns: Arc<[ColumnDesc]>,
-    /// Timestamp of last use for LRU eviction.
-    last_used: std::time::Instant,
+    /// Monotonic counter value at last use for LRU eviction.
+    /// Cheaper than `Instant::now()` which is a syscall on macOS (~20-40ns).
+    last_used: u64,
 }
 
 /// Description of a result column.
@@ -411,6 +412,9 @@ pub struct Connection {
     /// this size, the least recently used statement is evicted (Close sent to PG).
     /// Default: 256.
     max_stmt_cache_size: usize,
+    /// Monotonic counter for LRU eviction — incremented on each cache access.
+    /// Replaces `Instant::now()` to avoid syscall overhead (~20-40ns on macOS).
+    query_counter: u64,
 }
 
 impl Connection {
@@ -472,6 +476,7 @@ impl Connection {
             created_at: std::time::Instant::now(),
             pending_notifications: Vec::new(),
             max_stmt_cache_size: 256,
+            query_counter: 0,
         };
 
         conn.startup(config).await?;
@@ -695,12 +700,13 @@ impl Connection {
         self.expect_ready().await?;
 
         // Cache the statement (with LRU eviction if needed)
+        self.query_counter += 1;
         self.cache_stmt(
             sql_hash,
             StmtInfo {
                 name,
                 columns,
-                last_used: std::time::Instant::now(),
+                last_used: self.query_counter,
             },
         );
         Ok(())
@@ -835,48 +841,48 @@ impl Connection {
         params: &[&(dyn Encode + Sync)],
         chunk_size: i32,
     ) -> Result<(Arc<[ColumnDesc]>, bool), DriverError> {
-        let cached = self.stmts.contains_key(&sql_hash);
-
         self.write_buf.clear();
 
-        let new_name = if !cached {
+        // Single hash lookup via get_mut — avoids contains_key + index double-lookup.
+        let columns = if let Some(info) = self.stmts.get_mut(&sql_hash) {
+            // Cache hit: Bind+Execute+Flush only
+            self.query_counter += 1;
+            info.last_used = self.query_counter;
+            proto::write_bind_params(&mut self.write_buf, "", &info.name, params);
+            let cols = info.columns.clone();
+
+            proto::write_execute(&mut self.write_buf, "", chunk_size);
+            // Use Flush (not Sync!) to keep the portal alive between chunks.
+            proto::write_flush(&mut self.write_buf);
+            self.flush_write().await?;
+
+            cols
+        } else {
+            // Cache miss: Parse+Describe+Bind+Execute+Flush
             let name = make_stmt_name(sql_hash);
             let param_oids: smallvec::SmallVec<[u32; 8]> =
                 params.iter().map(|p| p.type_oid()).collect();
             proto::write_parse(&mut self.write_buf, &name, sql, &param_oids);
             proto::write_describe(&mut self.write_buf, b'S', &name);
             proto::write_bind_params(&mut self.write_buf, "", &name, params);
-            Some(name)
-        } else {
-            let name = &*self.stmts[&sql_hash].name;
-            proto::write_bind_params(&mut self.write_buf, "", name, params);
-            None
-        };
 
-        proto::write_execute(&mut self.write_buf, "", chunk_size);
-        // Use Flush (not Sync!) to keep the portal alive between chunks.
-        proto::write_flush(&mut self.write_buf);
-        self.flush_write().await?;
+            proto::write_execute(&mut self.write_buf, "", chunk_size);
+            proto::write_flush(&mut self.write_buf);
+            self.flush_write().await?;
 
-        // Read responses for Parse+Describe if needed
-        let columns = if let Some(stmt_name) = new_name {
             self.expect_message(|m| matches!(m, BackendMessage::ParseComplete))
                 .await?;
             let columns = self.read_column_description().await?;
+            self.query_counter += 1;
             self.cache_stmt(
                 sql_hash,
                 StmtInfo {
-                    name: stmt_name,
+                    name,
                     columns: columns.clone(),
-                    last_used: std::time::Instant::now(),
+                    last_used: self.query_counter,
                 },
             );
             columns
-        } else {
-            if let Some(info) = self.stmts.get_mut(&sql_hash) {
-                info.last_used = std::time::Instant::now();
-            }
-            self.stmts[&sql_hash].columns.clone()
         };
 
         // BindComplete
@@ -973,12 +979,22 @@ impl Connection {
     /// Common pipeline setup — builds Parse+Describe+Bind+Execute+Sync (or
     /// Bind+Execute+Sync on cache hit), sends to wire, reads ParseComplete+Describe
     /// responses if needed, reads BindComplete. Returns column metadata.
+    ///
+    /// When `need_columns` is false (e.g. `for_each_raw`, `execute`), the Arc
+    /// clone of column metadata is skipped — saving an atomic increment on the
+    /// hot path.
+    ///
+    /// When `skip_bind_complete` is true, the BindComplete message is NOT
+    /// consumed here — the caller reads it inline from stream_buf (e.g.
+    /// `for_each_raw` which already has a zero-copy stream_buf reader).
     async fn send_pipeline(
         &mut self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
-    ) -> Result<Arc<[ColumnDesc]>, DriverError> {
+        need_columns: bool,
+        skip_bind_complete: bool,
+    ) -> Result<Option<Arc<[ColumnDesc]>>, DriverError> {
         debug_assert_eq!(
             hash_sql(sql),
             sql_hash,
@@ -993,52 +1009,60 @@ impl Connection {
             )));
         }
 
-        let cached = self.stmts.contains_key(&sql_hash);
         self.write_buf.clear();
 
-        let new_name = if !cached {
+        // Single hash lookup — get_mut avoids the contains_key + index double-lookup.
+        let columns = if let Some(info) = self.stmts.get_mut(&sql_hash) {
+            // Cache hit: Bind+Execute+Sync only
+            self.query_counter += 1;
+            info.last_used = self.query_counter;
+            proto::write_bind_params(&mut self.write_buf, "", &info.name, params);
+            // Clone Arc only when caller needs columns (query path).
+            // for_each_raw / execute skip this atomic increment.
+            let cols = if need_columns {
+                Some(info.columns.clone())
+            } else {
+                None
+            };
+
+            proto::write_execute(&mut self.write_buf, "", 0);
+            proto::write_sync(&mut self.write_buf);
+            self.flush_write().await?;
+
+            cols
+        } else {
+            // Cache miss: Parse+Describe+Bind+Execute+Sync
             let name = make_stmt_name(sql_hash);
             let param_oids: smallvec::SmallVec<[u32; 8]> =
                 params.iter().map(|p| p.type_oid()).collect();
             proto::write_parse(&mut self.write_buf, &name, sql, &param_oids);
             proto::write_describe(&mut self.write_buf, b'S', &name);
             proto::write_bind_params(&mut self.write_buf, "", &name, params);
-            Some(name)
-        } else {
-            let name = &*self.stmts[&sql_hash].name;
-            proto::write_bind_params(&mut self.write_buf, "", name, params);
-            None
-        };
 
-        proto::write_execute(&mut self.write_buf, "", 0);
-        proto::write_sync(&mut self.write_buf);
-        self.flush_write().await?;
+            proto::write_execute(&mut self.write_buf, "", 0);
+            proto::write_sync(&mut self.write_buf);
+            self.flush_write().await?;
 
-        // Read Parse+Describe responses if needed
-        let columns = if let Some(stmt_name) = new_name {
             self.expect_message(|m| matches!(m, BackendMessage::ParseComplete))
                 .await?;
             let columns = self.read_column_description().await?;
+            self.query_counter += 1;
             self.cache_stmt(
                 sql_hash,
                 StmtInfo {
-                    name: stmt_name,
+                    name,
                     columns: columns.clone(),
-                    last_used: std::time::Instant::now(),
+                    last_used: self.query_counter,
                 },
             );
-            columns
-        } else {
-            // Touch LRU timestamp on cache hit
-            if let Some(info) = self.stmts.get_mut(&sql_hash) {
-                info.last_used = std::time::Instant::now();
-            }
-            self.stmts[&sql_hash].columns.clone()
+            if need_columns { Some(columns) } else { None }
         };
 
-        // BindComplete
-        self.expect_message(|m| matches!(m, BackendMessage::BindComplete))
-            .await?;
+        // BindComplete — skip when caller handles it inline (for_each_raw).
+        if !skip_bind_complete {
+            self.expect_message(|m| matches!(m, BackendMessage::BindComplete))
+                .await?;
+        }
 
         Ok(columns)
     }
@@ -1054,7 +1078,10 @@ impl Connection {
         params: &[&(dyn Encode + Sync)],
         arena: &mut Arena,
     ) -> Result<QueryResult, DriverError> {
-        let columns = self.send_pipeline(sql, sql_hash, params).await?;
+        let columns = self
+            .send_pipeline(sql, sql_hash, params, true, false)
+            .await?
+            .expect("send_pipeline(need_columns=true) must return Some");
 
         // Read DataRow messages and CommandComplete.
         // Flat column offsets: all rows' columns are stored contiguously in
@@ -1151,7 +1178,9 @@ impl Connection {
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> Result<u64, DriverError> {
-        let _columns = self.send_pipeline(sql, sql_hash, params).await?;
+        let _ = self
+            .send_pipeline(sql, sql_hash, params, false, false)
+            .await?;
 
         // Skip DataRow messages, read until CommandComplete
         let mut affected_rows: u64 = 0;
@@ -1206,7 +1235,9 @@ impl Connection {
     where
         F: FnMut(PgDataRow<'_>) -> Result<(), DriverError>,
     {
-        let _columns = self.send_pipeline(sql, sql_hash, params).await?;
+        let _ = self
+            .send_pipeline(sql, sql_hash, params, false, false)
+            .await?;
 
         loop {
             let msg = self.read_one_message().await?;
@@ -1261,7 +1292,86 @@ impl Connection {
     where
         F: FnMut(&[u8]) -> Result<(), DriverError>,
     {
-        let _columns = self.send_pipeline(sql, sql_hash, params).await?;
+        let _ = self
+            .send_pipeline(sql, sql_hash, params, false, true)
+            .await?;
+
+        // Read BindComplete inline from stream_buf — avoids the full
+        // expect_message -> read_one_message -> read_message_buffered path.
+        // BindComplete is always exactly 5 bytes: type='2'(1) + len=4(4).
+        loop {
+            let avail = self.stream_buf_end - self.stream_buf_pos;
+            if avail >= 5 {
+                let bc_type = self.stream_buf[self.stream_buf_pos];
+                match bc_type {
+                    b'2' => {
+                        // BindComplete — skip the 5-byte message.
+                        self.stream_buf_pos += 5;
+                        break;
+                    }
+                    b'E' => {
+                        // ErrorResponse — fall back to full message reader.
+                        let msg = self.read_one_message().await?;
+                        if let BackendMessage::ErrorResponse { data } = msg {
+                            let fields = proto::parse_error_response(data);
+                            self.drain_to_ready().await?;
+                            return Err(self.make_server_error(fields));
+                        }
+                    }
+                    b'N' | b'S' => {
+                        // NoticeResponse or ParameterStatus — parse length,
+                        // skip, and continue looking for BindComplete.
+                        let raw_len = i32::from_be_bytes([
+                            self.stream_buf[self.stream_buf_pos + 1],
+                            self.stream_buf[self.stream_buf_pos + 2],
+                            self.stream_buf[self.stream_buf_pos + 3],
+                            self.stream_buf[self.stream_buf_pos + 4],
+                        ]);
+                        let total = 1 + raw_len as usize;
+                        if avail >= total {
+                            self.stream_buf_pos += total;
+                            continue;
+                        }
+                        // Async message spans buffer boundary — fall back.
+                        self.expect_message(|m| matches!(m, BackendMessage::BindComplete))
+                            .await?;
+                        break;
+                    }
+                    _ => {
+                        // Unexpected type — fall back to full reader for
+                        // proper error handling.
+                        self.expect_message(|m| matches!(m, BackendMessage::BindComplete))
+                            .await?;
+                        break;
+                    }
+                }
+            } else {
+                // Not enough data in stream_buf — compact and refill.
+                let remaining = self.stream_buf_end - self.stream_buf_pos;
+                if remaining > 0 && self.stream_buf_pos > 0 {
+                    self.stream_buf
+                        .copy_within(self.stream_buf_pos..self.stream_buf_end, 0);
+                }
+                self.stream_buf_pos = 0;
+                self.stream_buf_end = remaining;
+
+                let n = {
+                    let mut reader = StreamReader(&mut self.stream);
+                    use tokio::io::AsyncReadExt;
+                    reader
+                        .read(&mut self.stream_buf[remaining..])
+                        .await
+                        .map_err(DriverError::Io)?
+                };
+                if n == 0 {
+                    return Err(DriverError::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "connection closed",
+                    )));
+                }
+                self.stream_buf_end = remaining + n;
+            }
+        }
 
         // Bulk DataRow loop: parse messages directly from stream_buf when possible.
         'outer: loop {
@@ -2773,14 +2883,14 @@ mod tests {
     // --- Task 7: Statement cache size ---
 
     #[test]
-    fn stmt_info_has_last_used() {
+    fn stmt_info_has_last_used_counter() {
         let info = StmtInfo {
             name: "s_test".into(),
             columns: Arc::from(Vec::new()),
-            last_used: std::time::Instant::now(),
+            last_used: 42,
         };
-        // Verify last_used is recent
-        assert!(info.last_used.elapsed().as_secs() < 1);
+        // Verify last_used counter is stored correctly
+        assert_eq!(info.last_used, 42);
     }
 
     // --- PgDataRow tests ---
