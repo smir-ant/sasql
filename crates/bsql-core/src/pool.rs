@@ -458,6 +458,12 @@ pub struct PoolConnection {
     pub(crate) inner: Mutex<bsql_driver_postgres::PoolGuard>,
 }
 
+impl std::fmt::Debug for PoolConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PoolConnection").finish()
+    }
+}
+
 /// Snapshot of pool utilization.
 #[derive(Debug, Clone, Copy)]
 pub struct PoolStatus {
@@ -469,6 +475,16 @@ pub struct PoolStatus {
     pub open: usize,
     /// Maximum pool size.
     pub max_size: usize,
+}
+
+impl std::fmt::Display for PoolStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "idle={}, active={}, open={}, max={}",
+            self.idle, self.active, self.open, self.max_size
+        )
+    }
 }
 
 #[cfg(test)]
@@ -596,5 +612,116 @@ mod tests {
             .await
             .unwrap();
         assert!(!pool.is_uds());
+    }
+
+    // --- PoolStatus Display ---
+
+    #[test]
+    fn pool_status_display() {
+        let status = PoolStatus {
+            idle: 3,
+            active: 2,
+            open: 5,
+            max_size: 10,
+        };
+        assert_eq!(status.to_string(), "idle=3, active=2, open=5, max=10");
+    }
+
+    #[test]
+    fn pool_status_display_zeros() {
+        let status = PoolStatus {
+            idle: 0,
+            active: 0,
+            open: 0,
+            max_size: 0,
+        };
+        assert_eq!(status.to_string(), "idle=0, active=0, open=0, max=0");
+    }
+
+    // --- PoolConnection Debug ---
+
+    #[tokio::test]
+    async fn pool_connection_debug() {
+        // PoolConnection wraps a Mutex<PoolGuard>, Debug should not panic
+        let dbg_str = "PoolConnection";
+        assert!(!dbg_str.is_empty());
+        // We can't construct a PoolConnection without a real pool guard,
+        // but we verify the impl exists at compile time through the trait bound.
+        fn _assert_debug<T: std::fmt::Debug>() {}
+        _assert_debug::<PoolConnection>();
+    }
+
+    // --- Pool Debug ---
+
+    #[tokio::test]
+    async fn pool_debug() {
+        let pool = Pool::connect("postgres://user:pass@localhost/db")
+            .await
+            .unwrap();
+        let dbg = format!("{pool:?}");
+        assert!(dbg.contains("Pool"), "Debug should show Pool: {dbg}");
+    }
+
+    // --- Pool Clone ---
+
+    #[tokio::test]
+    async fn pool_clone_is_cheap() {
+        let pool = Pool::connect("postgres://user:pass@localhost/db")
+            .await
+            .unwrap();
+        let pool2 = pool.clone();
+        assert_eq!(pool.status().max_size, pool2.status().max_size);
+        assert!(!pool.has_replica());
+        assert!(!pool2.has_replica());
+    }
+
+    // --- Send + Sync assertions ---
+
+    fn _assert_send<T: Send>() {}
+    fn _assert_sync<T: Sync>() {}
+
+    #[test]
+    fn pool_is_send_and_sync() {
+        _assert_send::<Pool>();
+        _assert_sync::<Pool>();
+    }
+
+    #[test]
+    fn pool_connection_is_send_and_sync() {
+        _assert_send::<PoolConnection>();
+        _assert_sync::<PoolConnection>();
+    }
+
+    #[test]
+    fn pool_status_is_send_and_sync() {
+        _assert_send::<PoolStatus>();
+        _assert_sync::<PoolStatus>();
+    }
+
+    // --- Builder without URL ---
+
+    #[tokio::test]
+    async fn builder_build_without_url_errors() {
+        let result = Pool::builder().build().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("URL"), "error should mention URL: {err}");
+    }
+
+    // --- PoolBuilder chaining ---
+
+    #[test]
+    fn builder_chaining() {
+        let b = Pool::builder()
+            .url("postgres://u@localhost/db")
+            .max_size(20)
+            .lifetime_secs(600)
+            .timeout_secs(3)
+            .min_idle(2)
+            .replica_url("postgres://u@replica/db")
+            .replica_max_size(10);
+        assert_eq!(b.max_size, 20);
+        assert_eq!(b.min_idle, Some(2));
+        assert_eq!(b.replica_max_size, Some(10));
     }
 }

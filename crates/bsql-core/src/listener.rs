@@ -590,4 +590,71 @@ mod tests {
         // Double quotes are doubled
         assert_eq!(result, "\"a\"\"b'c;d\"");
     }
+
+    // --- Notification accessors ---
+
+    #[test]
+    fn notification_channel_and_payload() {
+        let notif = Notification {
+            channel: "orders".to_owned(),
+            payload: "{\"id\": 42}".to_owned(),
+        };
+        assert_eq!(notif.channel(), "orders");
+        assert_eq!(notif.payload(), "{\"id\": 42}");
+    }
+
+    #[test]
+    fn notification_empty_payload() {
+        let notif = Notification {
+            channel: "pings".to_owned(),
+            payload: String::new(),
+        };
+        assert_eq!(notif.channel(), "pings");
+        assert_eq!(notif.payload(), "");
+    }
+
+    #[test]
+    fn notification_clone() {
+        let notif = Notification {
+            channel: "ch".to_owned(),
+            payload: "data".to_owned(),
+        };
+        let cloned = notif.clone();
+        assert_eq!(cloned.channel(), notif.channel());
+        assert_eq!(cloned.payload(), notif.payload());
+    }
+
+    #[test]
+    fn notification_debug() {
+        let notif = Notification {
+            channel: "ch".to_owned(),
+            payload: "data".to_owned(),
+        };
+        let dbg = format!("{notif:?}");
+        assert!(dbg.contains("ch"), "Debug should show channel: {dbg}");
+        assert!(dbg.contains("data"), "Debug should show payload: {dbg}");
+    }
+
+    // --- Listener Debug (compile-time only, can't construct without DB) ---
+
+    fn _assert_debug<T: std::fmt::Debug>() {}
+
+    #[test]
+    fn listener_debug_impl_exists() {
+        _assert_debug::<Listener>();
+    }
+
+    // --- Send assertions ---
+
+    fn _assert_send<T: Send>() {}
+
+    #[test]
+    fn notification_is_send() {
+        _assert_send::<Notification>();
+    }
+
+    #[test]
+    fn listener_is_send() {
+        _assert_send::<Listener>();
+    }
 }

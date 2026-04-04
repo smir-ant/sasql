@@ -103,6 +103,17 @@ impl PoolSlot {
     fn is_sync(&self) -> bool {
         matches!(self, PoolSlot::Sync(_))
     }
+
+    /// Update the last-used timestamp. Called once when the connection is
+    /// returned to the pool, replacing per-query `Instant::now()` calls
+    /// (~20-40ns per call on macOS).
+    fn touch(&mut self) {
+        match self {
+            PoolSlot::Async(c) => c.touch(),
+            #[cfg(unix)]
+            PoolSlot::Sync(c) => c.touch(),
+        }
+    }
 }
 
 // --- Pool ---
@@ -966,7 +977,7 @@ impl PoolGuard {
 
 impl Drop for PoolGuard {
     fn drop(&mut self) {
-        if let Some(slot) = self.conn.take() {
+        if let Some(mut slot) = self.conn.take() {
             // + Discard if:
             //   - explicitly marked for discard
             //   - in a failed transaction (tx_status == 'E')
@@ -982,6 +993,11 @@ impl Drop for PoolGuard {
                 self.pool.open_count.fetch_sub(1, Ordering::AcqRel);
                 return;
             }
+
+            // Stamp the last-used time once on pool return, instead of on
+            // every query. Saves ~20-40ns per query on macOS (one fewer
+            // mach_absolute_time syscall per query).
+            slot.touch();
 
             // Return to pool synchronously. The critical section is trivial
             // (Vec::push — no I/O), so std::sync::Mutex is appropriate here

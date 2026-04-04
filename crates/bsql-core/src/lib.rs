@@ -86,3 +86,29 @@ pub fn rapid_hash_str(s: &str) -> u64 {
     s.hash(&mut hasher);
     hasher.finish()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rapid_hash_str_deterministic() {
+        let h1 = rapid_hash_str("SELECT 1");
+        let h2 = rapid_hash_str("SELECT 1");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn rapid_hash_str_different_inputs_differ() {
+        let h1 = rapid_hash_str("SELECT 1");
+        let h2 = rapid_hash_str("SELECT 2");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn rapid_hash_str_empty_string() {
+        let h = rapid_hash_str("");
+        // Should not panic, and the hash should be consistent
+        assert_eq!(h, rapid_hash_str(""));
+    }
+}

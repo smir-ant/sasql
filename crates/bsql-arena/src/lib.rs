@@ -107,10 +107,16 @@ impl Arena {
         let start = self.offset;
         let new_len = start + data.len();
 
-        if new_len > chunk.len() {
-            chunk.resize(new_len, 0);
+        // Common case: appending to the end of the chunk. Use extend_from_slice
+        // which copies data directly without zeroing first (unlike resize+copy).
+        if start == chunk.len() {
+            chunk.extend_from_slice(data);
+        } else {
+            if new_len > chunk.len() {
+                chunk.resize(new_len, 0);
+            }
+            chunk[start..new_len].copy_from_slice(data);
         }
-        chunk[start..new_len].copy_from_slice(data);
 
         let global = self.global_offset_at(self.current, start);
         self.offset = new_len;

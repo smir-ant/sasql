@@ -395,4 +395,51 @@ mod tests {
         let result = sf.try_join(1);
         assert!(matches!(result, FlightResult::Leader(_)));
     }
+
+    // --- Send + Sync assertions ---
+
+    fn _assert_send<T: Send>() {}
+    fn _assert_sync<T: Sync>() {}
+
+    #[test]
+    fn singleflight_is_send_and_sync() {
+        _assert_send::<Singleflight>();
+        _assert_sync::<Singleflight>();
+    }
+
+    // --- compute_key with string params ---
+
+    #[test]
+    fn compute_key_string_params() {
+        let a = "hello";
+        let b = "world";
+        let k1 = Singleflight::compute_key(100, &[&a, &b]);
+        let k2 = Singleflight::compute_key(100, &[&a, &b]);
+        assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn compute_key_empty_params_consistent() {
+        let k1 = Singleflight::compute_key(0, &[]);
+        let k2 = Singleflight::compute_key(0, &[]);
+        assert_eq!(k1, k2);
+    }
+
+    // --- Leader complete with no followers ---
+
+    #[test]
+    fn leader_complete_with_no_followers() {
+        let sf = Singleflight::new();
+        let leader = match sf.try_join(42) {
+            FlightResult::Leader(l) => l,
+            _ => panic!("expected leader"),
+        };
+        // Complete without any followers. Should not panic.
+        let err = BsqlError::from(bsql_driver_postgres::DriverError::Pool("solo".into()));
+        leader.complete(&sf, Arc::new(Err(err)));
+
+        // Key should be removed
+        let result = sf.try_join(42);
+        assert!(matches!(result, FlightResult::Leader(_)));
+    }
 }

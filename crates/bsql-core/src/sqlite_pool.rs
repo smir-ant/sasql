@@ -840,4 +840,170 @@ mod tests {
         let max = "a".repeat(63);
         assert!(validate_savepoint_name(&max).is_ok());
     }
+
+    // --- Builder tests ---
+
+    #[test]
+    fn builder_requires_path() {
+        let result = SqlitePool::builder().build();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("path"), "error should mention path: {err}");
+    }
+
+    #[test]
+    fn builder_default_reader_count() {
+        let b = SqlitePool::builder();
+        assert_eq!(b.reader_count, 4);
+    }
+
+    #[test]
+    fn builder_custom_reader_count() {
+        let path = temp_db_path();
+        let pool = SqlitePool::builder()
+            .path(&path)
+            .reader_count(2)
+            .build()
+            .unwrap();
+        assert_eq!(pool.reader_count(), 2);
+        pool.close();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- Debug impls ---
+
+    #[test]
+    fn sqlite_pool_debug() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        let dbg = format!("{pool:?}");
+        assert!(
+            dbg.contains("SqlitePool"),
+            "Debug should show SqlitePool: {dbg}"
+        );
+        assert!(
+            dbg.contains("reader_count"),
+            "Debug should show reader_count: {dbg}"
+        );
+        pool.close();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sqlite_transaction_debug() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        let tx = pool.begin().unwrap();
+        let dbg = format!("{tx:?}");
+        assert!(
+            dbg.contains("SqliteTransaction"),
+            "Debug should show SqliteTransaction: {dbg}"
+        );
+        assert!(
+            dbg.contains("finished"),
+            "Debug should show finished field: {dbg}"
+        );
+        tx.rollback().unwrap();
+        pool.close();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- Clone ---
+
+    #[test]
+    fn sqlite_pool_clone() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        let pool2 = pool.clone();
+        assert_eq!(pool.reader_count(), pool2.reader_count());
+        pool.close();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- close / is_closed ---
+
+    #[test]
+    fn sqlite_pool_close_and_is_closed() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        assert!(!pool.is_closed());
+        pool.close();
+        assert!(pool.is_closed());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- execute_batch ---
+
+    #[test]
+    fn execute_batch_multiple() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+            .unwrap();
+
+        let sql = "INSERT INTO t VALUES (?1)";
+        let hash = crate::rapid_hash_str(sql);
+
+        let v1 = 1i64;
+        let v2 = 2i64;
+        let v3 = 3i64;
+        let params1: &[&dyn bsql_driver_sqlite::codec::SqliteEncode] = &[&v1];
+        let params2: &[&dyn bsql_driver_sqlite::codec::SqliteEncode] = &[&v2];
+        let params3: &[&dyn bsql_driver_sqlite::codec::SqliteEncode] = &[&v3];
+
+        let total = pool
+            .execute_batch(sql, hash, &[params1, params2, params3])
+            .unwrap();
+        assert_eq!(total, 3);
+
+        let select = "SELECT id FROM t ORDER BY id";
+        let select_hash = crate::rapid_hash_str(select);
+        let (result, _arena) = pool
+            .query_readonly(select, select_hash, smallvec::SmallVec::new())
+            .unwrap();
+        assert_eq!(result.len(), 3);
+
+        pool.close();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- execute_direct ---
+
+    #[test]
+    fn execute_direct_insert() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+            .unwrap();
+
+        let sql = "INSERT INTO t VALUES (?1)";
+        let hash = crate::rapid_hash_str(sql);
+        let v: i64 = 42;
+        let affected = pool
+            .execute_direct(
+                sql,
+                hash,
+                &[&v as &dyn bsql_driver_sqlite::codec::SqliteEncode],
+            )
+            .unwrap();
+        assert_eq!(affected, 1);
+
+        pool.close();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- Send + Sync assertions ---
+
+    fn _assert_send<T: Send>() {}
+    fn _assert_sync<T: Sync>() {}
+
+    #[test]
+    fn sqlite_pool_is_send_and_sync() {
+        _assert_send::<SqlitePool>();
+        _assert_sync::<SqlitePool>();
+    }
+
+    // SqliteTransaction is NOT Send (holds Arc to pool with Mutex<SqliteConnection>
+    // which is !Send due to raw FFI pointers), but it IS usable from a single thread.
+    // We do NOT assert Send/Sync for SqliteTransaction — it is intentionally !Send.
 }

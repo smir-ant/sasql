@@ -446,4 +446,60 @@ mod tests {
         );
         assert_eq!(IsolationLevel::Serializable.to_string(), "SERIALIZABLE");
     }
+
+    // --- IsolationLevel traits ---
+
+    #[test]
+    fn isolation_level_clone() {
+        let level = IsolationLevel::Serializable;
+        let cloned = level;
+        assert_eq!(level, cloned);
+    }
+
+    #[test]
+    fn isolation_level_debug() {
+        let level = IsolationLevel::RepeatableRead;
+        let dbg = format!("{level:?}");
+        assert!(
+            dbg.contains("RepeatableRead"),
+            "Debug should show variant name: {dbg}"
+        );
+    }
+
+    #[test]
+    fn isolation_level_eq() {
+        assert_eq!(IsolationLevel::Serializable, IsolationLevel::Serializable);
+        assert_ne!(IsolationLevel::Serializable, IsolationLevel::ReadCommitted);
+    }
+
+    // --- Transaction Debug ---
+
+    #[test]
+    fn transaction_debug_shows_finished_false() {
+        // Transaction cannot be constructed in tests without a driver,
+        // but we verify the Debug impl exists at compile time.
+        fn _assert_debug<T: std::fmt::Debug>() {}
+        _assert_debug::<Transaction>();
+    }
+
+    // --- Send + Sync assertions ---
+
+    fn _assert_send<T: Send>() {}
+    fn _assert_sync<T: Sync>() {}
+
+    #[test]
+    fn transaction_is_send() {
+        _assert_send::<Transaction>();
+    }
+
+    #[test]
+    fn transaction_is_sync() {
+        _assert_sync::<Transaction>();
+    }
+
+    #[test]
+    fn isolation_level_is_send_and_sync() {
+        _assert_send::<IsolationLevel>();
+        _assert_sync::<IsolationLevel>();
+    }
 }

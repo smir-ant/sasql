@@ -830,4 +830,177 @@ mod tests {
         });
         assert_eq!(e.pg_code(), None);
     }
+
+    // --- Server error with position ---
+
+    #[test]
+    fn server_error_with_position_display() {
+        let driver_err = bsql_driver_postgres::DriverError::Server {
+            code: "42601".into(),
+            message: "syntax error".into(),
+            detail: None,
+            hint: None,
+            position: Some(8),
+        };
+        let e = BsqlError::from(driver_err);
+        let display = e.to_string();
+        assert!(
+            display.contains("at position 8"),
+            "should contain position: {display}"
+        );
+        assert!(
+            display.contains("syntax error"),
+            "should contain message: {display}"
+        );
+    }
+
+    #[test]
+    fn server_error_with_all_fields() {
+        let driver_err = bsql_driver_postgres::DriverError::Server {
+            code: "42P01".into(),
+            message: "relation does not exist".into(),
+            detail: Some("table was dropped".into()),
+            hint: Some("recreate the table".into()),
+            position: Some(42),
+        };
+        let e = BsqlError::from(driver_err);
+        let display = e.to_string();
+        assert!(display.contains("at position 42"));
+        assert!(display.contains("detail: table was dropped"));
+        assert!(display.contains("hint: recreate the table"));
+        assert!(display.contains("relation does not exist"));
+    }
+
+    // --- from_driver_query with Server variant delegates to From ---
+
+    #[test]
+    fn from_driver_query_server_error_delegates() {
+        let e = BsqlError::from_driver_query(bsql_driver_postgres::DriverError::Server {
+            code: "23505".into(),
+            message: "duplicate key".into(),
+            detail: None,
+            hint: None,
+            position: None,
+        });
+        assert!(matches!(e, BsqlError::Query(_)));
+        assert_eq!(e.pg_code(), Some("23505"));
+    }
+
+    // --- From<DriverError> for all variants ---
+
+    #[test]
+    fn from_driver_io_maps_to_connect() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        let e = BsqlError::from(bsql_driver_postgres::DriverError::Io(io_err));
+        assert!(matches!(e, BsqlError::Connect(_)));
+        assert!(e.source().is_some());
+    }
+
+    #[test]
+    fn from_driver_auth_maps_to_connect() {
+        let e = BsqlError::from(bsql_driver_postgres::DriverError::Auth(
+            "wrong password".into(),
+        ));
+        match &e {
+            BsqlError::Connect(ce) => {
+                assert!(ce.message.contains("wrong password"));
+            }
+            other => panic!("expected Connect, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_driver_protocol_maps_to_query() {
+        let e = BsqlError::from(bsql_driver_postgres::DriverError::Protocol(
+            "unexpected message".into(),
+        ));
+        match &e {
+            BsqlError::Query(qe) => {
+                assert!(qe.message.contains("unexpected message"));
+                assert!(qe.pg_code.is_none());
+            }
+            other => panic!("expected Query, got: {other:?}"),
+        }
+    }
+
+    // --- SQLite error conversion ---
+
+    #[cfg(feature = "sqlite")]
+    mod sqlite_tests {
+        use super::*;
+
+        #[test]
+        fn from_sqlite_sqlite_error() {
+            let e = BsqlError::from_sqlite(bsql_driver_sqlite::SqliteError::Sqlite {
+                code: 19,
+                message: "UNIQUE constraint failed".into(),
+            });
+            match &e {
+                BsqlError::Query(qe) => {
+                    assert!(qe.message.contains("SQLite error [19]"));
+                    assert!(qe.message.contains("UNIQUE constraint failed"));
+                    assert!(qe.pg_code.is_none());
+                }
+                other => panic!("expected Query, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn from_sqlite_io_error() {
+            let io_err =
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, "read-only filesystem");
+            let e = BsqlError::from_sqlite(bsql_driver_sqlite::SqliteError::Io(io_err));
+            match &e {
+                BsqlError::Connect(ce) => {
+                    assert!(ce.message.contains("SQLite I/O error"));
+                    assert!(ce.message.contains("read-only filesystem"));
+                    assert!(ce.source.is_some());
+                }
+                other => panic!("expected Connect, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn from_sqlite_internal_error() {
+            let e = BsqlError::from_sqlite(bsql_driver_sqlite::SqliteError::Internal(
+                "corrupted database".into(),
+            ));
+            match &e {
+                BsqlError::Query(qe) => {
+                    assert!(qe.message.contains("SQLite internal error"));
+                    assert!(qe.message.contains("corrupted database"));
+                }
+                other => panic!("expected Query, got: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn from_sqlite_pool_error() {
+            let e = BsqlError::from_sqlite(bsql_driver_sqlite::SqliteError::Pool(
+                "no readers available".into(),
+            ));
+            match &e {
+                BsqlError::Pool(pe) => {
+                    assert!(pe.message.contains("SQLite pool error"));
+                    assert!(pe.message.contains("no readers available"));
+                }
+                other => panic!("expected Pool, got: {other:?}"),
+            }
+        }
+    }
+
+    // --- Send + Sync assertions ---
+
+    fn _assert_send<T: Send>() {}
+    fn _assert_sync<T: Sync>() {}
+
+    #[test]
+    fn bsql_error_is_send() {
+        _assert_send::<BsqlError>();
+    }
+
+    #[test]
+    fn bsql_error_is_sync() {
+        _assert_sync::<BsqlError>();
+    }
 }

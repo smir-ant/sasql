@@ -455,4 +455,77 @@ mod tests {
         let arena = acquire_arena();
         bsql_driver_postgres::arena::release_arena(arena);
     }
+
+    // --- fetch_next_chunk without arena errors ---
+
+    #[tokio::test]
+    async fn fetch_next_chunk_without_arena_errors() {
+        let columns = sample_columns(1);
+        let result = make_result(0, &columns);
+        let mut stream = QueryStream {
+            guard: None,
+            arena: None, // no arena
+            current_result: Some(result),
+            position: 0,
+            columns,
+            finished: false,
+            needs_execute: false,
+        };
+        let res = stream.fetch_next_chunk().await;
+        assert!(res.is_err(), "should error without arena");
+    }
+
+    // --- advance when not finished but fetch fails ---
+
+    #[tokio::test]
+    async fn advance_fetch_fails_propagates_error() {
+        // Stream with 0 rows, not finished, no guard -> advance triggers fetch -> error
+        let mut stream = make_stream(0, 1, false);
+        let res = stream.advance().await;
+        assert!(res.is_err(), "advance should propagate fetch error");
+    }
+
+    // --- remaining on None result ---
+
+    #[test]
+    fn remaining_with_none_result() {
+        let columns = sample_columns(1);
+        let arena = acquire_arena();
+        let stream = QueryStream {
+            guard: None,
+            arena: Some(arena),
+            current_result: None,
+            position: 0,
+            columns,
+            finished: true,
+            needs_execute: false,
+        };
+        assert_eq!(stream.remaining(), 0);
+    }
+
+    // --- has_more with None result and finished ---
+
+    #[test]
+    fn has_more_with_none_result_finished() {
+        let columns = sample_columns(1);
+        let arena = acquire_arena();
+        let stream = QueryStream {
+            guard: None,
+            arena: Some(arena),
+            current_result: None,
+            position: 0,
+            columns,
+            finished: true,
+            needs_execute: false,
+        };
+        assert!(!stream.has_more());
+    }
+
+    // --- columns returns correct count ---
+
+    #[test]
+    fn columns_zero_columns() {
+        let stream = make_stream(0, 0, true);
+        assert_eq!(stream.columns().len(), 0);
+    }
 }

@@ -489,6 +489,9 @@ pub struct Connection {
     /// Monotonic counter for LRU eviction — incremented on each cache access.
     /// Replaces `Instant::now()` to avoid syscall overhead (~20-40ns on macOS).
     query_counter: u64,
+    /// Persistent scratch buffer for bind template parameter encoding.
+    /// Reused across queries to avoid per-query heap allocation (~50-100ns).
+    bind_scratch: Vec<u8>,
 }
 
 impl Connection {
@@ -573,6 +576,7 @@ impl Connection {
             pending_notifications: Vec::new(),
             max_stmt_cache_size: 256,
             query_counter: 0,
+            bind_scratch: Vec::with_capacity(64),
         };
 
         conn.startup(config).await?;
@@ -894,7 +898,6 @@ impl Connection {
             match msg {
                 BackendMessage::ReadyForQuery { status } => {
                     self.tx_status = status;
-                    self.touch();
                     return Ok(rows);
                 }
                 BackendMessage::DataRow { data } => {
@@ -956,9 +959,7 @@ impl Connection {
                 self.write_buf.extend_from_slice(&tmpl.bytes);
 
                 let mut template_ok = true;
-                // Reuse one scratch buffer across all params to avoid
-                // per-parameter heap allocation.
-                let mut scratch = Vec::new();
+                // Reuse persistent scratch buffer — avoids per-query heap allocation.
                 for (i, param) in params.iter().enumerate() {
                     let (data_offset, old_len) = tmpl.param_slots[i];
                     if param.is_null() {
@@ -966,11 +967,11 @@ impl Connection {
                         self.write_buf[len_offset..len_offset + 4]
                             .copy_from_slice(&(-1i32).to_be_bytes());
                     } else if old_len >= 0 {
-                        scratch.clear();
-                        param.encode_binary(&mut scratch);
-                        if scratch.len() == old_len as usize {
-                            self.write_buf[data_offset..data_offset + scratch.len()]
-                                .copy_from_slice(&scratch);
+                        self.bind_scratch.clear();
+                        param.encode_binary(&mut self.bind_scratch);
+                        if self.bind_scratch.len() == old_len as usize {
+                            self.write_buf[data_offset..data_offset + self.bind_scratch.len()]
+                                .copy_from_slice(&self.bind_scratch);
                         } else {
                             template_ok = false;
                             break;
@@ -1174,9 +1175,7 @@ impl Connection {
                 self.write_buf.extend_from_slice(&tmpl.bytes);
 
                 let mut template_ok = true;
-                // Reuse one scratch buffer across all params to avoid
-                // per-parameter heap allocation.
-                let mut scratch = Vec::new();
+                // Reuse persistent scratch buffer — avoids per-query heap allocation.
                 for (i, param) in params.iter().enumerate() {
                     let (data_offset, old_len) = tmpl.param_slots[i];
                     if param.is_null() {
@@ -1184,11 +1183,11 @@ impl Connection {
                         self.write_buf[len_offset..len_offset + 4]
                             .copy_from_slice(&(-1i32).to_be_bytes());
                     } else if old_len >= 0 {
-                        scratch.clear();
-                        param.encode_binary(&mut scratch);
-                        if scratch.len() == old_len as usize {
-                            self.write_buf[data_offset..data_offset + scratch.len()]
-                                .copy_from_slice(&scratch);
+                        self.bind_scratch.clear();
+                        param.encode_binary(&mut self.bind_scratch);
+                        if self.bind_scratch.len() == old_len as usize {
+                            self.write_buf[data_offset..data_offset + self.bind_scratch.len()]
+                                .copy_from_slice(&self.bind_scratch);
                         } else {
                             template_ok = false;
                             break;
@@ -1324,7 +1323,6 @@ impl Connection {
         // ReadyForQuery
         self.expect_ready().await?;
         self.shrink_buffers();
-        self.touch();
 
         Ok(QueryResult {
             all_col_offsets,
@@ -1408,7 +1406,6 @@ impl Connection {
 
         self.expect_ready().await?;
         self.shrink_buffers();
-        self.touch();
         Ok(affected_rows)
     }
 
@@ -1539,7 +1536,6 @@ impl Connection {
 
         self.expect_ready().await?;
         self.shrink_buffers();
-        self.touch();
         Ok(results)
     }
 
@@ -1671,7 +1667,6 @@ impl Connection {
 
         self.expect_ready().await?;
         self.shrink_buffers();
-        self.touch();
         Ok(results)
     }
 
@@ -1723,7 +1718,6 @@ impl Connection {
 
         self.expect_ready().await?;
         self.shrink_buffers();
-        self.touch();
         Ok(())
     }
 
@@ -1943,7 +1937,6 @@ impl Connection {
         // Read ReadyForQuery.
         self.expect_ready().await?;
         self.shrink_buffers();
-        self.touch();
         Ok(())
     }
 
@@ -1961,7 +1954,6 @@ impl Connection {
             match msg {
                 BackendMessage::ReadyForQuery { status } => {
                     self.tx_status = status;
-                    self.touch();
                     return Ok(());
                 }
                 BackendMessage::CommandComplete { .. }
@@ -2236,7 +2228,12 @@ impl Connection {
     /// Called after query()/execute() to prevent a single large result from
     /// permanently bloating the connection's buffers.
     fn shrink_buffers(&mut self) {
-        // existing allocation if possible, avoiding a dealloc+alloc pair.
+        // Only check every 64 queries — the capacity comparisons are cheap
+        // but the shrink itself (realloc) is not. Most queries never trigger
+        // the threshold, so this saves ~2-5ns of branch overhead per query.
+        if self.query_counter & 63 != 0 {
+            return;
+        }
         if self.read_buf.capacity() > 64 * 1024 {
             self.read_buf.clear();
             self.read_buf.shrink_to(8192);
