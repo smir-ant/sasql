@@ -1349,7 +1349,7 @@ async fn defer_execute_commit_auto_flushes() {
     let url = require_db!();
     let pool = Pool::connect(&url).await.unwrap();
 
-    let sql = "INSERT INTO users (login, first_name, last_name) VALUES ($1, $2, $3)";
+    let sql = "INSERT INTO users (login, first_name, last_name, email) VALUES ($1, $2, $3, $4)";
     let hash = hash_sql(sql);
 
     let mut tx = pool.begin().await.unwrap();
@@ -1357,7 +1357,8 @@ async fn defer_execute_commit_auto_flushes() {
         let login = format!("defer_commit_{i}");
         let first_name = format!("first_commit_{i}");
         let last_name = "test".to_string();
-        tx.defer_execute(sql, hash, &[&login, &first_name, &last_name])
+        let email = format!("{}@test.com", login);
+        tx.defer_execute(sql, hash, &[&login, &first_name, &last_name, &email])
             .await
             .unwrap();
     }
@@ -1387,7 +1388,7 @@ async fn defer_execute_flush_returns_affected_rows() {
     let url = require_db!();
     let pool = Pool::connect(&url).await.unwrap();
 
-    let sql = "INSERT INTO users (login, first_name, last_name) VALUES ($1, $2, $3)";
+    let sql = "INSERT INTO users (login, first_name, last_name, email) VALUES ($1, $2, $3, $4)";
     let hash = hash_sql(sql);
 
     let mut tx = pool.begin().await.unwrap();
@@ -1395,7 +1396,8 @@ async fn defer_execute_flush_returns_affected_rows() {
         let login = format!("defer_flush_{i}");
         let first_name = format!("first_flush_{i}");
         let last_name = "test".to_string();
-        tx.defer_execute(sql, hash, &[&login, &first_name, &last_name])
+        let email = format!("{}@test.com", login);
+        tx.defer_execute(sql, hash, &[&login, &first_name, &last_name, &email])
             .await
             .unwrap();
     }
@@ -1421,7 +1423,7 @@ async fn defer_execute_auto_flushes_before_query() {
     let url = require_db!();
     let pool = Pool::connect(&url).await.unwrap();
 
-    let sql = "INSERT INTO users (login, first_name, last_name) VALUES ($1, $2, $3)";
+    let sql = "INSERT INTO users (login, first_name, last_name, email) VALUES ($1, $2, $3, $4)";
     let hash = hash_sql(sql);
 
     let mut tx = pool.begin().await.unwrap();
@@ -1429,7 +1431,8 @@ async fn defer_execute_auto_flushes_before_query() {
     let login = "defer_before_query".to_string();
     let first_name = "first_before_query".to_string();
     let last_name = "test".to_string();
-    tx.defer_execute(sql, hash, &[&login, &first_name, &last_name])
+    let email = format!("{}@test.com", login);
+    tx.defer_execute(sql, hash, &[&login, &first_name, &last_name, &email])
         .await
         .unwrap();
     assert_eq!(tx.deferred_count(), 1);
@@ -1462,7 +1465,7 @@ async fn defer_execute_100_inserts() {
     let url = require_db!();
     let pool = Pool::connect(&url).await.unwrap();
 
-    let sql = "INSERT INTO users (login, first_name, last_name) VALUES ($1, $2, $3)";
+    let sql = "INSERT INTO users (login, first_name, last_name, email) VALUES ($1, $2, $3, $4)";
     let hash = hash_sql(sql);
 
     let mut tx = pool.begin().await.unwrap();
@@ -1470,7 +1473,8 @@ async fn defer_execute_100_inserts() {
         let login = format!("defer_100_{i}");
         let first_name = format!("first_100_{i}");
         let last_name = "test".to_string();
-        tx.defer_execute(sql, hash, &[&login, &first_name, &last_name])
+        let email = format!("{}@test.com", login);
+        tx.defer_execute(sql, hash, &[&login, &first_name, &last_name, &email])
             .await
             .unwrap();
     }
@@ -1500,7 +1504,7 @@ async fn defer_execute_mixed_with_regular_execute() {
     let url = require_db!();
     let pool = Pool::connect(&url).await.unwrap();
 
-    let sql = "INSERT INTO users (login, first_name, last_name) VALUES ($1, $2, $3)";
+    let sql = "INSERT INTO users (login, first_name, last_name, email) VALUES ($1, $2, $3, $4)";
     let hash = hash_sql(sql);
 
     let mut tx = pool.begin().await.unwrap();
@@ -1509,7 +1513,8 @@ async fn defer_execute_mixed_with_regular_execute() {
     let login = "defer_mixed_d1".to_string();
     let first_name = "first_mixed_d1".to_string();
     let last_name = "test".to_string();
-    tx.defer_execute(sql, hash, &[&login, &first_name, &last_name])
+    let email = format!("{}@test.com", login);
+    tx.defer_execute(sql, hash, &[&login, &first_name, &last_name, &email])
         .await
         .unwrap();
 
@@ -1517,8 +1522,9 @@ async fn defer_execute_mixed_with_regular_execute() {
     let login2 = "defer_mixed_r1".to_string();
     let first_name2 = "first_mixed_r1".to_string();
     let last_name2 = "test".to_string();
+    let email2 = format!("{}@test.com", login2);
     let affected = tx
-        .execute(sql, hash, &[&login2, &first_name2, &last_name2])
+        .execute(sql, hash, &[&login2, &first_name2, &last_name2, &email2])
         .await
         .unwrap();
     assert_eq!(affected, 1);
@@ -1527,7 +1533,8 @@ async fn defer_execute_mixed_with_regular_execute() {
     let login3 = "defer_mixed_d2".to_string();
     let first_name3 = "first_mixed_d2".to_string();
     let last_name3 = "test".to_string();
-    tx.defer_execute(sql, hash, &[&login3, &first_name3, &last_name3])
+    let email3 = format!("{}@test.com", login3);
+    tx.defer_execute(sql, hash, &[&login3, &first_name3, &last_name3, &email3])
         .await
         .unwrap();
     assert_eq!(tx.deferred_count(), 2);
@@ -1556,14 +1563,15 @@ async fn defer_execute_rollback_discards_deferred() {
     let url = require_db!();
     let pool = Pool::connect(&url).await.unwrap();
 
-    let sql = "INSERT INTO users (login, first_name, last_name) VALUES ($1, $2, $3)";
+    let sql = "INSERT INTO users (login, first_name, last_name, email) VALUES ($1, $2, $3, $4)";
     let hash = hash_sql(sql);
 
     let mut tx = pool.begin().await.unwrap();
     let login = "defer_rollback".to_string();
     let first_name = "first_rollback".to_string();
     let last_name = "test".to_string();
-    tx.defer_execute(sql, hash, &[&login, &first_name, &last_name])
+    let email = format!("{}@test.com", login);
+    tx.defer_execute(sql, hash, &[&login, &first_name, &last_name, &email])
         .await
         .unwrap();
     assert_eq!(tx.deferred_count(), 1);
@@ -1589,14 +1597,15 @@ async fn defer_execute_auto_flushes_before_for_each() {
     let url = require_db!();
     let pool = Pool::connect(&url).await.unwrap();
 
-    let sql = "INSERT INTO users (login, first_name, last_name) VALUES ($1, $2, $3)";
+    let sql = "INSERT INTO users (login, first_name, last_name, email) VALUES ($1, $2, $3, $4)";
     let hash = hash_sql(sql);
 
     let mut tx = pool.begin().await.unwrap();
     let login = "defer_before_foreach".to_string();
     let first_name = "first_before_foreach".to_string();
     let last_name = "test".to_string();
-    tx.defer_execute(sql, hash, &[&login, &first_name, &last_name])
+    let email = format!("{}@test.com", login);
+    tx.defer_execute(sql, hash, &[&login, &first_name, &last_name, &email])
         .await
         .unwrap();
 
@@ -1620,14 +1629,15 @@ async fn defer_execute_auto_flushes_before_simple_query() {
     let url = require_db!();
     let pool = Pool::connect(&url).await.unwrap();
 
-    let sql = "INSERT INTO users (login, first_name, last_name) VALUES ($1, $2, $3)";
+    let sql = "INSERT INTO users (login, first_name, last_name, email) VALUES ($1, $2, $3, $4)";
     let hash = hash_sql(sql);
 
     let mut tx = pool.begin().await.unwrap();
     let login = "defer_before_simple".to_string();
     let first_name = "first_before_simple".to_string();
     let last_name = "test".to_string();
-    tx.defer_execute(sql, hash, &[&login, &first_name, &last_name])
+    let email = format!("{}@test.com", login);
+    tx.defer_execute(sql, hash, &[&login, &first_name, &last_name, &email])
         .await
         .unwrap();
     assert_eq!(tx.deferred_count(), 1);
