@@ -18,7 +18,7 @@ All times are median. Microseconds unless noted. Collected 2026-04-04.
 | JOIN + aggregate | 39.7 ms <kbd>x1</kbd> | 40.4 ms <kbd>x1.0</kbd> | 42.7 ms <kbd>x1.1</kbd> | 41.7 ms <kbd>x1.1</kbd> | 25.4 ms <kbd>x0.6</kbd>\* |
 | Subquery | **65.4 us** <kbd>x1</kbd> | 69.9 us <kbd>x1.1</kbd> | 123 us <kbd>x1.9</kbd> | 155 us <kbd>x2.4</kbd> | 97.7 us <kbd>x1.5</kbd> |
 
-\*Go JOIN+aggregate (25.4 ms) is from a different session when PG had less background load. In this session PG was running maintenance, so all JOIN times are ~40 ms. The relative ranking between bsql/C/diesel/sqlx is consistent.
+**About Go JOIN+aggregate:** Go's number (25.4 ms) was measured in a separate session when PostgreSQL had less background activity. In this session, PG was performing maintenance (autovacuum/checkpoint), which slowed ALL libraries' JOIN queries to ~40 ms. Within the same session: bsql (39.7 ms) < C (40.4 ms) < sqlx (41.7 ms) < diesel (42.7 ms). The relative ranking is what matters — absolute times depend on PG server load at measurement time.
 
 All benchmarks use Unix domain socket (UDS) connections to PostgreSQL. UDS eliminates the TCP network stack -- no packet framing, no congestion control, no Nagle delays -- isolating pure library performance from network noise. This applies equally to ALL libraries in the comparison (bsql, C, Go, diesel, sqlx). For TCP benchmarks, see the methodology section.
 
@@ -40,37 +40,45 @@ Note: INSERT single shows parity between bsql (105 us), C (98 us), and diesel (1
 
 All SQLite benchmarks use NOMUTEX mode (`SQLITE_OPEN_NOMUTEX`). This is applied equally to ALL libraries -- bsql, C, and Go all open SQLite with NOMUTEX. Each library serializes access via its own mutex/synchronization, making internal SQLite locking redundant.
 
-## How to Run
+## How to reproduce
 
-You need: Rust, Go 1.26+, a C compiler (clang or gcc), PostgreSQL, and SQLite.
+### Prerequisites
+- PostgreSQL (any version 15-18)
+- Rust stable (1.85+)
+- Go 1.22+
+- C compiler (clang or gcc)
+- SQLite 3.37+ (system or bundled)
 
-**PostgreSQL:**
+### Setup
 ```bash
+# PostgreSQL
 createdb bench_db
-export BENCH_DATABASE_URL="postgres://user@localhost/bench_db?host=/tmp"
-export BSQL_DATABASE_URL=$BENCH_DATABASE_URL
-psql "$BENCH_DATABASE_URL" -f setup/pg_setup.sql
-```
+psql bench_db -f setup/pg_setup.sql
+export BENCH_DATABASE_URL="postgres://YOUR_USER@localhost/bench_db?host=/tmp"
+export BSQL_DATABASE_URL="$BENCH_DATABASE_URL"
 
-**SQLite:**
-```bash
-rm -f bench.db
+# SQLite
 sqlite3 bench.db < setup/sqlite_setup.sql
 export BENCH_SQLITE_PATH=bench.db
-export BSQL_DATABASE_URL=sqlite://bench.db
 ```
 
-**Run everything:**
+### Run all benchmarks
 ```bash
-# Rust (Criterion)
+# Rust (bsql, sqlx, diesel)
 cargo bench
 
 # C
-cd c && make all && BENCH_DATABASE_URL="$BENCH_DATABASE_URL" ./pg_bench && BENCH_SQLITE_PATH=../bench.db ./sqlite_bench && cd ..
+cd c && make all
+BENCH_DATABASE_URL="host=/tmp dbname=bench_db" ./pg_bench
+BENCH_SQLITE_PATH=../bench.db ./sqlite_bench
 
 # Go
-cd go && go mod tidy && BENCH_DATABASE_URL="$BENCH_DATABASE_URL" go run pg_bench.go && BENCH_SQLITE_PATH=../bench.db go run sqlite_bench.go && cd ..
+cd go
+BENCH_DATABASE_URL="host=/tmp dbname=bench_db" go run ./pg/
+BENCH_SQLITE_PATH=../bench.db go run ./sqlite/
 ```
+
+Note: Run all benchmarks in quick succession on an idle machine for consistent results. PG background maintenance (autovacuum, checkpoints) can add 10-50% variance to INSERT and complex queries.
 
 Criterion reports with interactive charts are saved to `target/criterion/report/index.html`.
 
