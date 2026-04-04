@@ -1,19 +1,13 @@
 # bsql
 
-Your safest, fastest, most lightweight SQL.
-
 Compile-time safe SQL for Rust. PostgreSQL and SQLite.
 
 ## Why bsql
 
 - **If it compiles, the SQL is correct** -- every query is validated against your real database during `cargo build`. Table names, column names, types, nullability -- all checked before your code can run.
-
 - **Always checked** -- there is no unchecked SQL function. In sqlx, one missing `!` (`query()` vs `query!()`) silently skips compile-time validation. In bsql, there is only one function, and it always checks. You cannot accidentally write unchecked SQL because the unchecked version does not exist.
-
 - **Pure SQL** -- write real SQL. CTEs, JOINs, window functions, subqueries. No DSL, no method chains, no `.filter().select().join()` (hi, diesel). If PostgreSQL or SQLite supports it, bsql validates it.
-
 - **Faster than C** -- 1.05–2.5x faster than raw C (libpq, sqlite3) on every benchmark. Not synthetic tuning — the same code paths run in benchmarks and in your production app. See [benchmarks](bench/README.md).
-
 - **PostgreSQL and SQLite** -- same `query!` macro, same compile-time safety, both databases. SQLite is not a second-class citizen.
 
 ```rust
@@ -44,6 +38,7 @@ let user = &users[0];
 <details><summary>PostgreSQL</summary>
 
 **Cargo.toml:**
+
 ```toml
 [dependencies]
 bsql = { version = "0.15", features = ["time", "uuid"] }
@@ -51,11 +46,13 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
 **Set the database URL** (used by `query!` at compile time):
+
 ```bash
 export BSQL_DATABASE_URL="postgres://user:pass@localhost/mydb"
 ```
 
 **src/main.rs:**
+
 ```rust
 use bsql::Pool;
 
@@ -79,6 +76,7 @@ async fn main() -> Result<(), bsql::BsqlError> {
 <details><summary>SQLite</summary>
 
 **Cargo.toml:**
+
 ```toml
 [dependencies]
 bsql = { version = "0.15", features = ["sqlite"] }
@@ -86,6 +84,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
 **Set the database URL** (used by `query!` at compile time):
+
 ```bash
 export BSQL_DATABASE_URL="sqlite:./myapp.db"
 ```
@@ -93,6 +92,7 @@ export BSQL_DATABASE_URL="sqlite:./myapp.db"
 If you commit the `.bsql/` cache directory to your repo, teammates and CI can compile without a live database -- the cache contains the schema snapshot.
 
 **src/main.rs:**
+
 ```rust
 use bsql::SqlitePool;
 
@@ -141,16 +141,16 @@ When a pure-Rust SQLite engine like [Limbo](https://github.com/penberg/limbo) re
 
 ## Compile-Time Checks
 
-| Your mistake | What happens |
-|---|---|
-| Table name typo | `table "tcikets" not found -- did you mean "tickets"?` |
-| Column doesn't exist | `column "naem" not found in table "users"` |
-| Wrong parameter type | `expected i32, found &str for column "users.id"` |
-| Nullable column | Automatically becomes `Option<T>` -- you cannot forget to handle NULL |
-| `UPDATE` without `WHERE` | Compile error -- flags accidental full-table updates |
-| `DELETE` without `WHERE` | Compile error -- same protection |
-| SQL syntax error | PostgreSQL's own parser error message, at compile time |
-| Typo in any identifier | Levenshtein-based "did you mean?" suggestions |
+| Your mistake                 | What happens                                                            |
+| ---------------------------- | ----------------------------------------------------------------------- |
+| Table name typo              | `table "tcikets" not found -- did you mean "tickets"?`                |
+| Column doesn't exist         | `column "naem" not found in table "users"`                            |
+| Wrong parameter type         | `expected i32, found &str for column "users.id"`                      |
+| Nullable column              | Automatically becomes `Option<T>` -- you cannot forget to handle NULL |
+| `UPDATE` without `WHERE` | Compile error -- flags accidental full-table updates                    |
+| `DELETE` without `WHERE` | Compile error -- same protection                                        |
+| SQL syntax error             | PostgreSQL's own parser error message, at compile time                  |
+| Typo in any identifier       | Levenshtein-based "did you mean?" suggestions                           |
 
 ---
 
@@ -165,12 +165,12 @@ Out of the box, bsql works with basic types: integers, floats, booleans, strings
 bsql = { version = "0.15", features = ["time", "uuid", "decimal"] }
 ```
 
-| Feature | PostgreSQL types | Rust types |
-|---|---|---|
-| `time` | TIMESTAMPTZ, TIMESTAMP, DATE, TIME | `time::OffsetDateTime`, `Date`, `Time` |
-| `chrono` | Same (alternative to `time`) | `chrono::DateTime<Utc>`, `NaiveDateTime` |
-| `uuid` | UUID | `uuid::Uuid` |
-| `decimal` | NUMERIC, DECIMAL | `rust_decimal::Decimal` |
+| Feature     | PostgreSQL types                   | Rust types                                   |
+| ----------- | ---------------------------------- | -------------------------------------------- |
+| `time`    | TIMESTAMPTZ, TIMESTAMP, DATE, TIME | `time::OffsetDateTime`, `Date`, `Time` |
+| `chrono`  | Same (alternative to `time`)     | `chrono::DateTime<Utc>`, `NaiveDateTime` |
+| `uuid`    | UUID                               | `uuid::Uuid`                               |
+| `decimal` | NUMERIC, DECIMAL                   | `rust_decimal::Decimal`                    |
 
 If your query touches a column that needs a feature you haven't enabled, you get a compile error naming the exact feature to add.
 
@@ -196,11 +196,11 @@ No string concatenation. No runtime SQL assembly. 2 optional clauses = 4 variant
 <details>
 <summary>Execution methods</summary>
 
-| Method | Returns | Use |
-|---|---|---|
-| `.fetch(&pool)` | `Vec<Row>` | SELECT queries |
-| `.run(&pool)` | `u64` | INSERT, UPDATE, DELETE |
-| `.defer(&tx)` | `()` | Buffer in transaction |
+| Method            | Returns      | Use                    |
+| ----------------- | ------------ | ---------------------- |
+| `.fetch(&pool)` | `Vec<Row>` | SELECT queries         |
+| `.run(&pool)`   | `u64`      | INSERT, UPDATE, DELETE |
+| `.defer(&tx)`   | `()`       | Buffer in transaction  |
 
 Power users: `fetch_one`, `fetch_optional`, `fetch_stream`, `for_each` also available.
 

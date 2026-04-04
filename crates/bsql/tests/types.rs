@@ -162,12 +162,11 @@ mod time_tests {
     async fn select_nullable_timestamptz() {
         // deadline is nullable TIMESTAMPTZ — find a ticket where it's NULL
         let pool = pool().await;
-        let ticket = bsql::query!(
-            "SELECT id, deadline FROM tickets WHERE deadline IS NULL LIMIT 1"
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let ticket =
+            bsql::query!("SELECT id, deadline FROM tickets WHERE deadline IS NULL LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
 
         assert!(ticket.deadline.is_none());
     }
