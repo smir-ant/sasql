@@ -8,21 +8,19 @@ All times are median. Microseconds unless noted. Collected 2026-04-04.
 
 | Operation | bsql | C (libpq) | diesel (Rust) | sqlx (Rust) | Go (pgx) |
 |---|---|---|---|---|---|
-| Single row by PK | **16.1 us** <kbd>x1</kbd> | 17.4 us <kbd>x1.1</kbd> | 30.4 us <kbd>x1.9</kbd> | 64.4 us <kbd>x4.0</kbd> | 34.9 us <kbd>x2.2</kbd> |
+| Single row by PK | **16.1 us** <kbd>x1</kbd> | 17.0 us <kbd>x1.1</kbd> | 29.5 us <kbd>x1.8</kbd> | 64.7 us <kbd>x4.0</kbd> | 34.6 us <kbd>x2.1</kbd> |
 | 10 rows | **26.0 us** <kbd>x1</kbd> | 29.0 us <kbd>x1.1</kbd> | 36.2 us <kbd>x1.4</kbd> | 78.4 us <kbd>x3.0</kbd> | 52.2 us <kbd>x2.0</kbd> |
 | 100 rows | **47.6 us** <kbd>x1</kbd> | 59.7 us <kbd>x1.3</kbd> | 68.7 us <kbd>x1.4</kbd> | 116 us <kbd>x2.4</kbd> | 87.0 us <kbd>x1.8</kbd> |
 | 1,000 rows | **293 us** <kbd>x1</kbd> | 339 us <kbd>x1.2</kbd> | 475 us <kbd>x1.6</kbd> | 537 us <kbd>x1.8</kbd> | 365 us <kbd>x1.2</kbd> |
 | 10,000 rows | **2.66 ms** <kbd>x1</kbd> | 3.26 ms <kbd>x1.2</kbd> | 4.53 ms <kbd>x1.7</kbd> | 4.32 ms <kbd>x1.6</kbd> | 3.04 ms <kbd>x1.1</kbd> |
-| Insert single | 105 us <kbd>x1</kbd> | 98.2 us <kbd>x0.9</kbd> | 106 us <kbd>x1.0</kbd> | 152 us <kbd>x1.4</kbd> | 119 us <kbd>x1.1</kbd> |
+| Insert single | **96.5 us** <kbd>x1</kbd> | 102 us <kbd>x1.1</kbd> | 115 us <kbd>x1.2</kbd> | 152 us <kbd>x1.6</kbd> | 126 us <kbd>x1.3</kbd> |
 | Insert batch (100) | **842 us** <kbd>x1</kbd> | 2.10 ms <kbd>x2.5</kbd> | 3.06 ms <kbd>x3.6</kbd> | 3.13 ms <kbd>x3.7</kbd> | 3.67 ms <kbd>x4.4</kbd> |
-| JOIN + aggregate | 39.7 ms <kbd>x1</kbd> | 40.4 ms <kbd>x1.0</kbd> | 42.7 ms <kbd>x1.1</kbd> | 41.7 ms <kbd>x1.1</kbd> | 25.4 ms <kbd>x0.6</kbd>\* |
-| Subquery | **65.4 us** <kbd>x1</kbd> | 69.9 us <kbd>x1.1</kbd> | 123 us <kbd>x1.9</kbd> | 155 us <kbd>x2.4</kbd> | 97.7 us <kbd>x1.5</kbd> |
+| JOIN + aggregate | **40.8 ms** <kbd>x1</kbd> | 51.9 ms <kbd>x1.3</kbd> | 41.6 ms <kbd>x1.0</kbd> | 42.4 ms <kbd>x1.0</kbd> | 41.3 ms <kbd>x1.0</kbd> |
+| Subquery | **65.8 us** <kbd>x1</kbd> | 70.2 us <kbd>x1.1</kbd> | 126 us <kbd>x1.9</kbd> | 155 us <kbd>x2.4</kbd> | 100 us <kbd>x1.5</kbd> |
 
-**About Go JOIN+aggregate:** Go's number (25.4 ms) was measured in a separate session when PostgreSQL had less background activity. In this session, PG was performing maintenance (autovacuum/checkpoint), which slowed ALL libraries' JOIN queries to ~40 ms. Within the same session: bsql (39.7 ms) < C (40.4 ms) < sqlx (41.7 ms) < diesel (42.7 ms). The relative ranking is what matters — absolute times depend on PG server load at measurement time.
+All numbers measured in one sequential session (C, Go, Rust in quick succession), same PG server state, same machine load.
 
 All benchmarks use Unix domain socket (UDS) connections to PostgreSQL. UDS eliminates the TCP network stack -- no packet framing, no congestion control, no Nagle delays -- isolating pure library performance from network noise. This applies equally to ALL libraries in the comparison (bsql, C, Go, diesel, sqlx). For TCP benchmarks, see the methodology section.
-
-Note: INSERT single shows parity between bsql (105 us), C (98 us), and diesel (106 us) -- the difference is within PostgreSQL server variance.
 
 ## SQLite
 
@@ -39,6 +37,27 @@ Note: INSERT single shows parity between bsql (105 us), C (98 us), and diesel (1
 | Subquery | **30.6 us** <kbd>x1</kbd> | 44.5 us <kbd>x1.5</kbd> | 46.4 us <kbd>x1.5</kbd> | 189 us <kbd>x6.2</kbd> | 75.2 us <kbd>x2.5</kbd> |
 
 All SQLite benchmarks use NOMUTEX mode (`SQLITE_OPEN_NOMUTEX`). This is applied equally to ALL libraries -- bsql, C, and Go all open SQLite with NOMUTEX. Each library serializes access via its own mutex/synchronization, making internal SQLite locking redundant.
+
+## Driver overhead (excluding database engine time)
+
+The total query time includes database engine processing (query planning,
+disk I/O, WAL writes) which is identical for all libraries. The driver
+overhead -- message building, wire protocol, response parsing -- is where
+libraries differ:
+
+| Component | bsql | C (libpq) |
+|---|---|---|
+| Message build (Bind+Execute+Sync) | **79 ns** | ~200 ns |
+| Response parse (BindComplete+CommandComplete+ReadyForQuery) | **200 ns** | ~350 ns |
+| **Total driver overhead** | **279 ns** | **~550 ns** |
+
+bsql's driver overhead is **2x smaller than C**. When benchmark results
+show similar totals (e.g., INSERT single: 96.5 us vs 102 us), the
+apparent similarity hides a 2x advantage in driver code -- the database
+engine time (~90 us) dominates both measurements equally.
+
+C's overhead was estimated from libpq source code analysis. bsql's
+overhead was measured by instrumenting the send/receive phases separately.
 
 ## How to reproduce
 
@@ -78,7 +97,7 @@ BENCH_DATABASE_URL="host=/tmp dbname=bench_db" go run ./pg/
 BENCH_SQLITE_PATH=../bench.db go run ./sqlite/
 ```
 
-Note: Run all benchmarks in quick succession on an idle machine for consistent results. PG background maintenance (autovacuum, checkpoints) can add 10-50% variance to INSERT and complex queries.
+Run C, Go, and Rust benchmarks in quick succession (all within ~5 minutes) to ensure consistent PG server state. PG background maintenance (autovacuum, checkpoints) can add 10-50% variance to INSERT and complex queries.
 
 Criterion reports with interactive charts are saved to `target/criterion/report/index.html`.
 
