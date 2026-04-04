@@ -736,6 +736,9 @@ impl PoolGuard {
     }
 
     /// Execute a query without result rows (INSERT/UPDATE/DELETE).
+    ///
+    /// For sync UDS connections, calls `execute_monolithic` directly — the
+    /// entire send+receive path is inlined in one function.
     pub async fn execute(
         &mut self,
         sql: &str,
@@ -750,7 +753,7 @@ impl PoolGuard {
             PoolSlot::Async(conn) => conn.execute(sql, sql_hash, params).await,
             #[cfg(unix)]
             PoolSlot::Sync(conn) => {
-                tokio::task::block_in_place(|| conn.execute(sql, sql_hash, params))
+                tokio::task::block_in_place(|| conn.execute_monolithic(sql, sql_hash, params))
             }
         }
     }
@@ -816,6 +819,9 @@ impl PoolGuard {
     }
 
     /// Process each DataRow as raw bytes — fastest path.
+    ///
+    /// For sync UDS connections, calls `for_each_raw_monolithic` directly — the
+    /// entire send+receive path is inlined in one function.
     pub async fn for_each_raw<F>(
         &mut self,
         sql: &str,
@@ -833,9 +839,9 @@ impl PoolGuard {
         match slot {
             PoolSlot::Async(conn) => conn.for_each_raw(sql, sql_hash, params, f).await,
             #[cfg(unix)]
-            PoolSlot::Sync(conn) => {
-                tokio::task::block_in_place(|| conn.for_each_raw(sql, sql_hash, params, f))
-            }
+            PoolSlot::Sync(conn) => tokio::task::block_in_place(|| {
+                conn.for_each_raw_monolithic(sql, sql_hash, params, f)
+            }),
         }
     }
 

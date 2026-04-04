@@ -579,24 +579,97 @@ impl SyncConnection {
         ))
     }
 
-    /// Execute a query without result rows (INSERT/UPDATE/DELETE).
+    /// Monolithic execute — everything in one function, no intermediate calls.
     ///
-    /// Optimized path: after `send_pipeline` flushes, the server sends
-    /// BindComplete + CommandComplete + ReadyForQuery (~31 bytes total).
-    /// We parse all three directly from `stream_buf` in one pass, avoiding
-    /// per-message `read_message_buffered` overhead (no `read_buf` copies,
-    /// no `BackendMessage` enum construction).
+    /// Inlines the entire send_pipeline + response parsing path for
+    /// INSERT/UPDATE/DELETE. On cache hit: template copy + param patch +
+    /// write_all + inline message parsing. No send_pipeline(), no flush_write(),
+    /// no refill_stream_buf(). The compiler sees the entire path and can
+    /// optimize globally.
+    ///
+    /// On cache miss (first execution of a statement), falls through to the
+    /// cold `execute_with_prepare` path.
     #[inline]
-    pub fn execute(
+    pub fn execute_monolithic(
         &mut self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> Result<u64, DriverError> {
-        let _ = self.send_pipeline(sql, sql_hash, params, false, true)?;
+        // === SEND PHASE (inline — no send_pipeline, no flush_write) ===
+        self.write_buf.clear();
 
-        // Inline response parsing: BindComplete + DataRow* + CommandComplete + ReadyForQuery.
-        // All messages are parsed directly from stream_buf.
+        // Check statement cache — inline, no function call.
+        let info = match self.stmts.get_mut(&sql_hash) {
+            Some(info) => {
+                self.query_counter += 1;
+                info.last_used = self.query_counter;
+                info
+            }
+            None => {
+                // Cache miss: prepare first (cold path, separate function).
+                return self.execute_with_prepare(sql, sql_hash, params);
+            }
+        };
+
+        // Build Bind+Execute+Sync message — inline bind template logic.
+        let can_use_template = info
+            .bind_template
+            .as_ref()
+            .is_some_and(|t| t.param_slots.len() == params.len());
+
+        let mut has_exec_sync = false;
+
+        if can_use_template {
+            let tmpl = info.bind_template.as_ref().unwrap();
+            self.write_buf.extend_from_slice(&tmpl.bytes);
+
+            let mut template_ok = true;
+            for (i, param) in params.iter().enumerate() {
+                let (data_offset, old_len) = tmpl.param_slots[i];
+                if param.is_null() {
+                    let len_offset = data_offset - 4;
+                    self.write_buf[len_offset..len_offset + 4]
+                        .copy_from_slice(&(-1i32).to_be_bytes());
+                } else if old_len >= 0 {
+                    let end = data_offset + old_len as usize;
+                    if !param.encode_at(&mut self.write_buf[data_offset..end]) {
+                        template_ok = false;
+                        break;
+                    }
+                } else {
+                    // Template had NULL, now non-NULL — rebuild.
+                    template_ok = false;
+                    break;
+                }
+            }
+
+            if template_ok {
+                has_exec_sync = true;
+            } else {
+                self.write_buf.clear();
+                proto::write_bind_params(&mut self.write_buf, "", &info.name, params);
+                info.bind_template = None;
+            }
+        } else {
+            proto::write_bind_params(&mut self.write_buf, "", &info.name, params);
+        }
+
+        // Snapshot bind template on first use or after invalidation.
+        if info.bind_template.is_none() && !self.write_buf.is_empty() {
+            info.bind_template = build_bind_template(&self.write_buf, params.len());
+        }
+
+        if !has_exec_sync {
+            self.write_buf.extend_from_slice(proto::EXECUTE_SYNC);
+        }
+
+        // Write to socket — ONE syscall, no flush_write() indirection.
+        self.stream
+            .write_all(&self.write_buf)
+            .map_err(DriverError::Io)?;
+
+        // === RECEIVE PHASE (inline — no refill_stream_buf) ===
         let mut affected_rows: u64 = 0;
 
         'outer: loop {
@@ -626,7 +699,6 @@ impl SyncConnection {
 
                 if avail < total_msg_len {
                     if total_msg_len > self.stream_buf.len() {
-                        // Oversized message — fall back to read_one_message.
                         let msg = self.read_one_message()?;
                         match msg {
                             BackendMessage::BindComplete | BackendMessage::DataRow { .. } => {
@@ -662,9 +734,6 @@ impl SyncConnection {
                 let payload_start = self.stream_buf_pos + 5;
                 let payload_end = payload_start + payload_len;
 
-                // Happy path first: for execute(), BindComplete (b'2') and
-                // CommandComplete (b'C') are the common messages. DataRow is
-                // skipped. Use if/else chain for predicted branches.
                 if msg_type == b'2' || msg_type == b'D' || msg_type == b'I' {
                     // BindComplete / DataRow / EmptyQuery — skip
                 } else if msg_type == b'C' {
@@ -691,11 +760,192 @@ impl SyncConnection {
                 self.stream_buf_pos += total_msg_len;
             }
 
-            // Need more data — compact and refill.
+            // Need more data — compact and refill inline.
+            let remaining = self.stream_buf_end - self.stream_buf_pos;
+            if remaining > 0 && self.stream_buf_pos > 0 {
+                self.stream_buf
+                    .copy_within(self.stream_buf_pos..self.stream_buf_end, 0);
+            }
+            self.stream_buf_pos = 0;
+            self.stream_buf_end = remaining;
+            let n = self
+                .stream
+                .read(&mut self.stream_buf[remaining..])
+                .map_err(DriverError::Io)?;
+            if n == 0 {
+                return Err(DriverError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed",
+                )));
+            }
+            self.stream_buf_end = remaining + n;
+        }
+
+        // Throttled maintenance — every 64 queries.
+        if self.query_counter & 63 == 0 {
+            if self.read_buf.capacity() > 64 * 1024 {
+                self.read_buf.clear();
+                self.read_buf.shrink_to(8192);
+            }
+            if self.write_buf.capacity() > 16 * 1024 {
+                self.write_buf.clear();
+                self.write_buf.shrink_to(8192);
+            }
+        }
+
+        Ok(affected_rows)
+    }
+
+    /// Cold path: cache miss — Parse+Describe+Bind+Execute+Sync, then read response.
+    #[cold]
+    #[inline(never)]
+    fn execute_with_prepare(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+    ) -> Result<u64, DriverError> {
+        debug_assert_eq!(crate::conn::hash_sql(sql), sql_hash, "sql_hash mismatch");
+
+        if params.len() > i16::MAX as usize {
+            return Err(DriverError::Protocol(format!(
+                "parameter count {} exceeds maximum {}",
+                params.len(),
+                i16::MAX
+            )));
+        }
+
+        let name = make_stmt_name(sql_hash);
+        let param_oids: smallvec::SmallVec<[u32; 8]> =
+            params.iter().map(|p| p.type_oid()).collect();
+
+        self.write_buf.clear();
+        proto::write_parse(&mut self.write_buf, &name, sql, &param_oids);
+        proto::write_describe(&mut self.write_buf, b'S', &name);
+        proto::write_bind_params(&mut self.write_buf, "", &name, params);
+        self.write_buf.extend_from_slice(proto::EXECUTE_SYNC);
+        self.stream
+            .write_all(&self.write_buf)
+            .map_err(DriverError::Io)?;
+
+        self.expect_message(|m| matches!(m, BackendMessage::ParseComplete))?;
+        let columns = self.read_column_description()?;
+        self.query_counter += 1;
+        self.cache_stmt(
+            sql_hash,
+            StmtInfo {
+                name,
+                columns,
+                last_used: self.query_counter,
+                bind_template: None,
+            },
+        );
+
+        // Now read BindComplete + CommandComplete + ReadyForQuery.
+        let mut affected_rows: u64 = 0;
+        'outer: loop {
+            loop {
+                let avail = self.stream_buf_end - self.stream_buf_pos;
+                if avail < 5 {
+                    break;
+                }
+
+                let msg_type = self.stream_buf[self.stream_buf_pos];
+                let raw_len = i32::from_be_bytes([
+                    self.stream_buf[self.stream_buf_pos + 1],
+                    self.stream_buf[self.stream_buf_pos + 2],
+                    self.stream_buf[self.stream_buf_pos + 3],
+                    self.stream_buf[self.stream_buf_pos + 4],
+                ]);
+
+                if raw_len < 4 {
+                    return Err(DriverError::Protocol(format!(
+                        "invalid message length {raw_len} for type '{}'",
+                        msg_type as char
+                    )));
+                }
+
+                let payload_len = (raw_len - 4) as usize;
+                let total_msg_len = 5 + payload_len;
+
+                if avail < total_msg_len {
+                    if total_msg_len > self.stream_buf.len() {
+                        let msg = self.read_one_message()?;
+                        match msg {
+                            BackendMessage::BindComplete | BackendMessage::DataRow { .. } => {
+                                continue;
+                            }
+                            BackendMessage::CommandComplete { tag } => {
+                                affected_rows = proto::parse_command_tag(tag);
+                                continue;
+                            }
+                            BackendMessage::EmptyQuery => continue,
+                            BackendMessage::ReadyForQuery { status } => {
+                                self.tx_status = status;
+                                break 'outer;
+                            }
+                            BackendMessage::NoticeResponse { .. } => continue,
+                            BackendMessage::ErrorResponse { data } => {
+                                let fields = proto::parse_error_response(data);
+                                self.maybe_invalidate_stmt_cache(&fields, sql_hash);
+                                self.drain_to_ready()?;
+                                return Err(self.make_server_error(fields));
+                            }
+                            other => {
+                                return Err(DriverError::Protocol(format!(
+                                    "unexpected message during execute: {other:?}"
+                                )));
+                            }
+                        }
+                    }
+                    break;
+                }
+
+                let payload_start = self.stream_buf_pos + 5;
+                let payload_end = payload_start + payload_len;
+
+                if msg_type == b'2' || msg_type == b'D' || msg_type == b'I' {
+                    // BindComplete / DataRow / EmptyQuery — skip
+                } else if msg_type == b'C' {
+                    affected_rows = proto::parse_command_tag_bytes(
+                        &self.stream_buf[payload_start..payload_end],
+                    );
+                } else if msg_type == b'Z' {
+                    if payload_len >= 1 {
+                        self.tx_status = self.stream_buf[payload_start];
+                    }
+                    self.stream_buf_pos += total_msg_len;
+                    break 'outer;
+                } else {
+                    self.handle_non_datarow_execute(
+                        msg_type,
+                        payload_start,
+                        payload_end,
+                        sql_hash,
+                    )?;
+                }
+
+                self.stream_buf_pos += total_msg_len;
+            }
+
             self.refill_stream_buf()?;
         }
 
         Ok(affected_rows)
+    }
+
+    /// Execute a query without result rows (INSERT/UPDATE/DELETE).
+    ///
+    /// Delegates to `execute_monolithic` which inlines the entire send + receive
+    /// path. Kept for API compatibility.
+    #[inline]
+    pub fn execute(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+    ) -> Result<u64, DriverError> {
+        self.execute_monolithic(sql, sql_hash, params)
     }
 
     /// Execute the same prepared statement N times with different parameters
@@ -1044,12 +1294,18 @@ impl SyncConnection {
         Ok(())
     }
 
-    /// Process each DataRow as raw bytes — fastest path.
+    /// Monolithic for_each_raw — everything in one function, no intermediate calls.
     ///
-    /// Same zero-copy stream_buf optimization as the async `Connection::for_each_raw`,
-    /// but with blocking I/O. No futures, no wakers, no poll overhead.
+    /// Inlines the entire send_pipeline + response parsing path for SELECT
+    /// queries processed via a raw byte closure. On cache hit: template copy +
+    /// param patch + write_all + inline DataRow streaming + inline
+    /// ReadyForQuery. No send_pipeline(), no flush_write(), no
+    /// refill_stream_buf().
+    ///
+    /// On cache miss (first execution of a statement), falls through to the
+    /// cold `for_each_raw_with_prepare` path.
     #[inline]
-    pub fn for_each_raw<F>(
+    pub fn for_each_raw_monolithic<F>(
         &mut self,
         sql: &str,
         sql_hash: u64,
@@ -1059,7 +1315,79 @@ impl SyncConnection {
     where
         F: FnMut(&[u8]) -> Result<(), DriverError>,
     {
-        let _ = self.send_pipeline(sql, sql_hash, params, false, true)?;
+        // === SEND PHASE (inline — no send_pipeline, no flush_write) ===
+        self.write_buf.clear();
+
+        // Check statement cache — inline, no function call.
+        let info = match self.stmts.get_mut(&sql_hash) {
+            Some(info) => {
+                self.query_counter += 1;
+                info.last_used = self.query_counter;
+                info
+            }
+            None => {
+                // Cache miss: prepare first (cold path, separate function).
+                return self.for_each_raw_with_prepare(sql, sql_hash, params, f);
+            }
+        };
+
+        // Build Bind+Execute+Sync message — inline bind template logic.
+        let can_use_template = info
+            .bind_template
+            .as_ref()
+            .is_some_and(|t| t.param_slots.len() == params.len());
+
+        let mut has_exec_sync = false;
+
+        if can_use_template {
+            let tmpl = info.bind_template.as_ref().unwrap();
+            self.write_buf.extend_from_slice(&tmpl.bytes);
+
+            let mut template_ok = true;
+            for (i, param) in params.iter().enumerate() {
+                let (data_offset, old_len) = tmpl.param_slots[i];
+                if param.is_null() {
+                    let len_offset = data_offset - 4;
+                    self.write_buf[len_offset..len_offset + 4]
+                        .copy_from_slice(&(-1i32).to_be_bytes());
+                } else if old_len >= 0 {
+                    let end = data_offset + old_len as usize;
+                    if !param.encode_at(&mut self.write_buf[data_offset..end]) {
+                        template_ok = false;
+                        break;
+                    }
+                } else {
+                    template_ok = false;
+                    break;
+                }
+            }
+
+            if template_ok {
+                has_exec_sync = true;
+            } else {
+                self.write_buf.clear();
+                proto::write_bind_params(&mut self.write_buf, "", &info.name, params);
+                info.bind_template = None;
+            }
+        } else {
+            proto::write_bind_params(&mut self.write_buf, "", &info.name, params);
+        }
+
+        // Snapshot bind template on first use or after invalidation.
+        if info.bind_template.is_none() && !self.write_buf.is_empty() {
+            info.bind_template = build_bind_template(&self.write_buf, params.len());
+        }
+
+        if !has_exec_sync {
+            self.write_buf.extend_from_slice(proto::EXECUTE_SYNC);
+        }
+
+        // Write to socket — ONE syscall, no flush_write() indirection.
+        self.stream
+            .write_all(&self.write_buf)
+            .map_err(DriverError::Io)?;
+
+        // === RECEIVE PHASE (inline — no refill_stream_buf) ===
 
         // Read BindComplete inline from stream_buf.
         loop {
@@ -1100,13 +1428,29 @@ impl SyncConnection {
                     }
                 }
             } else {
-                self.refill_stream_buf()?;
+                // Inline refill.
+                let remaining = self.stream_buf_end - self.stream_buf_pos;
+                if remaining > 0 && self.stream_buf_pos > 0 {
+                    self.stream_buf
+                        .copy_within(self.stream_buf_pos..self.stream_buf_end, 0);
+                }
+                self.stream_buf_pos = 0;
+                self.stream_buf_end = remaining;
+                let n = self
+                    .stream
+                    .read(&mut self.stream_buf[remaining..])
+                    .map_err(DriverError::Io)?;
+                if n == 0 {
+                    return Err(DriverError::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "connection closed",
+                    )));
+                }
+                self.stream_buf_end = remaining + n;
             }
         }
 
         // Bulk DataRow loop: parse messages directly from stream_buf.
-        // Continues through CommandComplete/EmptyQuery until ReadyForQuery,
-        // eliminating the separate expect_ready() call.
         'outer: loop {
             loop {
                 let avail = self.stream_buf_end - self.stream_buf_pos;
@@ -1134,7 +1478,6 @@ impl SyncConnection {
 
                 if avail < total_msg_len {
                     if total_msg_len > self.stream_buf.len() {
-                        // Oversized message — fall back to read_message_buffered.
                         let msg = self.read_one_message()?;
                         match msg {
                             BackendMessage::DataRow { data } => {
@@ -1169,12 +1512,177 @@ impl SyncConnection {
                 let payload_start = self.stream_buf_pos + 5;
                 let payload_end = payload_start + payload_len;
 
-                // Happy path first: DataRow is ~99.9% of messages during
-                // bulk streaming. Single predicted branch.
                 if msg_type == b'D' {
                     f(&self.stream_buf[payload_start..payload_end])?;
                 } else if msg_type == b'Z' {
-                    // ReadyForQuery — extract tx status and we're done.
+                    if payload_len >= 1 {
+                        self.tx_status = self.stream_buf[payload_start];
+                    }
+                    self.stream_buf_pos += total_msg_len;
+                    break 'outer;
+                } else {
+                    self.handle_non_datarow_execute(
+                        msg_type,
+                        payload_start,
+                        payload_end,
+                        sql_hash,
+                    )?;
+                }
+
+                self.stream_buf_pos += total_msg_len;
+            }
+
+            // Need more data — compact and refill inline.
+            let remaining = self.stream_buf_end - self.stream_buf_pos;
+            if remaining > 0 && self.stream_buf_pos > 0 {
+                self.stream_buf
+                    .copy_within(self.stream_buf_pos..self.stream_buf_end, 0);
+            }
+            self.stream_buf_pos = 0;
+            self.stream_buf_end = remaining;
+            let n = self
+                .stream
+                .read(&mut self.stream_buf[remaining..])
+                .map_err(DriverError::Io)?;
+            if n == 0 {
+                return Err(DriverError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed",
+                )));
+            }
+            self.stream_buf_end = remaining + n;
+        }
+
+        // Throttled maintenance — every 64 queries.
+        if self.query_counter & 63 == 0 {
+            if self.read_buf.capacity() > 64 * 1024 {
+                self.read_buf.clear();
+                self.read_buf.shrink_to(8192);
+            }
+            if self.write_buf.capacity() > 16 * 1024 {
+                self.write_buf.clear();
+                self.write_buf.shrink_to(8192);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Cold path: cache miss for for_each_raw — Parse+Describe first, then stream.
+    #[cold]
+    #[inline(never)]
+    fn for_each_raw_with_prepare<F>(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+        mut f: F,
+    ) -> Result<(), DriverError>
+    where
+        F: FnMut(&[u8]) -> Result<(), DriverError>,
+    {
+        debug_assert_eq!(crate::conn::hash_sql(sql), sql_hash, "sql_hash mismatch");
+
+        if params.len() > i16::MAX as usize {
+            return Err(DriverError::Protocol(format!(
+                "parameter count {} exceeds maximum {}",
+                params.len(),
+                i16::MAX
+            )));
+        }
+
+        let name = make_stmt_name(sql_hash);
+        let param_oids: smallvec::SmallVec<[u32; 8]> =
+            params.iter().map(|p| p.type_oid()).collect();
+
+        self.write_buf.clear();
+        proto::write_parse(&mut self.write_buf, &name, sql, &param_oids);
+        proto::write_describe(&mut self.write_buf, b'S', &name);
+        proto::write_bind_params(&mut self.write_buf, "", &name, params);
+        self.write_buf.extend_from_slice(proto::EXECUTE_SYNC);
+        self.stream
+            .write_all(&self.write_buf)
+            .map_err(DriverError::Io)?;
+
+        self.expect_message(|m| matches!(m, BackendMessage::ParseComplete))?;
+        let columns = self.read_column_description()?;
+        self.query_counter += 1;
+        self.cache_stmt(
+            sql_hash,
+            StmtInfo {
+                name,
+                columns,
+                last_used: self.query_counter,
+                bind_template: None,
+            },
+        );
+
+        // Now read BindComplete + DataRow* + CommandComplete + ReadyForQuery.
+        self.expect_message(|m| matches!(m, BackendMessage::BindComplete))?;
+
+        'outer: loop {
+            loop {
+                let avail = self.stream_buf_end - self.stream_buf_pos;
+                if avail < 5 {
+                    break;
+                }
+
+                let msg_type = self.stream_buf[self.stream_buf_pos];
+                let raw_len = i32::from_be_bytes([
+                    self.stream_buf[self.stream_buf_pos + 1],
+                    self.stream_buf[self.stream_buf_pos + 2],
+                    self.stream_buf[self.stream_buf_pos + 3],
+                    self.stream_buf[self.stream_buf_pos + 4],
+                ]);
+
+                if raw_len < 4 {
+                    return Err(DriverError::Protocol(format!(
+                        "invalid message length {raw_len} for type '{}'",
+                        msg_type as char
+                    )));
+                }
+
+                let payload_len = (raw_len - 4) as usize;
+                let total_msg_len = 5 + payload_len;
+
+                if avail < total_msg_len {
+                    if total_msg_len > self.stream_buf.len() {
+                        let msg = self.read_one_message()?;
+                        match msg {
+                            BackendMessage::DataRow { data } => {
+                                f(data)?;
+                                continue;
+                            }
+                            BackendMessage::CommandComplete { .. } | BackendMessage::EmptyQuery => {
+                                continue;
+                            }
+                            BackendMessage::ReadyForQuery { status } => {
+                                self.tx_status = status;
+                                break 'outer;
+                            }
+                            BackendMessage::ErrorResponse { data } => {
+                                let fields = proto::parse_error_response(data);
+                                self.maybe_invalidate_stmt_cache(&fields, sql_hash);
+                                self.drain_to_ready()?;
+                                return Err(self.make_server_error(fields));
+                            }
+                            BackendMessage::NoticeResponse { .. } => continue,
+                            other => {
+                                return Err(DriverError::Protocol(format!(
+                                    "unexpected message during for_each_raw: {other:?}"
+                                )));
+                            }
+                        }
+                    }
+                    break;
+                }
+
+                let payload_start = self.stream_buf_pos + 5;
+                let payload_end = payload_start + payload_len;
+
+                if msg_type == b'D' {
+                    f(&self.stream_buf[payload_start..payload_end])?;
+                } else if msg_type == b'Z' {
                     if payload_len >= 1 {
                         self.tx_status = self.stream_buf[payload_start];
                     }
@@ -1197,6 +1705,24 @@ impl SyncConnection {
 
         self.shrink_buffers();
         Ok(())
+    }
+
+    /// Process each DataRow as raw bytes — fastest path.
+    ///
+    /// Delegates to `for_each_raw_monolithic` which inlines the entire send +
+    /// receive path. Kept for API compatibility.
+    #[inline]
+    pub fn for_each_raw<F>(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+        f: F,
+    ) -> Result<(), DriverError>
+    where
+        F: FnMut(&[u8]) -> Result<(), DriverError>,
+    {
+        self.for_each_raw_monolithic(sql, sql_hash, params, f)
     }
 
     /// Simple query protocol — for non-prepared SQL (BEGIN, COMMIT, SET, etc.).
