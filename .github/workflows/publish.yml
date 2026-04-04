@@ -18,34 +18,82 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Publish bsql-arena
-        run: cargo publish -p bsql-arena --token ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          output=$(cargo publish -p bsql-arena --token ${{ secrets.CRATES_IO_TOKEN }} 2>&1) || {
+            if echo "$output" | grep -q "already exists"; then
+              echo "bsql-arena already published, skipping"
+            else
+              echo "$output"
+              exit 1
+            fi
+          }
 
       - name: Wait for index
         run: sleep 30
 
       - name: Publish bsql-driver-postgres
-        run: cargo publish -p bsql-driver-postgres --token ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          output=$(cargo publish -p bsql-driver-postgres --token ${{ secrets.CRATES_IO_TOKEN }} 2>&1) || {
+            if echo "$output" | grep -q "already exists"; then
+              echo "bsql-driver-postgres already published, skipping"
+            else
+              echo "$output"
+              exit 1
+            fi
+          }
 
       - name: Wait for index
         run: sleep 30
 
       - name: Publish bsql-driver-sqlite
-        run: cargo publish -p bsql-driver-sqlite --token ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          output=$(cargo publish -p bsql-driver-sqlite --token ${{ secrets.CRATES_IO_TOKEN }} 2>&1) || {
+            if echo "$output" | grep -q "already exists"; then
+              echo "bsql-driver-sqlite already published, skipping"
+            else
+              echo "$output"
+              exit 1
+            fi
+          }
 
       - name: Wait for index
         run: sleep 30
 
       - name: Publish bsql-core
-        run: cargo publish -p bsql-core --token ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          output=$(cargo publish -p bsql-core --token ${{ secrets.CRATES_IO_TOKEN }} 2>&1) || {
+            if echo "$output" | grep -q "already exists"; then
+              echo "bsql-core already published, skipping"
+            else
+              echo "$output"
+              exit 1
+            fi
+          }
 
       - name: Wait for index
         run: sleep 30
 
       - name: Publish bsql-macros
-        run: cargo publish -p bsql-macros --token ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          output=$(cargo publish -p bsql-macros --token ${{ secrets.CRATES_IO_TOKEN }} 2>&1) || {
+            if echo "$output" | grep -q "already exists"; then
+              echo "bsql-macros already published, skipping"
+            else
+              echo "$output"
+              exit 1
+            fi
+          }
 
       - name: Wait for index
         run: sleep 30
 
       - name: Publish bsql
-        run: cargo publish -p bsql --token ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          output=$(cargo publish -p bsql --token ${{ secrets.CRATES_IO_TOKEN }} 2>&1) || {
+            if echo "$output" | grep -q "already exists"; then
+              echo "bsql already published, skipping"
+            else
+              echo "$output"
+              exit 1
+            fi
+          }
