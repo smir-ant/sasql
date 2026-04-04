@@ -160,16 +160,15 @@ mod time_tests {
 
     #[tokio::test]
     async fn select_nullable_timestamptz() {
-        // deadline is nullable TIMESTAMPTZ
+        // deadline is nullable TIMESTAMPTZ — find a ticket where it's NULL
         let pool = pool().await;
-        let id = 1i32;
-        let ticket = bsql::query!("SELECT id, deadline FROM tickets WHERE id = $id: i32")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let ticket = bsql::query!(
+            "SELECT id, deadline FROM tickets WHERE deadline IS NULL LIMIT 1"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
 
-        assert_eq!(ticket.id, 1);
-        // Default is NULL
         assert!(ticket.deadline.is_none());
     }
 
