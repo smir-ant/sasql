@@ -8,6 +8,18 @@ publish = false
 name = "bsql_bench"
 path = "src/lib.rs"
 
+[[bin]]
+name = "mem_bsql_pg"
+path = "mem/bsql_pg.rs"
+
+[[bin]]
+name = "mem_sqlx_pg"
+path = "mem/sqlx_pg.rs"
+
+[[bin]]
+name = "mem_diesel_pg"
+path = "mem/diesel_pg.rs"
+
 [[bench]]
 name = "pg_fetch_one"
 harness = false

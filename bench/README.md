@@ -63,6 +63,25 @@ engine time (~90 us) dominates both measurements equally.
 C's overhead was estimated from libpq source code analysis. bsql's
 overhead was measured by instrumenting the send/receive phases separately.
 
+## Memory (peak RSS)
+
+Standalone binaries that each connect to PostgreSQL and run 10,000 SELECT queries + 1,000 INSERT queries, then exit. Peak resident set size measured externally via `/usr/bin/time -l` on macOS.
+
+| Library | Peak RSS | vs bsql |
+|---|---|---|
+| **bsql** | **2.2 MB** | <kbd>x1</kbd> |
+| sqlx (Rust) | 7.1 MB | <kbd>x3.3</kbd> |
+| diesel (Rust) | 7.3 MB | <kbd>x3.4</kbd> |
+| C (libpq) | 8.6 MB | <kbd>x4.0</kbd> |
+| Go (pgx) | 15.0 MB | <kbd>x6.9</kbd> |
+
+Run the memory benchmarks:
+```bash
+BENCH_DATABASE_URL="host=/tmp dbname=bench_db" ./mem/run_all.sh
+```
+
+Each binary does identical work: connect, 10K SELECTs by PK, 1K INSERTs, exit. No connection pooling variance -- bsql and sqlx use a pool with 1 connection, diesel and C use a single connection directly.
+
 ## How to reproduce
 
 ### Prerequisites
@@ -99,6 +118,9 @@ BENCH_SQLITE_PATH=../bench.db ./sqlite_bench
 cd go
 BENCH_DATABASE_URL="host=/tmp dbname=bench_db" go run ./pg/
 BENCH_SQLITE_PATH=../bench.db go run ./sqlite/
+
+# Memory (peak RSS)
+./mem/run_all.sh
 ```
 
 Run C, Go, and Rust benchmarks in quick succession (all within ~5 minutes) to ensure consistent PG server state. PG background maintenance (autovacuum, checkpoints) can add 10-50% variance to INSERT and complex queries.
