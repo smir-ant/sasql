@@ -461,7 +461,9 @@ fn parse_auth(payload: &[u8]) -> Result<BackendMessage<'_>, DriverError> {
             data: &payload[4..],
         }),
         _ => Err(DriverError::Protocol(format!(
-            "unsupported auth type: {auth_type}"
+            "unsupported authentication method (type {auth_type}). bsql supports: cleartext (3), \
+             MD5 (5), SCRAM-SHA-256 (10). Your server requires method {auth_type} which may be \
+             GSSAPI, SSPI, or certificate auth."
         ))),
     }
 }
@@ -1210,8 +1212,33 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("unsupported auth type"),
+            err.contains("unsupported authentication method (type 7)"),
             "unexpected error: {err}"
+        );
+        assert!(
+            err.contains("bsql supports: cleartext (3), MD5 (5), SCRAM-SHA-256 (10)"),
+            "missing supported methods list: {err}"
+        );
+        assert!(
+            err.contains("Your server requires method 7"),
+            "missing server method hint: {err}"
+        );
+    }
+
+    // Auth unsupported type=2 (Kerberos) shows helpful message
+    #[test]
+    fn auth_unsupported_type_2_kerberos() {
+        let payload = 2i32.to_be_bytes();
+        let result = parse_backend_message(b'R', &payload);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unsupported authentication method (type 2)"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains("GSSAPI, SSPI, or certificate auth"),
+            "missing fallback hint: {err}"
         );
     }
 

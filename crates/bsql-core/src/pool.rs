@@ -13,6 +13,35 @@ use crate::error::{BsqlError, BsqlResult};
 use crate::stream::QueryStream;
 use crate::transaction::Transaction;
 
+/// A row of text values from a raw (unvalidated) SQL query.
+///
+/// All values are strings — PostgreSQL's simple query protocol returns
+/// everything as text. Use [`get`](RawRow::get) to access columns by index.
+#[derive(Debug, Clone)]
+pub struct RawRow(Vec<Option<String>>);
+
+impl RawRow {
+    /// Get a column value by index. Returns `None` for SQL NULL.
+    pub fn get(&self, idx: usize) -> Option<&str> {
+        self.0.get(idx)?.as_deref()
+    }
+
+    /// Number of columns.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the row has no columns.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Iterate over column values.
+    pub fn iter(&self) -> impl Iterator<Item = Option<&str>> {
+        self.0.iter().map(|v| v.as_deref())
+    }
+}
+
 /// A PostgreSQL connection pool.
 ///
 /// Created via [`Pool::connect`] or [`Pool::builder`]. The pool manages a set
@@ -285,6 +314,33 @@ impl Pool {
     /// the connection from being usable.
     pub fn set_warmup_sqls(&self, sqls: &[&str]) {
         self.inner.set_warmup_sqls(sqls);
+    }
+
+    /// Execute arbitrary SQL and return text rows.
+    ///
+    /// Uses PostgreSQL's simple query protocol — all values returned as strings.
+    /// This bypasses bsql's compile-time SQL validation entirely.
+    ///
+    /// Use for DDL, ad-hoc queries, migrations, or the rare dynamic SQL that
+    /// cannot be expressed via `query!`. For type-safe queries, use `query!`.
+    pub fn raw_query(&self, sql: &str) -> BsqlResult<Vec<RawRow>> {
+        let mut guard = self.inner.acquire().map_err(BsqlError::from)?;
+        let rows = guard
+            .simple_query_rows(sql)
+            .map_err(BsqlError::from_driver_query)?;
+        Ok(rows.into_iter().map(RawRow).collect())
+    }
+
+    /// Execute arbitrary SQL without returning rows.
+    ///
+    /// Uses PostgreSQL's simple query protocol. Useful for DDL (CREATE TABLE,
+    /// ALTER, DROP), SET commands, or any statement where you don't need results.
+    pub fn raw_execute(&self, sql: &str) -> BsqlResult<()> {
+        let mut guard = self.inner.acquire().map_err(BsqlError::from)?;
+        guard
+            .simple_query(sql)
+            .map_err(BsqlError::from_driver_query)?;
+        Ok(())
     }
 
     /// Pool status metrics: idle, active, open, and max_size.
@@ -699,5 +755,50 @@ mod tests {
         assert_eq!(b.max_size, 20);
         assert_eq!(b.min_idle, Some(2));
         assert_eq!(b.replica_max_size, Some(10));
+    }
+
+    // --- RawRow ---
+
+    #[test]
+    fn raw_row_get() {
+        let row = RawRow(vec![Some("hello".into()), None, Some("42".into())]);
+        assert_eq!(row.get(0), Some("hello"));
+        assert_eq!(row.get(1), None);
+        assert_eq!(row.get(2), Some("42"));
+        assert_eq!(row.get(99), None);
+        assert_eq!(row.len(), 3);
+    }
+
+    #[test]
+    fn raw_row_is_empty() {
+        let empty = RawRow(vec![]);
+        assert!(empty.is_empty());
+        assert_eq!(empty.len(), 0);
+
+        let non_empty = RawRow(vec![Some("x".into())]);
+        assert!(!non_empty.is_empty());
+    }
+
+    #[test]
+    fn raw_row_iter() {
+        let row = RawRow(vec![Some("a".into()), None, Some("b".into())]);
+        let vals: Vec<_> = row.iter().collect();
+        assert_eq!(vals, vec![Some("a"), None, Some("b")]);
+    }
+
+    #[test]
+    fn raw_row_clone() {
+        let row = RawRow(vec![Some("hello".into()), None]);
+        let cloned = row.clone();
+        assert_eq!(cloned.get(0), Some("hello"));
+        assert_eq!(cloned.get(1), None);
+        assert_eq!(cloned.len(), 2);
+    }
+
+    #[test]
+    fn raw_row_debug() {
+        let row = RawRow(vec![Some("x".into())]);
+        let dbg = format!("{row:?}");
+        assert!(dbg.contains("RawRow"), "Debug should show RawRow: {dbg}");
     }
 }

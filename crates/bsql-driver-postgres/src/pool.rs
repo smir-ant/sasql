@@ -16,7 +16,7 @@ use crate::DriverError;
 use crate::arena::Arena;
 use crate::codec::Encode;
 use crate::conn::Connection;
-use crate::types::{Config, PgDataRow, QueryResult};
+use crate::types::{Config, PgDataRow, QueryResult, SimpleRow};
 
 // --- Pool ---
 
@@ -587,6 +587,16 @@ impl PoolGuard {
             .as_mut()
             .ok_or_else(|| DriverError::Pool("connection already taken".into()))?
             .simple_query(sql)
+    }
+
+    /// Execute a simple query and return rows as text.
+    ///
+    /// Uses PostgreSQL's simple query protocol — all values are strings.
+    pub fn simple_query_rows(&mut self, sql: &str) -> Result<Vec<SimpleRow>, DriverError> {
+        self.conn
+            .as_mut()
+            .ok_or_else(|| DriverError::Pool("connection already taken".into()))?
+            .simple_query_rows(sql)
     }
 
     /// Process each row via a closure with zero-copy `PgDataRow`.
