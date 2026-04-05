@@ -2,23 +2,23 @@
 
 Comparative benchmarks: **bsql** vs **C** vs **diesel (Rust)** vs **sqlx (Rust)** vs **Go** on PostgreSQL and SQLite.
 
-All times are mean of N iterations. Microseconds unless noted. Collected 2026-04-05.
+All times are mean of N iterations. Microseconds unless noted. Collected 2026-04-06.
 
 ## PostgreSQL
 
 | Operation | bsql | C (libpq) | diesel (Rust) | sqlx (Rust) | Go (pgx) |
 |---|---|---|---|---|---|
-| Single row by PK | **15.3 us** <kbd>x1</kbd> | 17.2 us <kbd>x1.1</kbd> | 31.5 us <kbd>x2.1</kbd> | 63.9 us <kbd>x4.2</kbd> | 36.6 us <kbd>x2.4</kbd> |
-| 10 rows | **27.7 us** <kbd>x1</kbd> | 27.1 us <kbd>x1.0</kbd> | 38.5 us <kbd>x1.4</kbd> | 87.6 us <kbd>x3.2</kbd> | 55.9 us <kbd>x2.0</kbd> |
-| 100 rows | **50.6 us** <kbd>x1</kbd> | 53.5 us <kbd>x1.1</kbd> | 79.1 us <kbd>x1.6</kbd> | 146 us <kbd>x2.9</kbd> | 87.6 us <kbd>x1.7</kbd> |
-| 1,000 rows | **332 us** <kbd>x1</kbd> | 333 us <kbd>x1.0</kbd> | 480 us <kbd>x1.4</kbd> | 597 us <kbd>x1.8</kbd> | 368 us <kbd>x1.1</kbd> |
-| 10,000 rows | **2.89 ms** <kbd>x1</kbd> | 3.13 ms <kbd>x1.1</kbd> | 6.21 ms <kbd>x2.1</kbd> | 4.55 ms <kbd>x1.6</kbd> | 3.19 ms <kbd>x1.1</kbd> |
-| Insert single | **92.5 us** <kbd>x1</kbd> | 93.1 us <kbd>x1.0</kbd> | 105 us <kbd>x1.1</kbd> | 145 us <kbd>x1.6</kbd> | 119 us <kbd>x1.3</kbd> |
-| Insert batch (100) | **899 us** <kbd>x1</kbd> | 1.83 ms <kbd>x2.0</kbd> | 3.53 ms <kbd>x3.9</kbd> | 3.18 ms <kbd>x3.5</kbd> | 4.47 ms <kbd>x5.0</kbd> |
-| JOIN + aggregate | **31.8 ms** <kbd>x1</kbd> | 31.6 ms <kbd>x1.0</kbd> | 31.6 ms <kbd>x1.0</kbd> | 32.7 ms <kbd>x1.0</kbd> | 31.7 ms <kbd>x1.0</kbd> |
-| Subquery | **123 us** <kbd>x1</kbd> | 124 us <kbd>x1.0</kbd> | 185 us <kbd>x1.5</kbd> | 310 us <kbd>x2.5</kbd> | 175 us <kbd>x1.4</kbd> |
+| Single row by PK | **15.2 us** <kbd>x1</kbd> | 15.6 us <kbd>x1.0</kbd> | 31.7 us <kbd>x2.1</kbd> | 60.5 us <kbd>x4.0</kbd> | 33.6 us <kbd>x2.2</kbd> |
+| 10 rows | **26.4 us** <kbd>x1</kbd> | 28.0 us <kbd>x1.1</kbd> | 36.8 us <kbd>x1.4</kbd> | 82.3 us <kbd>x3.1</kbd> | 53.4 us <kbd>x2.0</kbd> |
+| 100 rows | **49.5 us** <kbd>x1</kbd> | 54.5 us <kbd>x1.1</kbd> | 78.8 us <kbd>x1.6</kbd> | 138 us <kbd>x2.8</kbd> | 86.9 us <kbd>x1.8</kbd> |
+| 1,000 rows | **303 us** <kbd>x1</kbd> | 320 us <kbd>x1.1</kbd> | 529 us <kbd>x1.7</kbd> | 516 us <kbd>x1.7</kbd> | 356 us <kbd>x1.2</kbd> |
+| 10,000 rows | **2.73 ms** <kbd>x1</kbd> | 2.90 ms <kbd>x1.1</kbd> | 5.74 ms <kbd>x2.1</kbd> | 4.39 ms <kbd>x1.6</kbd> | 3.18 ms <kbd>x1.2</kbd> |
+| Insert single | **85.2 us** <kbd>x1</kbd> | 88.5 us <kbd>x1.0</kbd> | 101 us <kbd>x1.2</kbd> | 142 us <kbd>x1.7</kbd> | 134 us <kbd>x1.6</kbd> |
+| Insert batch (100) | **751 us** <kbd>x1</kbd> | 1.90 ms <kbd>x2.5</kbd> | 3.30 ms <kbd>x4.4</kbd> | 2.89 ms <kbd>x3.8</kbd> | 3.78 ms <kbd>x5.0</kbd> |
+| JOIN + aggregate | **29.9 ms** <kbd>x1</kbd> | 30.0 ms <kbd>x1.0</kbd> | 32.1 ms <kbd>x1.1</kbd> | 31.8 ms <kbd>x1.1</kbd> | 30.3 ms <kbd>x1.0</kbd> |
+| Subquery | **112 us** <kbd>x1</kbd> | 116 us <kbd>x1.0</kbd> | 182 us <kbd>x1.6</kbd> | 225 us <kbd>x2.0</kbd> | 162 us <kbd>x1.4</kbd> |
 
-All numbers measured in one sequential session using `run_pg.sh`: database reset, all 5 runners warm up PG shared buffers, CHECKPOINT, then measure each in sequence on identical hot-cache state. CHECKPOINT between INSERT-heavy runs to prevent WAL checkpoint noise.
+Each runner warms up PG cache with a full pass immediately before measuring. Double warm-up eliminates shared_buffers cold-start noise. Use `run_quick.sh` for bsql vs C, `run_pg.sh` for all 5.
 
 All benchmarks use Unix domain socket (UDS) connections to PostgreSQL. UDS eliminates the TCP network stack -- no packet framing, no congestion control, no Nagle delays -- isolating pure library performance from network noise. This applies equally to ALL libraries in the comparison (bsql, C, Go, diesel, sqlx).
 
