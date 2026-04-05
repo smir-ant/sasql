@@ -2,25 +2,25 @@
 
 Comparative benchmarks: **bsql** vs **C** vs **diesel (Rust)** vs **sqlx (Rust)** vs **Go** on PostgreSQL and SQLite.
 
-All times are median. Microseconds unless noted. Collected 2026-04-05.
+All times are mean of N iterations. Microseconds unless noted. Collected 2026-04-05.
 
 ## PostgreSQL
 
 | Operation | bsql | C (libpq) | diesel (Rust) | sqlx (Rust) | Go (pgx) |
 |---|---|---|---|---|---|
-| Single row by PK | **15.4 us** <kbd>x1</kbd> | 17.0 us <kbd>x1.1</kbd> | 28.5 us <kbd>x1.9</kbd> | 60.6 us <kbd>x3.9</kbd> | 34.9 us <kbd>x2.3</kbd> |
-| 10 rows | **27.3 us** <kbd>x1</kbd> | 29.4 us <kbd>x1.1</kbd> | 36.2 us <kbd>x1.3</kbd> | 78.4 us <kbd>x2.9</kbd> | 52.2 us <kbd>x1.9</kbd> |
-| 100 rows | **50.1 us** <kbd>x1</kbd> | 58.8 us <kbd>x1.2</kbd> | 68.7 us <kbd>x1.4</kbd> | 116 us <kbd>x2.3</kbd> | 87.0 us <kbd>x1.7</kbd> |
-| 1,000 rows | **308 us** <kbd>x1</kbd> | 386 us <kbd>x1.3</kbd> | 475 us <kbd>x1.5</kbd> | 537 us <kbd>x1.7</kbd> | 365 us <kbd>x1.2</kbd> |
-| 10,000 rows | **2.79 ms** <kbd>x1</kbd> | 3.45 ms <kbd>x1.2</kbd> | 4.53 ms <kbd>x1.6</kbd> | 4.32 ms <kbd>x1.5</kbd> | 3.04 ms <kbd>x1.1</kbd> |
-| Insert single | **89.0 us** <kbd>x1</kbd> | 99.7 us <kbd>x1.1</kbd> | 115 us <kbd>x1.3</kbd> | 152 us <kbd>x1.7</kbd> | 126 us <kbd>x1.4</kbd> |
-| Insert batch (100) | **1.02 ms** <kbd>x1</kbd> | 2.33 ms <kbd>x2.3</kbd> | 3.06 ms <kbd>x3.0</kbd> | 3.13 ms <kbd>x3.1</kbd> | 3.67 ms <kbd>x3.6</kbd> |
-| JOIN + aggregate | **40.8 ms** <kbd>x1</kbd> | 41.4 ms <kbd>x1.0</kbd> | 41.6 ms <kbd>x1.0</kbd> | 42.4 ms <kbd>x1.0</kbd> | 41.3 ms <kbd>x1.0</kbd> |
-| Subquery | **65.9 us** <kbd>x1</kbd> | 69.5 us <kbd>x1.1</kbd> | 126 us <kbd>x1.9</kbd> | 155 us <kbd>x2.4</kbd> | 100 us <kbd>x1.5</kbd> |
+| Single row by PK | **15.3 us** <kbd>x1</kbd> | 17.2 us <kbd>x1.1</kbd> | 31.5 us <kbd>x2.1</kbd> | 63.9 us <kbd>x4.2</kbd> | 36.6 us <kbd>x2.4</kbd> |
+| 10 rows | **27.7 us** <kbd>x1</kbd> | 27.1 us <kbd>x1.0</kbd> | 38.5 us <kbd>x1.4</kbd> | 87.6 us <kbd>x3.2</kbd> | 55.9 us <kbd>x2.0</kbd> |
+| 100 rows | **50.6 us** <kbd>x1</kbd> | 53.5 us <kbd>x1.1</kbd> | 79.1 us <kbd>x1.6</kbd> | 146 us <kbd>x2.9</kbd> | 87.6 us <kbd>x1.7</kbd> |
+| 1,000 rows | **332 us** <kbd>x1</kbd> | 333 us <kbd>x1.0</kbd> | 480 us <kbd>x1.4</kbd> | 597 us <kbd>x1.8</kbd> | 368 us <kbd>x1.1</kbd> |
+| 10,000 rows | **2.89 ms** <kbd>x1</kbd> | 3.13 ms <kbd>x1.1</kbd> | 6.21 ms <kbd>x2.1</kbd> | 4.55 ms <kbd>x1.6</kbd> | 3.19 ms <kbd>x1.1</kbd> |
+| Insert single | **92.5 us** <kbd>x1</kbd> | 93.1 us <kbd>x1.0</kbd> | 105 us <kbd>x1.1</kbd> | 145 us <kbd>x1.6</kbd> | 119 us <kbd>x1.3</kbd> |
+| Insert batch (100) | **899 us** <kbd>x1</kbd> | 1.83 ms <kbd>x2.0</kbd> | 3.53 ms <kbd>x3.9</kbd> | 3.18 ms <kbd>x3.5</kbd> | 4.47 ms <kbd>x5.0</kbd> |
+| JOIN + aggregate | **31.8 ms** <kbd>x1</kbd> | 31.6 ms <kbd>x1.0</kbd> | 31.6 ms <kbd>x1.0</kbd> | 32.7 ms <kbd>x1.0</kbd> | 31.7 ms <kbd>x1.0</kbd> |
+| Subquery | **123 us** <kbd>x1</kbd> | 124 us <kbd>x1.0</kbd> | 185 us <kbd>x1.5</kbd> | 310 us <kbd>x2.5</kbd> | 175 us <kbd>x1.4</kbd> |
 
-All numbers measured in one sequential session (C, Go, Rust in quick succession), same PG server state, same machine load.
+All numbers measured in one sequential session using `run_pg.sh`: database reset, all 5 runners warm up PG shared buffers, CHECKPOINT, then measure each in sequence on identical hot-cache state. CHECKPOINT between INSERT-heavy runs to prevent WAL checkpoint noise.
 
-All benchmarks use Unix domain socket (UDS) connections to PostgreSQL. UDS eliminates the TCP network stack -- no packet framing, no congestion control, no Nagle delays -- isolating pure library performance from network noise. This applies equally to ALL libraries in the comparison (bsql, C, Go, diesel, sqlx). For TCP benchmarks, see the methodology section.
+All benchmarks use Unix domain socket (UDS) connections to PostgreSQL. UDS eliminates the TCP network stack -- no packet framing, no congestion control, no Nagle delays -- isolating pure library performance from network noise. This applies equally to ALL libraries in the comparison (bsql, C, Go, diesel, sqlx).
 
 ## SQLite
 
@@ -69,11 +69,11 @@ Standalone binaries that each connect to PostgreSQL and run 10,000 SELECT querie
 
 | Library | Peak RSS | vs bsql |
 |---|---|---|
-| **bsql** | **2.2 MB** | <kbd>x1</kbd> |
-| sqlx (Rust) | 7.1 MB | <kbd>x3.3</kbd> |
-| diesel (Rust) | 7.3 MB | <kbd>x3.4</kbd> |
-| C (libpq) | 8.6 MB | <kbd>x4.0</kbd> |
-| Go (pgx) | 15.0 MB | <kbd>x6.9</kbd> |
+| **bsql** | **1.47 MB** | <kbd>x1</kbd> |
+| C (libpq) | 6.50 MB | <kbd>x4.4</kbd> |
+| sqlx (Rust) | 6.59 MB | <kbd>x4.5</kbd> |
+| diesel (Rust) | 6.97 MB | <kbd>x4.7</kbd> |
+| Go (pgx) | 16.8 MB | <kbd>x11.4</kbd> |
 
 Run the memory benchmarks:
 ```bash
@@ -106,26 +106,27 @@ export BENCH_SQLITE_PATH=bench.db
 
 ### Run all benchmarks
 ```bash
-# Rust (bsql, sqlx, diesel)
-cargo bench
+# Build everything
+cargo build --release --bin bench_bsql_perf --bin bench_diesel_perf --bin bench_sqlx_perf
+(cd c && make all)
 
-# C
-cd c && make all
-BENCH_DATABASE_URL="host=/tmp dbname=bench_db" ./pg_bench
-BENCH_SQLITE_PATH=../bench.db ./sqlite_bench
+# PostgreSQL — fair comparison (all 5 runners, equal conditions)
+BENCH_DATABASE_URL="host=/tmp dbname=bench_db" \
+BSQL_DATABASE_URL="postgres://YOUR_USER@localhost/bench_db?host=/tmp" \
+./run_pg.sh
 
-# Go
-cd go
-BENCH_DATABASE_URL="host=/tmp dbname=bench_db" go run ./pg/
-BENCH_SQLITE_PATH=../bench.db go run ./sqlite/
+# SQLite
+BENCH_SQLITE_PATH=bench.db cargo bench --bench sqlite_fetch_one --bench sqlite_fetch_many --bench sqlite_insert --bench sqlite_complex
+(cd c && BENCH_SQLITE_PATH=../bench.db ./sqlite_bench)
+(cd go && BENCH_SQLITE_PATH=../bench.db go run ./sqlite/)
 
 # Memory (peak RSS)
+BENCH_DATABASE_URL="host=/tmp dbname=bench_db" \
+BSQL_DATABASE_URL="postgres://YOUR_USER@localhost/bench_db?host=/tmp" \
 ./mem/run_all.sh
 ```
 
-Run C, Go, and Rust benchmarks in quick succession (all within ~5 minutes) to ensure consistent PG server state. PG background maintenance (autovacuum, checkpoints) can add 10-50% variance to INSERT and complex queries.
-
-Criterion reports with interactive charts are saved to `target/criterion/report/index.html`.
+`run_pg.sh` handles database reset, cache warm-up, and CHECKPOINT between runs automatically.
 
 ## Machine
 
@@ -133,20 +134,29 @@ Apple M1 Pro (10-core), 16 GB RAM, macOS Darwin 25.0.0, Rust 1.96.0-nightly, Go 
 
 ## Methodology
 
-Each Rust benchmark uses Criterion (100 samples x ~1,000 iterations per sample). For volatile operations (INSERT, JOIN), results vary +/-10-15% between runs due to PostgreSQL server state (WAL checkpointing, background writer, kernel scheduling). Numbers in the tables represent a single Criterion run. For the most accurate comparison, run all benchmarks in sequence on an idle system.
+All 5 runners (bsql, C, Go, diesel, sqlx) use **identical methodology**: N iterations, total time, mean per-op. No framework-specific harness (no Criterion for cross-language numbers). This ensures direct apples-to-apples comparison.
 
-All benchmarks run in the same process and share the same database connection conditions. The order is: fetch_one, fetch_many, insert, complex. This ensures consistent PG server state across libraries within each benchmark category.
+**Noise reduction:**
+- Autovacuum disabled on bench tables (`ALTER TABLE SET (autovacuum_enabled = false)`)
+- `ANALYZE` run before benchmarks for optimal query plans
+- `CHECKPOINT` before and between INSERT-heavy runs to prevent WAL checkpoint noise
+- All 5 runners warm up PG shared buffers before any measurement
+- UDS connections eliminate TCP stack noise
+- JOIN + aggregate uses 3,000 iterations (other operations: 10,000) for lower variance
 
-Every benchmark implementation (Rust, C, Go) does identical work per iteration:
+**Iteration counts:**
+- fetch_one, fetch_many (10/100/1000), INSERT single: 10,000 iterations
+- fetch_many (10000), INSERT batch, JOIN + aggregate: 1,000-3,000 iterations
+- Subquery: 5,000 iterations
 
-1. Send the prepared query with parameters.
+Every benchmark implementation does identical work per iteration:
+
+1. Send the prepared query with parameters (binary protocol for bsql and C).
 2. Receive all rows from the server/engine.
-3. Read every column of every row into local variables (preventing dead-code elimination).
-4. Discard the row immediately -- no materialization into a Vec/slice/array.
+3. Read every column of every row (preventing dead-code elimination).
+4. bsql's `fetch()` returns zero-copy borrowed rows (`&str` fields), matching C's `PQgetvalue` (returns `char*` pointer). Both return references without heap allocation.
 
-Rust `fetch_all` materializes into a `Vec`, but the allocation cost is included in its measurement -- that is the API users actually call. C calls `PQgetvalue` / `sqlite3_column_*` for each column. Go calls `rows.Scan(...)` into stack locals.
-
-INSERT benchmarks grow the database over time. Re-run `setup/pg_setup.sql` or `setup/sqlite_setup.sql` to reset between runs. The C and Go benchmarks run 1,000-10,000 iterations with nanosecond-precision timing (`mach_absolute_time` on macOS for C, `time.Now()` for Go).
+INSERT benchmarks grow the database over time. Re-run `setup/pg_setup.sql` or `setup/sqlite_setup.sql` to reset between runs (or use `run_pg.sh` which handles this automatically).
 
 ## Library Notes
 
