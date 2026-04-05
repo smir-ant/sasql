@@ -174,7 +174,7 @@ func benchJoinAggregate(ctx context.Context, conn *pgx.Conn) {
 	}
 	rows.Close()
 
-	iters := 1000
+	iters := 3000
 	start := time.Now()
 	for _ = range iters {
 		rows, _ := conn.Query(ctx, sql)

@@ -8,6 +8,7 @@ use diesel::sql_types::{BigInt, Bool, Double, Integer, Text};
 
 const ITERATIONS: usize = 10000;
 const ITERATIONS_SLOW: usize = 1000;
+const ITERATIONS_JOIN: usize = 3000;
 const ITERATIONS_SUB: usize = 5000;
 
 #[derive(QueryableByName, Debug)]
@@ -140,11 +141,11 @@ fn main() {
         let _ = diesel::sql_query(sql).load::<JoinRow>(&mut conn).unwrap();
 
         let start = Instant::now();
-        for _ in 0..ITERATIONS_SLOW {
+        for _ in 0..ITERATIONS_JOIN {
             let _ = diesel::sql_query(sql).load::<JoinRow>(&mut conn).unwrap();
         }
         let elapsed = start.elapsed();
-        println!("pg_join_aggregate:  {} ns/op  ({} iters)", elapsed.as_nanos() / ITERATIONS_SLOW as u128, ITERATIONS_SLOW);
+        println!("pg_join_aggregate:  {} ns/op  ({} iters)", elapsed.as_nanos() / ITERATIONS_JOIN as u128, ITERATIONS_JOIN);
     }
 
     // subquery

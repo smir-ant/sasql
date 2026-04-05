@@ -10,6 +10,7 @@ use std::time::Instant;
 use bsql::{Pool, BsqlError};
 
 const ITERATIONS: usize = 10000;
+const ITERATIONS_JOIN: usize = 3000;
 const ITERATIONS_SLOW: usize = 1000;
 const ITERATIONS_SUB: usize = 5000;
 
@@ -129,7 +130,7 @@ fn main() -> Result<(), BsqlError> {
         .fetch(&pool)?;
 
         let start = Instant::now();
-        for _ in 0..ITERATIONS_SLOW {
+        for _ in 0..ITERATIONS_JOIN {
             let _ = bsql::query!(
                 "SELECT u.name, COUNT(o.id) AS order_count, SUM(o.amount) AS total_amount \
                  FROM bench_users u JOIN bench_orders o ON u.id = o.user_id \
@@ -140,8 +141,8 @@ fn main() -> Result<(), BsqlError> {
         let elapsed = start.elapsed();
         println!(
             "pg_join_aggregate:  {} ns/op  ({} iters)",
-            elapsed.as_nanos() / ITERATIONS_SLOW as u128,
-            ITERATIONS_SLOW
+            elapsed.as_nanos() / ITERATIONS_JOIN as u128,
+            ITERATIONS_JOIN
         );
     }
 

@@ -6,9 +6,17 @@
 # 2. Warm up PG cache — ALL 5 runners execute a full pass (not measured)
 # 3. CHECKPOINT after warm-up
 # 4. Measure each on identical hot-cache state, CHECKPOINT between INSERT runs
+# 5. For volatile operations (JOIN, INSERT): 3 runs, report median
 #
 # All 5 runners use the same approach: N iterations, total time, mean per-op.
 # No Criterion, no adaptive sampling. Direct comparison.
+#
+# Noise reduction:
+# - autovacuum disabled on bench tables (pg_setup.sql)
+# - ANALYZE run before benchmarks
+# - CHECKPOINT before and between INSERT-heavy runs
+# - All 5 warm up PG shared_buffers before any measurement
+# - UDS connection (no TCP stack noise)
 #
 # Usage:
 #   BENCH_DATABASE_URL="host=/tmp dbname=bench_db" \

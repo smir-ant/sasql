@@ -226,7 +226,7 @@ static void bench_join_aggregate(PGconn *conn) {
     die_if_bad(conn, warm, PGRES_TUPLES_OK);
     PQclear(warm);
 
-    int iters = 1000;
+    int iters = 3000;
     uint64_t start = now_ns();
     for (int i = 0; i < iters; i++) {
         PGresult *res = PQexecPrepared(conn, "join_agg", 0, NULL, NULL, NULL, 0);

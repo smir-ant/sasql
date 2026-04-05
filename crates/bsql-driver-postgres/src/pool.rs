@@ -731,7 +731,8 @@ impl Drop for PoolGuard {
                 return;
             }
 
-            // Stamp the last-used time once on pool return
+            // Stamp last-used time for idle connection tracking.
+            // Instant::now() is ~20ns (macOS mach_absolute_time).
             conn.touch();
 
             // Return to pool

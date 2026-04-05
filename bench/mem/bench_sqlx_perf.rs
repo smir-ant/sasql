@@ -5,6 +5,7 @@ use std::time::Instant;
 
 const ITERATIONS: usize = 10000;
 const ITERATIONS_SLOW: usize = 1000;
+const ITERATIONS_JOIN: usize = 3000;
 const ITERATIONS_SUB: usize = 5000;
 
 fn main() {
@@ -120,13 +121,13 @@ fn main() {
         });
 
         let start = Instant::now();
-        for _ in 0..ITERATIONS_SLOW {
+        for _ in 0..ITERATIONS_JOIN {
             rt.block_on(async {
                 let _: Vec<(String, i64, f64)> = sqlx::query_as(sql).fetch_all(&pool).await.unwrap();
             });
         }
         let elapsed = start.elapsed();
-        println!("pg_join_aggregate:  {} ns/op  ({} iters)", elapsed.as_nanos() / ITERATIONS_SLOW as u128, ITERATIONS_SLOW);
+        println!("pg_join_aggregate:  {} ns/op  ({} iters)", elapsed.as_nanos() / ITERATIONS_JOIN as u128, ITERATIONS_JOIN);
     }
 
     // subquery
