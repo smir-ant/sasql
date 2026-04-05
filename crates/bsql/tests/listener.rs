@@ -63,7 +63,9 @@ fn unlisten_stops_receiving() {
     listener.unlisten("unlisten_test").unwrap();
 
     // Send a notification -- should NOT be received since we unlistened
-    listener.notify("unlisten_test", "should_not_arrive").unwrap();
+    listener
+        .notify("unlisten_test", "should_not_arrive")
+        .unwrap();
 
     // Listen on a different channel and send there to prove recv works
     listener.listen("unlisten_control").unwrap();
@@ -238,8 +240,7 @@ fn channel_name_sql_injection_attempt() {
     if result.is_ok() {
         // Verify users table still exists
         let pool = bsql::Pool::connect(DB_URL).unwrap();
-        let users = bsql::query!("SELECT id FROM users LIMIT 1")
-            .fetch_optional(&pool);
+        let users = bsql::query!("SELECT id FROM users LIMIT 1").fetch_optional(&pool);
         assert!(users.is_ok(), "users table should still exist");
     }
     // If it errored, that's also fine -- the point is no injection

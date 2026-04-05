@@ -76,9 +76,7 @@ pub fn did_you_mean<'a>(target: &str, candidates: &[&'a str]) -> Option<&'a str>
 ///
 /// Returns schema-qualified names for non-public schemas and unqualified
 /// names for public schema tables.
-pub fn fetch_table_names(
-    conn: &mut bsql_driver_postgres::Connection,
-) -> Vec<String> {
+pub fn fetch_table_names(conn: &mut bsql_driver_postgres::Connection) -> Vec<String> {
     let query = "SELECT table_schema, table_name FROM information_schema.tables \
                  WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
                  ORDER BY table_schema, table_name";

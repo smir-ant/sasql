@@ -57,8 +57,7 @@ fn concurrent_identical_queries_all_succeed() {
     for _ in 0..10 {
         let pool = Arc::clone(&pool);
         handles.push(std::thread::spawn(move || {
-            bsql::query!("SELECT id, login FROM users ORDER BY id")
-                .fetch_all(pool.as_ref())
+            bsql::query!("SELECT id, login FROM users ORDER BY id").fetch_all(pool.as_ref())
         }));
     }
 
@@ -142,8 +141,7 @@ fn queries_work_after_concurrent_burst() {
     for _ in 0..20 {
         let pool = Arc::clone(&pool);
         handles.push(std::thread::spawn(move || {
-            bsql::query!("SELECT id, login FROM users ORDER BY id")
-                .fetch_all(pool.as_ref())
+            bsql::query!("SELECT id, login FROM users ORDER BY id").fetch_all(pool.as_ref())
         }));
     }
 
@@ -185,14 +183,12 @@ fn different_queries_are_independent() {
 
     let pool1 = Arc::clone(&pool);
     let h1 = std::thread::spawn(move || {
-        bsql::query!("SELECT id, login FROM users ORDER BY id")
-            .fetch_all(pool1.as_ref())
+        bsql::query!("SELECT id, login FROM users ORDER BY id").fetch_all(pool1.as_ref())
     });
 
     let pool2 = Arc::clone(&pool);
     let h2 = std::thread::spawn(move || {
-        bsql::query!("SELECT id FROM tickets ORDER BY id")
-            .fetch_all(pool2.as_ref())
+        bsql::query!("SELECT id FROM tickets ORDER BY id").fetch_all(pool2.as_ref())
     });
 
     let users = h1.join().expect("thread panicked").unwrap();

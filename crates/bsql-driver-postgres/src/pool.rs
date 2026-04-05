@@ -1181,8 +1181,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn pool_is_uds_true_for_var_run_socket() {
-        let pool =
-            Pool::connect("postgres://user@localhost/db?host=/var/run/postgresql").unwrap();
+        let pool = Pool::connect("postgres://user@localhost/db?host=/var/run/postgresql").unwrap();
         assert!(pool.is_uds());
     }
 

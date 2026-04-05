@@ -106,8 +106,7 @@ fn simple_query_set() {
     let config = Config::from_url(&url).unwrap();
     let mut conn = Connection::connect(&config).unwrap();
 
-    conn.simple_query("SET statement_timeout = '5s'")
-        .unwrap();
+    conn.simple_query("SET statement_timeout = '5s'").unwrap();
 }
 
 // --- Prepared query tests ---
@@ -232,9 +231,7 @@ fn query_statement_cache_hit() {
     let hash = hash_sql(sql);
 
     // First call: Parse+Bind+Execute
-    let r1 = conn
-        .query(sql, hash, &[&1i32, &2i32], &mut arena)
-        .unwrap();
+    let r1 = conn.query(sql, hash, &[&1i32, &2i32], &mut arena).unwrap();
     assert_eq!(r1.row(0, &arena).get_i32(0), Some(3));
 
     // Second call: cache hit, only Bind+Execute
@@ -280,9 +277,7 @@ fn query_insert_returning() {
 
     let sql = "INSERT INTO _driver_test_ret (name) VALUES ($1::text) RETURNING id, name";
     let hash = hash_sql(sql);
-    let result = conn
-        .query(sql, hash, &[&"alice"], &mut arena)
-        .unwrap();
+    let result = conn.query(sql, hash, &[&"alice"], &mut arena).unwrap();
 
     assert_eq!(result.len(), 1);
     let row = result.row(0, &arena);
@@ -322,9 +317,7 @@ fn query_large_text() {
     let big = "x".repeat(1_000_000);
     let sql = "SELECT $1::text AS big";
     let hash = hash_sql(sql);
-    let result = conn
-        .query(sql, hash, &[&big.as_str()], &mut arena)
-        .unwrap();
+    let result = conn.query(sql, hash, &[&big.as_str()], &mut arena).unwrap();
 
     assert_eq!(result.len(), 1);
     let row = result.row(0, &arena);
@@ -750,8 +743,7 @@ fn error_simple_query_reports_server_error() {
     let config = Config::from_url(&url).unwrap();
     let mut conn = Connection::connect(&config).unwrap();
 
-    let result = conn
-        .simple_query("SELECT * FROM _nonexistent_table_xyz");
+    let result = conn.simple_query("SELECT * FROM _nonexistent_table_xyz");
 
     match result {
         Err(DriverError::Server { code, .. }) => {
@@ -919,16 +911,12 @@ fn codec_empty_string_and_max_i64() {
     arena.reset();
     let sql2 = "SELECT $1::int8 AS val";
     let hash2 = hash_sql(sql2);
-    let result = conn
-        .query(sql2, hash2, &[&i64::MAX], &mut arena)
-        .unwrap();
+    let result = conn.query(sql2, hash2, &[&i64::MAX], &mut arena).unwrap();
     assert_eq!(result.row(0, &arena).get_i64(0), Some(i64::MAX));
 
     // Min i64
     arena.reset();
-    let result = conn
-        .query(sql2, hash2, &[&i64::MIN], &mut arena)
-        .unwrap();
+    let result = conn.query(sql2, hash2, &[&i64::MIN], &mut arena).unwrap();
     assert_eq!(result.row(0, &arena).get_i64(0), Some(i64::MIN));
 }
 
@@ -1066,9 +1054,7 @@ fn streaming_1000_rows() {
     let sql = "SELECT generate_series(1, 1000) AS n";
     let hash = hash_sql(sql);
 
-    let (columns, _) = conn
-        .query_streaming_start(sql, hash, &[], 64)
-        .unwrap();
+    let (columns, _) = conn.query_streaming_start(sql, hash, &[], 64).unwrap();
     assert_eq!(columns.len(), 1);
 
     let mut total_rows = 0;
@@ -1127,9 +1113,7 @@ fn streaming_chunk_boundary_exact() {
     let sql = "SELECT generate_series(1, 64) AS n";
     let hash = hash_sql(sql);
 
-    let (columns, _) = conn
-        .query_streaming_start(sql, hash, &[], 64)
-        .unwrap();
+    let (columns, _) = conn.query_streaming_start(sql, hash, &[], 64).unwrap();
 
     let num_cols = columns.len();
     let mut col_offsets: Vec<(usize, i32)> = Vec::new();
@@ -1170,9 +1154,7 @@ fn streaming_zero_rows() {
     let sql = "SELECT 1 AS n WHERE false";
     let hash = hash_sql(sql);
 
-    let (columns, _) = conn
-        .query_streaming_start(sql, hash, &[], 64)
-        .unwrap();
+    let (columns, _) = conn.query_streaming_start(sql, hash, &[], 64).unwrap();
 
     let num_cols = columns.len();
     let mut col_offsets: Vec<(usize, i32)> = Vec::new();
@@ -1199,9 +1181,7 @@ fn streaming_single_row() {
     let sql = "SELECT 42::int4 AS n";
     let hash = hash_sql(sql);
 
-    let (columns, _) = conn
-        .query_streaming_start(sql, hash, &[], 64)
-        .unwrap();
+    let (columns, _) = conn.query_streaming_start(sql, hash, &[], 64).unwrap();
 
     let num_cols = columns.len();
     let mut col_offsets: Vec<(usize, i32)> = Vec::new();
@@ -1232,9 +1212,7 @@ fn streaming_early_drop() {
     let sql = "SELECT generate_series(1, 200) AS n";
     let hash = hash_sql(sql);
 
-    let (_, _) = guard
-        .query_streaming_start(sql, hash, &[], 64)
-        .unwrap();
+    let (_, _) = guard.query_streaming_start(sql, hash, &[], 64).unwrap();
 
     let mut col_offsets: Vec<(usize, i32)> = Vec::new();
     let more = guard
@@ -1340,9 +1318,7 @@ fn defer_execute_commit_auto_flushes() {
     let mut arena = Arena::new();
     let count_sql = "SELECT count(*)::int4 AS c FROM users WHERE login LIKE 'defer_commit_%'";
     let count_hash = hash_sql(count_sql);
-    let result = conn
-        .query(count_sql, count_hash, &[], &mut arena)
-        .unwrap();
+    let result = conn.query(count_sql, count_hash, &[], &mut arena).unwrap();
     let row = result.row(0, &arena);
     assert_eq!(row.get_i32(0), Some(5));
 
@@ -1450,9 +1426,7 @@ fn defer_execute_100_inserts() {
     let mut arena = Arena::new();
     let count_sql = "SELECT count(*)::int4 AS c FROM users WHERE login LIKE 'defer_100_%'";
     let count_hash = hash_sql(count_sql);
-    let result = conn
-        .query(count_sql, count_hash, &[], &mut arena)
-        .unwrap();
+    let result = conn.query(count_sql, count_hash, &[], &mut arena).unwrap();
     let row = result.row(0, &arena);
     assert_eq!(row.get_i32(0), Some(100));
 
@@ -1505,9 +1479,7 @@ fn defer_execute_mixed_with_regular_execute() {
     let mut arena = Arena::new();
     let count_sql = "SELECT count(*)::int4 AS c FROM users WHERE login LIKE 'defer_mixed_%'";
     let count_hash = hash_sql(count_sql);
-    let result = conn
-        .query(count_sql, count_hash, &[], &mut arena)
-        .unwrap();
+    let result = conn.query(count_sql, count_hash, &[], &mut arena).unwrap();
     let row = result.row(0, &arena);
     assert_eq!(row.get_i32(0), Some(3));
 
@@ -1540,9 +1512,7 @@ fn defer_execute_rollback_discards_deferred() {
     let mut arena = Arena::new();
     let count_sql = "SELECT count(*)::int4 AS c FROM users WHERE login = 'defer_rollback'";
     let count_hash = hash_sql(count_sql);
-    let result = conn
-        .query(count_sql, count_hash, &[], &mut arena)
-        .unwrap();
+    let result = conn.query(count_sql, count_hash, &[], &mut arena).unwrap();
     let row = result.row(0, &arena);
     assert_eq!(row.get_i32(0), Some(0));
 }
@@ -1611,8 +1581,7 @@ fn defer_execute_param_count_exceeds_max() {
     // Build a param list that exceeds i16::MAX
     let too_many: Vec<&(dyn bsql_driver_postgres::Encode + Sync)> =
         vec![&1i32 as &(dyn bsql_driver_postgres::Encode + Sync); 32768];
-    let result = tx
-        .defer_execute("SELECT 1", hash_sql("SELECT 1"), &too_many);
+    let result = tx.defer_execute("SELECT 1", hash_sql("SELECT 1"), &too_many);
     assert!(result.is_err());
     match result.unwrap_err() {
         DriverError::Protocol(msg) => {

@@ -51,15 +51,13 @@ pub fn try_upgrade(
     match response[0] {
         b'S' => {
             // Server accepts TLS — perform handshake
-            let server_name = rustls::pki_types::ServerName::try_from(host.to_owned())
-                .map_err(|e| {
+            let server_name =
+                rustls::pki_types::ServerName::try_from(host.to_owned()).map_err(|e| {
                     DriverError::Protocol(format!("invalid TLS server name '{host}': {e}"))
                 })?;
 
-            let tls_conn =
-                rustls::ClientConnection::new(TLS_CONFIG.clone(), server_name).map_err(|e| {
-                    DriverError::Io(std::io::Error::other(e))
-                })?;
+            let tls_conn = rustls::ClientConnection::new(TLS_CONFIG.clone(), server_name)
+                .map_err(|e| DriverError::Io(std::io::Error::other(e)))?;
 
             Ok(rustls::StreamOwned::new(tls_conn, tcp))
         }

@@ -19,11 +19,11 @@ use crate::arena::Arena;
 use crate::auth;
 use crate::codec::Encode;
 use crate::proto::{self, BackendMessage};
-use crate::stmt_cache::{build_bind_template, make_stmt_name, StmtCache, StmtInfo};
+use crate::stmt_cache::{StmtCache, StmtInfo, build_bind_template, make_stmt_name};
 use crate::sync_io::Stream;
 use crate::types::{
-    ColumnDesc, Config, Notification, PgDataRow, PrepareResult, QueryResult, SimpleRow,
-    SslMode, StartupAction,
+    ColumnDesc, Config, Notification, PgDataRow, PrepareResult, QueryResult, SimpleRow, SslMode,
+    StartupAction,
 };
 
 // --- Connection ---
@@ -148,8 +148,8 @@ impl Connection {
                                     return Err(e);
                                 }
                                 // Prefer mode: reconnect without TLS
-                                let tcp = std::net::TcpStream::connect(&addr)
-                                    .map_err(DriverError::Io)?;
+                                let tcp =
+                                    std::net::TcpStream::connect(&addr).map_err(DriverError::Io)?;
                                 tcp.set_nodelay(true).map_err(DriverError::Io)?;
                                 let stream = Stream::Tcp(tcp);
                                 stream.set_keepalive()?;
@@ -3396,7 +3396,10 @@ mod tests {
         let config = Config::from_url("postgres://postgres@localhost/postgres?host=/tmp").unwrap();
         let conn = Connection::connect(&config).unwrap();
         let params = conn.server_params();
-        assert!(!params.is_empty(), "server should send parameters during startup");
+        assert!(
+            !params.is_empty(),
+            "server should send parameters during startup"
+        );
         // server_encoding should be present
         assert!(
             conn.parameter("server_encoding").is_some(),

@@ -165,10 +165,7 @@ pub(crate) struct BindTemplate {
 /// Parses the Bind message to locate each parameter's data offset and length.
 /// Appends EXECUTE_SYNC to the template bytes so the hot path is a single memcpy.
 /// Returns `None` if the message cannot be parsed.
-pub(crate) fn build_bind_template(
-    write_buf: &[u8],
-    param_count: usize,
-) -> Option<BindTemplate> {
+pub(crate) fn build_bind_template(write_buf: &[u8], param_count: usize) -> Option<BindTemplate> {
     if write_buf.is_empty() || write_buf[0] != b'B' {
         return None;
     }

@@ -137,8 +137,7 @@ impl Transaction {
         let sql = format!("SAVEPOINT {name}");
         let mut guard = self.inner.lock().unwrap();
         let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
-        tx.simple_query(&sql)
-            .map_err(BsqlError::from_driver_query)
+        tx.simple_query(&sql).map_err(BsqlError::from_driver_query)
     }
 
     /// Release (destroy) a savepoint, keeping its effects.
@@ -149,8 +148,7 @@ impl Transaction {
         let sql = format!("RELEASE SAVEPOINT {name}");
         let mut guard = self.inner.lock().unwrap();
         let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
-        tx.simple_query(&sql)
-            .map_err(BsqlError::from_driver_query)
+        tx.simple_query(&sql).map_err(BsqlError::from_driver_query)
     }
 
     /// Roll back to a savepoint, undoing changes made after it was created.
@@ -161,8 +159,7 @@ impl Transaction {
         let sql = format!("ROLLBACK TO SAVEPOINT {name}");
         let mut guard = self.inner.lock().unwrap();
         let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
-        tx.simple_query(&sql)
-            .map_err(BsqlError::from_driver_query)
+        tx.simple_query(&sql).map_err(BsqlError::from_driver_query)
     }
 
     /// Set the isolation level for this transaction.
@@ -174,8 +171,7 @@ impl Transaction {
         let sql = format!("SET TRANSACTION ISOLATION LEVEL {}", level.as_sql());
         let mut guard = self.inner.lock().unwrap();
         let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
-        tx.simple_query(&sql)
-            .map_err(BsqlError::from_driver_query)
+        tx.simple_query(&sql).map_err(BsqlError::from_driver_query)
     }
 
     /// Execute a query within the transaction (used by Executor impl).
@@ -261,8 +257,7 @@ impl Transaction {
     pub fn flush_deferred(&self) -> BsqlResult<Vec<u64>> {
         let mut guard = self.inner.lock().unwrap();
         let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
-        tx.flush_deferred()
-            .map_err(BsqlError::from_driver_query)
+        tx.flush_deferred().map_err(BsqlError::from_driver_query)
     }
 
     /// Number of operations currently buffered for deferred execution.

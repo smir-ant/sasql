@@ -125,8 +125,7 @@ fn delete_execute() {
 fn fetch_one_zero_rows_errors() {
     let pool = pool();
     let id = 999999i32;
-    let result = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
-        .fetch_one(&pool);
+    let result = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32").fetch_one(&pool);
 
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -278,8 +277,8 @@ fn param_reuse_in_real_query() {
 fn fetch_optional_multiple_rows_errors() {
     let pool = pool();
     // users table has 2+ rows with active=true -- fetch_optional must error
-    let result = bsql::query!("SELECT id, login FROM users WHERE active = true")
-        .fetch_optional(&pool);
+    let result =
+        bsql::query!("SELECT id, login FROM users WHERE active = true").fetch_optional(&pool);
 
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -369,8 +368,7 @@ fn pool_builder_url_method() {
 #[test]
 fn fetch_one_multiple_rows_errors() {
     let pool = pool();
-    let result = bsql::query!("SELECT id, login FROM users WHERE active = true")
-        .fetch_one(&pool);
+    let result = bsql::query!("SELECT id, login FROM users WHERE active = true").fetch_one(&pool);
 
     assert!(result.is_err());
     match result.unwrap_err() {

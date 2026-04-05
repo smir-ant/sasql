@@ -127,7 +127,7 @@ impl std::fmt::Debug for Listener {
         let active = self
             ._thread_handle
             .as_ref()
-            .map_or(false, |h| !h.is_finished());
+            .is_some_and(|h| !h.is_finished());
         f.debug_struct("Listener")
             .field("active", &active)
             .field("channels", &channel_count)
@@ -467,10 +467,7 @@ fn drive_listener(
 /// `read_one_message` auto-buffers NotificationResponse messages in
 /// `pending_notifications` instead of returning them — so after any command
 /// that calls `simple_query`, self-notifications would be silently lost.
-fn drain_pending(
-    conn: &mut bsql_driver_postgres::Connection,
-    notif_tx: &SyncSender<Notification>,
-) {
+fn drain_pending(conn: &mut bsql_driver_postgres::Connection, notif_tx: &SyncSender<Notification>) {
     for notif in conn.drain_notifications() {
         let _ = notif_tx.try_send(Notification {
             channel: notif.channel,

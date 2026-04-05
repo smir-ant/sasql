@@ -55,12 +55,12 @@ mod tls_sync;
 
 pub use arena::Arena;
 pub use codec::Encode;
+pub use conn::Connection;
 pub use pool::{Pool, PoolBuilder, PoolGuard, PoolStatus, Transaction};
 pub use types::{
-    hash_sql, ColumnDesc, Config, Notification, PgDataRow, PrepareResult, QueryResult, Row,
-    SimpleRow, SslMode,
+    ColumnDesc, Config, Notification, PgDataRow, PrepareResult, QueryResult, Row, SimpleRow,
+    SslMode, hash_sql,
 };
-pub use conn::Connection;
 
 // --- DriverError ---
 

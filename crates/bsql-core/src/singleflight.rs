@@ -151,10 +151,7 @@ impl Singleflight {
     pub fn wait_for_result(state: &FlightState) -> Option<SharedResult> {
         let mut guard = state.result.lock().unwrap_or_else(|e| e.into_inner());
         while guard.is_none() {
-            guard = state
-                .condvar
-                .wait(guard)
-                .unwrap_or_else(|e| e.into_inner());
+            guard = state.condvar.wait(guard).unwrap_or_else(|e| e.into_inner());
             // Check if the leader was dropped without completing — the condvar
             // was notified but result is still None. In that case, the leader's
             // Drop impl has removed the key from the map. We break out and
@@ -338,9 +335,7 @@ mod tests {
             _ => panic!("expected follower"),
         };
 
-        let handle = std::thread::spawn(move || {
-            Singleflight::wait_for_result(&follower_state)
-        });
+        let handle = std::thread::spawn(move || Singleflight::wait_for_result(&follower_state));
 
         let err = BsqlError::from(bsql_driver_postgres::DriverError::Pool("test".into()));
         leader.complete(&sf, Arc::new(Err(err)));
