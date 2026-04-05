@@ -5,7 +5,6 @@
 //! from `pg_catalog`.
 
 use smallvec::SmallVec;
-use tokio::runtime::Runtime;
 
 use bsql_driver_postgres::{ColumnDesc, Connection, DriverError};
 
@@ -51,48 +50,39 @@ pub struct ValidationResult {
 /// 3. Returns column metadata and parameter types
 pub fn validate_query(
     parsed: &ParsedQuery,
-    rt: &Runtime,
-    conn: &mut Connection,
-) -> Result<ValidationResult, String> {
-    rt.block_on(validate_async(parsed, conn))
-}
-
-async fn validate_async(
-    parsed: &ParsedQuery,
     conn: &mut Connection,
 ) -> Result<ValidationResult, String> {
     // Prepare the query — this validates syntax, tables, columns, types.
     let result = conn
         .prepare_describe(&parsed.positional_sql)
-        .await
         .map_err(|e| format_driver_error(&e, parsed))?;
 
     // Extract parameter type OIDs
     let param_pg_oids: SmallVec<[u32; 8]> = result.param_oids.iter().copied().collect();
 
     // Detect PG enums by querying pg_type.typtype for each parameter OID.
-    let param_is_pg_enum = detect_pg_enums(conn, &result.param_oids).await;
+    let param_is_pg_enum = detect_pg_enums(conn, &result.param_oids);
 
-    let columns = build_columns(conn, &result.columns).await?;
+    let columns = build_columns(conn, &result.columns)?;
 
     Ok(ValidationResult {
         columns,
         param_pg_oids,
         param_is_pg_enum,
         #[cfg(feature = "explain")]
-        explain_plan: fetch_explain_plan(conn, parsed).await,
+        explain_plan: fetch_explain_plan(conn, parsed),
     })
 }
 
 /// Resolve column metadata (name, type, nullability) from a prepared statement.
-async fn build_columns(
+fn build_columns(
     conn: &mut Connection,
     pg_columns: &[ColumnDesc],
 ) -> Result<Vec<ColumnInfo>, String> {
-    let nullable_flags = resolve_nullability_batch(conn, pg_columns).await;
+    let nullable_flags = resolve_nullability_batch(conn, pg_columns);
 
     // Detect which columns are PG enum types (for the enum error message).
-    let enum_flags = detect_column_enums(conn, pg_columns).await;
+    let enum_flags = detect_column_enums(conn, pg_columns);
 
     let mut columns = Vec::with_capacity(pg_columns.len());
     for (i, col) in pg_columns.iter().enumerate() {
@@ -135,7 +125,7 @@ async fn build_columns(
 /// Returns a human-readable summary of the query plan. Errors are silently
 /// ignored -- EXPLAIN is informational and must never block compilation.
 #[cfg(feature = "explain")]
-async fn fetch_explain_plan(conn: &mut Connection, parsed: &ParsedQuery) -> Option<String> {
+fn fetch_explain_plan(conn: &mut Connection, parsed: &ParsedQuery) -> Option<String> {
     // EXPLAIN cannot handle parameterized queries directly. We use
     // EXPLAIN (FORMAT TEXT) with a generic plan (PG 16+ supports
     // EXPLAIN (GENERIC_PLAN) for prepared statements).
@@ -144,7 +134,7 @@ async fn fetch_explain_plan(conn: &mut Connection, parsed: &ParsedQuery) -> Opti
     // (e.g. because of parameters), we skip silently.
     let explain_sql = format!("EXPLAIN (FORMAT TEXT, COSTS) {}", parsed.positional_sql);
 
-    match conn.simple_query_rows(&explain_sql).await {
+    match conn.simple_query_rows(&explain_sql) {
         Ok(rows) => {
             let lines: Vec<String> = rows
                 .into_iter()
@@ -166,7 +156,7 @@ async fn fetch_explain_plan(conn: &mut Connection, parsed: &ParsedQuery) -> Opti
 /// For columns backed by a real table, queries `pg_attribute.attnotnull` in
 /// batch using string-interpolated OIDs. Computed columns (aggregates,
 /// functions) default to nullable (the safe choice).
-async fn resolve_nullability_batch(conn: &mut Connection, columns: &[ColumnDesc]) -> Vec<bool> {
+fn resolve_nullability_batch(conn: &mut Connection, columns: &[ColumnDesc]) -> Vec<bool> {
     let col_count = columns.len();
     // Default: all nullable (safe). We overwrite entries we can resolve.
     let mut result = vec![true; col_count];
@@ -215,7 +205,7 @@ async fn resolve_nullability_batch(conn: &mut Connection, columns: &[ColumnDesc]
          )"
     );
 
-    if let Ok(rows) = conn.simple_query_rows(&query).await {
+    if let Ok(rows) = conn.simple_query_rows(&query) {
         // Build lookup: (table_oid, col_num) -> original column index
         let mut lookup: std::collections::HashMap<(u32, i16), Vec<usize>> =
             std::collections::HashMap::with_capacity(table_oids.len());
@@ -256,7 +246,7 @@ async fn resolve_nullability_batch(conn: &mut Connection, columns: &[ColumnDesc]
 ///
 /// Queries `pg_type.typtype` for each OID. Returns `'e'` for enum types.
 /// Uses a single batched simple query with string-interpolated OIDs.
-async fn detect_pg_enums(conn: &mut Connection, oids: &[u32]) -> SmallVec<[bool; 8]> {
+fn detect_pg_enums(conn: &mut Connection, oids: &[u32]) -> SmallVec<[bool; 8]> {
     if oids.is_empty() {
         return SmallVec::new();
     }
@@ -272,7 +262,7 @@ async fn detect_pg_enums(conn: &mut Connection, oids: &[u32]) -> SmallVec<[bool;
     let mut enum_map: std::collections::HashMap<u32, bool> =
         std::collections::HashMap::with_capacity(oids.len());
 
-    if let Ok(rows) = conn.simple_query_rows(&query).await {
+    if let Ok(rows) = conn.simple_query_rows(&query) {
         for row in &rows {
             let oid: u32 = row
                 .first()
@@ -293,7 +283,7 @@ async fn detect_pg_enums(conn: &mut Connection, oids: &[u32]) -> SmallVec<[bool;
 ///
 /// Similar to `detect_pg_enums` but for column OIDs. Only queries OIDs
 /// that are not in the standard built-in type range (< 10000).
-async fn detect_column_enums(conn: &mut Connection, columns: &[ColumnDesc]) -> Vec<bool> {
+fn detect_column_enums(conn: &mut Connection, columns: &[ColumnDesc]) -> Vec<bool> {
     let mut result = vec![false; columns.len()];
 
     // Only check non-built-in OIDs (built-in types are never enums)
@@ -316,7 +306,7 @@ async fn detect_column_enums(conn: &mut Connection, columns: &[ColumnDesc]) -> V
 
     let query = format!("SELECT oid, typtype FROM pg_type WHERE oid IN ({oid_list})");
 
-    if let Ok(rows) = conn.simple_query_rows(&query).await {
+    if let Ok(rows) = conn.simple_query_rows(&query) {
         let mut enum_set: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for row in &rows {
             let oid: u32 = row
@@ -361,12 +351,11 @@ pub fn check_param_types(
 pub fn validate_variants(
     variants: &[QueryVariant],
     parsed: &ParsedQuery,
-    rt: &Runtime,
     conn: &mut Connection,
 ) -> Result<ValidationResult, String> {
     if variants.len() <= 1 {
         // Single variant or no optional clauses — use normal validation
-        return validate_query(parsed, rt, conn);
+        return validate_query(parsed, conn);
     }
 
     // Validate every variant and collect results.
@@ -374,7 +363,7 @@ pub fn validate_variants(
     let mut canonical_result: Option<ValidationResult> = None;
 
     for (i, variant) in variants.iter().enumerate() {
-        let result = rt.block_on(validate_variant_async(variant, conn, parsed, i))?;
+        let result = validate_variant(variant, conn, parsed, i)?;
 
         // Check parameter type compatibility for this variant
         check_variant_param_types(variant, &result)?;
@@ -401,7 +390,7 @@ pub fn validate_variants(
     canonical_result.ok_or_else(|| "no variants to validate (internal error)".to_owned())
 }
 
-async fn validate_variant_async(
+fn validate_variant(
     variant: &QueryVariant,
     conn: &mut Connection,
     parsed: &ParsedQuery,
@@ -409,13 +398,12 @@ async fn validate_variant_async(
 ) -> Result<ValidationResult, String> {
     let result = conn
         .prepare_describe(&variant.sql)
-        .await
         .map_err(|e| format_variant_driver_error(&e, variant, parsed, variant_index))?;
 
     let param_pg_oids: SmallVec<[u32; 8]> = result.param_oids.iter().copied().collect();
-    let param_is_pg_enum = detect_pg_enums(conn, &result.param_oids).await;
+    let param_is_pg_enum = detect_pg_enums(conn, &result.param_oids);
 
-    let columns = build_columns(conn, &result.columns).await?;
+    let columns = build_columns(conn, &result.columns)?;
 
     Ok(ValidationResult {
         columns,
@@ -605,16 +593,13 @@ fn format_driver_error(e: &DriverError, parsed: &ParsedQuery) -> String {
 /// suggestions on failure.
 pub fn validate_query_with_suggestions(
     parsed: &ParsedQuery,
-    rt: &Runtime,
     conn: &mut Connection,
 ) -> Result<ValidationResult, String> {
-    match rt.block_on(validate_async(parsed, conn)) {
+    match validate_query(parsed, conn) {
         Ok(result) => Ok(result),
         Err(base_error) => {
             // Enhance the error with "did you mean?" suggestions.
-            // This runs as a separate block_on because enhance_error
-            // queries the schema with additional SQL.
-            if let Some(suggestion) = crate::suggest::enhance_error(&base_error, rt, conn) {
+            if let Some(suggestion) = crate::suggest::enhance_error(&base_error, conn) {
                 Err(format!("{base_error}{suggestion}"))
             } else {
                 Err(base_error)

@@ -7,8 +7,8 @@
 //! # Backend detection
 //!
 //! The URL scheme in `BSQL_DATABASE_URL` / `DATABASE_URL` determines the backend:
-//! - `postgres://` or `postgresql://` -> PostgreSQL (async via tokio)
-//! - `sqlite:` -> SQLite (synchronous, no tokio needed)
+//! - `postgres://` or `postgresql://` -> PostgreSQL (synchronous)
+//! - `sqlite:` -> SQLite (synchronous)
 //!   - `sqlite:///absolute/path` -> absolute path
 //!   - `sqlite:./relative/path` or `sqlite:relative/path` -> relative to CARGO_MANIFEST_DIR
 //!   - `sqlite::memory:` -> in-memory (for tests)
@@ -27,7 +27,6 @@
 //! will fail with a connection error.
 
 use std::sync::LazyLock;
-use tokio::runtime::Runtime;
 
 use bsql_driver_postgres::Connection;
 
@@ -76,7 +75,6 @@ pub fn detect_backend() -> Result<Option<Backend>, String> {
 
 /// The shared PG connection state, initialized once per compilation.
 struct MacroConnection {
-    runtime: Runtime,
     conn: std::sync::Mutex<Connection>,
 }
 
@@ -90,8 +88,6 @@ static MACRO_CONN: LazyLock<Result<MacroConnection, String>> = LazyLock::new(|| 
              connection URL (e.g. postgres://user:pass@localhost/mydb)."
                 .to_string()
         })?;
-
-    let rt = Runtime::new().map_err(|e| format!("bsql: failed to create tokio runtime: {e}"))?;
 
     // Parse URL and configure TLS via our driver's Config
     let mut config = bsql_driver_postgres::Config::from_url(&database_url)
@@ -107,7 +103,7 @@ static MACRO_CONN: LazyLock<Result<MacroConnection, String>> = LazyLock::new(|| 
     // Compile-time queries should time out, not hang the build.
     config.statement_timeout_secs = 30;
 
-    let conn = rt.block_on(Connection::connect(&config)).map_err(|e| {
+    let conn = Connection::connect(&config).map_err(|e| {
         format!(
             "bsql: failed to connect to PostgreSQL at compile time: {e}. \
                  Check that BSQL_DATABASE_URL or DATABASE_URL is set correctly \
@@ -116,23 +112,22 @@ static MACRO_CONN: LazyLock<Result<MacroConnection, String>> = LazyLock::new(|| 
     })?;
 
     Ok(MacroConnection {
-        runtime: rt,
         conn: std::sync::Mutex::new(conn),
     })
 });
 
-/// Run an async operation on the shared compile-time PG connection.
+/// Run a synchronous operation on the shared compile-time PG connection.
 ///
 /// Returns a `syn::Error` if the connection is not available.
 pub fn with_connection<F, T>(f: F) -> Result<T, syn::Error>
 where
-    F: FnOnce(&Runtime, &mut Connection) -> Result<T, String>,
+    F: FnOnce(&mut Connection) -> Result<T, String>,
 {
     let mc = MACRO_CONN
         .as_ref()
         .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?;
     let mut conn = mc.conn.lock().unwrap_or_else(|e| e.into_inner());
-    f(&mc.runtime, &mut conn).map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))
+    f(&mut conn).map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))
 }
 
 // ---------------------------------------------------------------------------

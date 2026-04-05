@@ -26,7 +26,6 @@ sqlite-system = ["sqlite", "bsql-driver-sqlite/system"]
 syn = { workspace = true }
 quote = { workspace = true }
 proc-macro2 = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread"] }
 bitcode = { workspace = true }
 bsql-core = { workspace = true }
 bsql-driver-postgres = { workspace = true }

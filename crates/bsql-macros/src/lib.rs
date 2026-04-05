@@ -110,8 +110,8 @@ fn query_impl_postgres(parsed: parse::ParsedQuery) -> Result<proc_macro2::TokenS
                 .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?
         } else {
             // ONLINE: validate against PostgreSQL via PREPARE with suggestions
-            let result = connection::with_connection(|rt, conn| {
-                validate::validate_query_with_suggestions(&parsed, rt, conn)
+            let result = connection::with_connection(|conn| {
+                validate::validate_query_with_suggestions(&parsed, conn)
             })?;
 
             // Write to offline cache for future use
@@ -142,8 +142,8 @@ fn query_impl_postgres(parsed: parse::ParsedQuery) -> Result<proc_macro2::TokenS
                 .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?
         } else {
             // ONLINE: validate ALL variants against PostgreSQL and check param types
-            let result = connection::with_connection(|rt, conn| {
-                validate::validate_variants(&variants, &parsed, rt, conn)
+            let result = connection::with_connection(|conn| {
+                validate::validate_variants(&variants, &parsed, conn)
             })?;
 
             // Write to offline cache for future use
@@ -309,8 +309,8 @@ fn query_impl_sort(parsed: parse::ParsedQuery) -> Result<proc_macro2::TokenStrea
         offline::lookup_cached_validation(&parsed)
             .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?
     } else {
-        let result = connection::with_connection(|rt, conn| {
-            validate::validate_query_with_suggestions(&dummy_parsed, rt, conn)
+        let result = connection::with_connection(|conn| {
+            validate::validate_query_with_suggestions(&dummy_parsed, conn)
         })?;
 
         offline::write_cache(&parsed, &result);
@@ -394,7 +394,7 @@ pub fn pg_enum(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```rust,ignore
 /// let tickets = bsql::query!(
 ///     "SELECT id, title FROM tickets ORDER BY $[sort: TicketSort] LIMIT $limit: i64"
-/// ).fetch_all(&pool).await?;
+/// ).fetch_all(&pool)?;
 /// ```
 ///
 /// Each variant must have a `#[sql("...")]` attribute mapping it to the

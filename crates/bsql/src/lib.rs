@@ -14,7 +14,6 @@
 //! ```toml
 //! [dependencies]
 //! bsql = "0.16"
-//! tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 //! ```
 //!
 //! Set the database URL for compile-time validation:
@@ -26,9 +25,8 @@
 //! ```rust,no_run
 //! use bsql::{Pool, BsqlError};
 //!
-//! #[tokio::main]
-//! async fn main() -> Result<(), BsqlError> {
-//!     let pool = Pool::connect("postgres://user:pass@localhost/mydb").await?;
+//! fn main() -> Result<(), BsqlError> {
+//!     let pool = Pool::connect("postgres://user:pass@localhost/mydb")?;
 //!
 //!     // Every query is validated against the real database at compile time.
 //!     // If this compiles, the SQL is correct — tables, columns, types, all checked.
@@ -36,7 +34,7 @@
 //!     //   let id = 1i32;
 //!     //   let users = bsql::query!(
 //!     //       "SELECT id, login, active FROM users WHERE id = $id: i32"
-//!     //   ).fetch(&pool).await?;
+//!     //   ).fetch(&pool)?;
 //!     //   let user = &users[0];
 //!     //
 //!     // The result struct has typed fields:
@@ -61,7 +59,7 @@
 //!
 //! There is no `bsql::query()` function. There is no `raw_sql()`. There is no
 //! way to execute unchecked SQL through bsql. If you need unchecked SQL, use
-//! `tokio-postgres` directly. bsql will not become the thing it replaces.
+//! a raw PostgreSQL driver directly. bsql will not become the thing it replaces.
 
 // Re-export the query! macro and attribute macros
 pub use bsql_macros::pg_enum;

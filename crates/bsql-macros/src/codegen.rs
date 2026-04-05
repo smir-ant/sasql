@@ -244,11 +244,11 @@ pub fn generate_sort_query_code(
 
             #[allow(non_camel_case_types)]
             impl #stream_name {
-                pub async fn next(&mut self) -> ::bsql_core::BsqlResult<Option<#result_name>> {
+                pub fn next(&mut self) -> ::bsql_core::BsqlResult<Option<#result_name>> {
                     if let Some(row) = self.inner.next_row() {
                         return Ok(Some(#result_name { #row_decode }));
                     }
-                    if !self.inner.fetch_next_chunk().await? {
+                    if !self.inner.fetch_next_chunk()? {
                         return Ok(None);
                     }
                     match self.inner.next_row() {
@@ -264,12 +264,12 @@ pub fn generate_sort_query_code(
 
             #[allow(non_camel_case_types)]
             impl<'_bsql> #executor_name<'_bsql> {
-                pub async fn fetch_one<E: ::bsql_core::Executor>(
+                pub fn fetch_one<E: ::bsql_core::Executor>(
                     self,
                     executor: &E,
                 ) -> ::bsql_core::BsqlResult<#result_name> {
                     #build_limited_sql
-                    let owned = executor.#qm(sql, sql_hash, #params_slice).await?;
+                    let owned = executor.#qm(sql, sql_hash, #params_slice)?;
                     if owned.len() != 1 {
                         return Err(::bsql_core::error::QueryError::row_count(
                             "exactly 1 row",
@@ -280,21 +280,21 @@ pub fn generate_sort_query_code(
                     Ok(#result_name { #row_decode })
                 }
 
-                pub async fn fetch_all<E: ::bsql_core::Executor>(
+                pub fn fetch_all<E: ::bsql_core::Executor>(
                     self,
                     executor: &E,
                 ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
                     #build_sql
-                    let owned = executor.#qm(sql, sql_hash, #params_slice).await?;
+                    let owned = executor.#qm(sql, sql_hash, #params_slice)?;
                     owned.iter().map(|row| Ok(#result_name { #row_decode })).collect::<::bsql_core::BsqlResult<Vec<_>>>()
                 }
 
-                pub async fn fetch_optional<E: ::bsql_core::Executor>(
+                pub fn fetch_optional<E: ::bsql_core::Executor>(
                     self,
                     executor: &E,
                 ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
                     #build_limited_sql
-                    let owned = executor.#qm(sql, sql_hash, #params_slice).await?;
+                    let owned = executor.#qm(sql, sql_hash, #params_slice)?;
                     match owned.len() {
                         0 => Ok(None),
                         1 => {
@@ -308,45 +308,45 @@ pub fn generate_sort_query_code(
                     }
                 }
 
-                pub async fn fetch_stream(
+                pub fn fetch_stream(
                     self,
                     pool: &::bsql_core::Pool,
                 ) -> ::bsql_core::BsqlResult<#stream_name> {
                     #build_sql
-                    let inner = pool.query_stream(sql, sql_hash, #params_slice).await?;
+                    let inner = pool.query_stream(sql, sql_hash, #params_slice)?;
                     Ok(#stream_name { inner })
                 }
 
-                pub async fn execute<E: ::bsql_core::Executor>(
+                pub fn execute<E: ::bsql_core::Executor>(
                     self,
                     executor: &E,
                 ) -> ::bsql_core::BsqlResult<u64> {
                     #build_sql
-                    executor.execute_raw(sql, sql_hash, #params_slice).await
+                    executor.execute_raw(sql, sql_hash, #params_slice)
                 }
 
                 /// Buffer this operation in a transaction for pipeline flush on commit.
-                pub async fn defer(self, tx: &::bsql_core::Transaction) -> ::bsql_core::BsqlResult<()> {
+                pub fn defer(self, tx: &::bsql_core::Transaction) -> ::bsql_core::BsqlResult<()> {
                     #build_sql
-                    tx.defer_execute(sql, sql_hash, #params_slice).await
+                    tx.defer_execute(sql, sql_hash, #params_slice)
                 }
 
                 // --- Simple API ---
 
                 /// Fetch all rows as a Vec.
-                pub async fn fetch<E: ::bsql_core::Executor>(
+                pub fn fetch<E: ::bsql_core::Executor>(
                     self,
                     executor: &E,
                 ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
-                    self.fetch_all(executor).await
+                    self.fetch_all(executor)
                 }
 
                 /// Execute (INSERT/UPDATE/DELETE). Returns affected row count.
-                pub async fn run<E: ::bsql_core::Executor>(
+                pub fn run<E: ::bsql_core::Executor>(
                     self,
                     executor: &E,
                 ) -> ::bsql_core::BsqlResult<u64> {
-                    self.execute(executor).await
+                    self.execute(executor)
                 }
             }
         }
@@ -355,26 +355,26 @@ pub fn generate_sort_query_code(
         quote! {
             #[allow(non_camel_case_types)]
             impl<'_bsql> #executor_name<'_bsql> {
-                pub async fn execute<E: ::bsql_core::Executor>(
+                pub fn execute<E: ::bsql_core::Executor>(
                     self,
                     executor: &E,
                 ) -> ::bsql_core::BsqlResult<u64> {
                     #build_sql
-                    executor.execute_raw(sql, sql_hash, #params_slice).await
+                    executor.execute_raw(sql, sql_hash, #params_slice)
                 }
 
                 /// Buffer this operation in a transaction for pipeline flush on commit.
-                pub async fn defer(self, tx: &::bsql_core::Transaction) -> ::bsql_core::BsqlResult<()> {
+                pub fn defer(self, tx: &::bsql_core::Transaction) -> ::bsql_core::BsqlResult<()> {
                     #build_sql
-                    tx.defer_execute(sql, sql_hash, #params_slice).await
+                    tx.defer_execute(sql, sql_hash, #params_slice)
                 }
 
                 /// Execute (INSERT/UPDATE/DELETE). Returns affected row count.
-                pub async fn run<E: ::bsql_core::Executor>(
+                pub fn run<E: ::bsql_core::Executor>(
                     self,
                     executor: &E,
                 ) -> ::bsql_core::BsqlResult<u64> {
-                    self.execute(executor).await
+                    self.execute(executor)
                 }
             }
         }
@@ -531,11 +531,11 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
         let stream_name = stream_struct_name(parsed);
 
         quote! {
-            pub async fn fetch_one<E: ::bsql_core::Executor>(
+            pub fn fetch_one<E: ::bsql_core::Executor>(
                 self,
                 executor: &E,
             ) -> ::bsql_core::BsqlResult<#result_name> {
-                let owned = executor.#query_method(#limited_sql_lit, #limited_sql_hash_val, #params_slice).await?;
+                let owned = executor.#query_method(#limited_sql_lit, #limited_sql_hash_val, #params_slice)?;
                 if owned.len() != 1 {
                     return Err(::bsql_core::error::QueryError::row_count(
                         "exactly 1 row",
@@ -546,19 +546,19 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
                 Ok(#result_name { #row_decode })
             }
 
-            pub async fn fetch_all<E: ::bsql_core::Executor>(
+            pub fn fetch_all<E: ::bsql_core::Executor>(
                 self,
                 executor: &E,
             ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
-                let owned = executor.#query_method(#sql_lit, #sql_hash_val, #params_slice).await?;
+                let owned = executor.#query_method(#sql_lit, #sql_hash_val, #params_slice)?;
                 owned.iter().map(|row| Ok(#result_name { #row_decode })).collect::<::bsql_core::BsqlResult<Vec<_>>>()
             }
 
-            pub async fn fetch_optional<E: ::bsql_core::Executor>(
+            pub fn fetch_optional<E: ::bsql_core::Executor>(
                 self,
                 executor: &E,
             ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
-                let owned = executor.#query_method(#limited_sql_lit, #limited_sql_hash_val, #params_slice).await?;
+                let owned = executor.#query_method(#limited_sql_lit, #limited_sql_hash_val, #params_slice)?;
                 match owned.len() {
                     0 => Ok(None),
                     1 => {
@@ -572,11 +572,11 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
                 }
             }
 
-            pub async fn fetch_stream(
+            pub fn fetch_stream(
                 self,
                 pool: &::bsql_core::Pool,
             ) -> ::bsql_core::BsqlResult<#stream_name> {
-                let inner = pool.query_stream(#sql_lit, #sql_hash_val, #params_slice).await?;
+                let inner = pool.query_stream(#sql_lit, #sql_hash_val, #params_slice)?;
                 Ok(#stream_name { inner })
             }
         }
@@ -594,18 +594,18 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
     };
 
     let execute_method = quote! {
-        pub async fn execute<E: ::bsql_core::Executor>(
+        pub fn execute<E: ::bsql_core::Executor>(
             self,
             executor: &E,
         ) -> ::bsql_core::BsqlResult<u64> {
-            executor.execute_raw(#sql_lit, #sql_hash_val, #params_slice).await
+            executor.execute_raw(#sql_lit, #sql_hash_val, #params_slice)
         }
     };
 
     let defer_method = quote! {
         /// Buffer this operation in a transaction for pipeline flush on commit.
-        pub async fn defer(self, tx: &::bsql_core::Transaction) -> ::bsql_core::BsqlResult<()> {
-            tx.defer_execute(#sql_lit, #sql_hash_val, #params_slice).await
+        pub fn defer(self, tx: &::bsql_core::Transaction) -> ::bsql_core::BsqlResult<()> {
+            tx.defer_execute(#sql_lit, #sql_hash_val, #params_slice)
         }
     };
 
@@ -630,7 +630,7 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
             ///
             /// Zero arena allocation, zero SmallVec — the generated code decodes
             /// columns sequentially inline from the raw DataRow message bytes.
-            pub async fn for_each<_BsqlForEachF>(
+            pub fn for_each<_BsqlForEachF>(
                 self,
                 pool: &::bsql_core::Pool,
                 mut f: _BsqlForEachF,
@@ -648,11 +648,11 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
                         let _bsql_typed = #fe_row_name { #fe_raw_inits };
                         f(_bsql_typed)
                     },
-                ).await
+                )
             }
 
             /// Process each row, collecting mapped results into a `Vec`.
-            pub async fn for_each_map<_BsqlForEachF, _BsqlForEachT>(
+            pub fn for_each_map<_BsqlForEachF, _BsqlForEachT>(
                 self,
                 pool: &::bsql_core::Pool,
                 mut f: _BsqlForEachF,
@@ -672,7 +672,7 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
                         _bsql_results.push(f(_bsql_typed));
                         Ok(())
                     },
-                ).await?;
+                )?;
                 Ok(_bsql_results)
             }
         }
@@ -686,11 +686,11 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
 
         quote! {
             /// Fetch all rows as a Vec.
-            pub async fn fetch<E: ::bsql_core::Executor>(
+            pub fn fetch<E: ::bsql_core::Executor>(
                 self,
                 executor: &E,
             ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
-                self.fetch_all(executor).await
+                self.fetch_all(executor)
             }
         }
     } else {
@@ -699,11 +699,11 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
 
     let simple_api_run = quote! {
         /// Execute (INSERT/UPDATE/DELETE). Returns affected row count.
-        pub async fn run<E: ::bsql_core::Executor>(
+        pub fn run<E: ::bsql_core::Executor>(
             self,
             executor: &E,
         ) -> ::bsql_core::BsqlResult<u64> {
-            self.execute(executor).await
+            self.execute(executor)
         }
     };
 
@@ -795,7 +795,7 @@ fn gen_dynamic_executor_impls(
         let fetch_one_dispatcher =
             gen_variant_dispatcher(parsed, variants, needs_limit, |sql_lit, sql_hash| {
                 quote! {
-                    let owned = executor.#qm(#sql_lit, #sql_hash, &params_slice[..]).await?;
+                    let owned = executor.#qm(#sql_lit, #sql_hash, &params_slice[..])?;
                     if owned.len() != 1 {
                         return Err(::bsql_core::error::QueryError::row_count(
                             "exactly 1 row",
@@ -813,7 +813,7 @@ fn gen_dynamic_executor_impls(
             false,
             |sql_lit, sql_hash| {
                 quote! {
-                    let owned = executor.#qm(#sql_lit, #sql_hash, &params_slice[..]).await?;
+                    let owned = executor.#qm(#sql_lit, #sql_hash, &params_slice[..])?;
                     owned.iter().map(|row| Ok(#result_name { #row_decode })).collect::<::bsql_core::BsqlResult<Vec<_>>>()
                 }
             },
@@ -822,7 +822,7 @@ fn gen_dynamic_executor_impls(
         let fetch_optional_dispatcher =
             gen_variant_dispatcher(parsed, variants, needs_limit, |sql_lit, sql_hash| {
                 quote! {
-                    let owned = executor.#qm(#sql_lit, #sql_hash, &params_slice[..]).await?;
+                    let owned = executor.#qm(#sql_lit, #sql_hash, &params_slice[..])?;
                     match owned.len() {
                         0 => Ok(None),
                         1 => {
@@ -840,34 +840,34 @@ fn gen_dynamic_executor_impls(
         let fetch_stream_dispatcher =
             gen_variant_dispatcher(parsed, variants, false, |sql_lit, sql_hash| {
                 quote! {
-                    let inner = pool.query_stream(#sql_lit, #sql_hash, &params_slice[..]).await?;
+                    let inner = pool.query_stream(#sql_lit, #sql_hash, &params_slice[..])?;
                     Ok(#stream_name { inner })
                 }
             });
 
         quote! {
-            pub async fn fetch_one<E: ::bsql_core::Executor>(
+            pub fn fetch_one<E: ::bsql_core::Executor>(
                 self,
                 executor: &E,
             ) -> ::bsql_core::BsqlResult<#result_name> {
                 #fetch_one_dispatcher
             }
 
-            pub async fn fetch_all<E: ::bsql_core::Executor>(
+            pub fn fetch_all<E: ::bsql_core::Executor>(
                 self,
                 executor: &E,
             ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
                 #fetch_all_dispatcher
             }
 
-            pub async fn fetch_optional<E: ::bsql_core::Executor>(
+            pub fn fetch_optional<E: ::bsql_core::Executor>(
                 self,
                 executor: &E,
             ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
                 #fetch_optional_dispatcher
             }
 
-            pub async fn fetch_stream(
+            pub fn fetch_stream(
                 self,
                 pool: &::bsql_core::Pool,
             ) -> ::bsql_core::BsqlResult<#stream_name> {
@@ -890,12 +890,12 @@ fn gen_dynamic_executor_impls(
     let execute_dispatcher =
         gen_variant_dispatcher(parsed, variants, false, |sql_lit, sql_hash| {
             quote! {
-                executor.execute_raw(#sql_lit, #sql_hash, &params_slice[..]).await
+                executor.execute_raw(#sql_lit, #sql_hash, &params_slice[..])
             }
         });
 
     let execute_method = quote! {
-        pub async fn execute<E: ::bsql_core::Executor>(
+        pub fn execute<E: ::bsql_core::Executor>(
             self,
             executor: &E,
         ) -> ::bsql_core::BsqlResult<u64> {
@@ -905,13 +905,13 @@ fn gen_dynamic_executor_impls(
 
     let defer_dispatcher = gen_variant_dispatcher(parsed, variants, false, |sql_lit, sql_hash| {
         quote! {
-            tx.defer_execute(#sql_lit, #sql_hash, &params_slice[..]).await
+            tx.defer_execute(#sql_lit, #sql_hash, &params_slice[..])
         }
     });
 
     let defer_method = quote! {
         /// Buffer this operation in a transaction for pipeline flush on commit.
-        pub async fn defer(self, tx: &::bsql_core::Transaction) -> ::bsql_core::BsqlResult<()> {
+        pub fn defer(self, tx: &::bsql_core::Transaction) -> ::bsql_core::BsqlResult<()> {
             #defer_dispatcher
         }
     };
@@ -935,7 +935,7 @@ fn gen_dynamic_executor_impls(
                             let _bsql_typed = #fe_row_name { #fe_raw_inits };
                             f(_bsql_typed)
                         },
-                    ).await
+                    )
                 }
             });
 
@@ -953,12 +953,12 @@ fn gen_dynamic_executor_impls(
                             _bsql_results.push(f(_bsql_typed));
                             Ok(())
                         },
-                    ).await
+                    )
                 }
             });
 
         quote! {
-            pub async fn for_each<_BsqlForEachF>(
+            pub fn for_each<_BsqlForEachF>(
                 self,
                 pool: &::bsql_core::Pool,
                 mut f: _BsqlForEachF,
@@ -969,7 +969,7 @@ fn gen_dynamic_executor_impls(
                 #for_each_dispatcher
             }
 
-            pub async fn for_each_map<_BsqlForEachF, _BsqlForEachT>(
+            pub fn for_each_map<_BsqlForEachF, _BsqlForEachT>(
                 self,
                 pool: &::bsql_core::Pool,
                 mut f: _BsqlForEachF,
@@ -992,11 +992,11 @@ fn gen_dynamic_executor_impls(
 
         quote! {
             /// Fetch all rows as a Vec.
-            pub async fn fetch<E: ::bsql_core::Executor>(
+            pub fn fetch<E: ::bsql_core::Executor>(
                 self,
                 executor: &E,
             ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
-                self.fetch_all(executor).await
+                self.fetch_all(executor)
             }
         }
     } else {
@@ -1005,11 +1005,11 @@ fn gen_dynamic_executor_impls(
 
     let simple_api_run = quote! {
         /// Execute (INSERT/UPDATE/DELETE). Returns affected row count.
-        pub async fn run<E: ::bsql_core::Executor>(
+        pub fn run<E: ::bsql_core::Executor>(
             self,
             executor: &E,
         ) -> ::bsql_core::BsqlResult<u64> {
-            self.execute(executor).await
+            self.execute(executor)
         }
     };
 
@@ -1143,11 +1143,11 @@ fn gen_stream_struct(
             ///
             /// Fetches the next chunk from PG when the current chunk is exhausted
             /// (true streaming via `Execute(max_rows=64)`).
-            pub async fn next(&mut self) -> ::bsql_core::BsqlResult<Option<#result_name>> {
+            pub fn next(&mut self) -> ::bsql_core::BsqlResult<Option<#result_name>> {
                 if let Some(row) = self.inner.next_row() {
                     return Ok(Some(#result_name { #row_decode }));
                 }
-                if !self.inner.fetch_next_chunk().await? {
+                if !self.inner.fetch_next_chunk()? {
                     return Ok(None);
                 }
                 match self.inner.next_row() {
