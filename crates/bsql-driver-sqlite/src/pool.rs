@@ -2222,4 +2222,260 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
+    // ---- Gap: concurrent 2 readers simultaneously ----
+
+    #[test]
+    fn pool_concurrent_two_readers_simultaneously() {
+        let path = temp_db_path();
+        let pool = SqlitePoolBuilder::new()
+            .path(&path)
+            .reader_count(4)
+            .build()
+            .unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER, val TEXT)")
+            .unwrap();
+        for i in 0..50 {
+            pool.simple_exec(&format!("INSERT INTO t VALUES ({i}, 'row_{i}')"))
+                .unwrap();
+        }
+
+        let pool = Arc::new(pool);
+        let barrier = std::sync::Barrier::new(2);
+        let barrier = Arc::new(barrier);
+        let mut handles = Vec::new();
+
+        for _ in 0..2 {
+            let pool = Arc::clone(&pool);
+            let barrier = Arc::clone(&barrier);
+            let handle = std::thread::spawn(move || {
+                barrier.wait(); // both readers start at the same time
+                let sql = "SELECT COUNT(*) FROM t";
+                let hash = hash_sql(sql);
+                let (result, arena) = pool.query_readonly(sql, hash, SmallVec::new()).unwrap();
+                assert_eq!(result.get_i64(0, 0, &arena), Some(50));
+            });
+            handles.push(handle);
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        pool.close();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- Gap: write during concurrent reads ----
+
+    #[test]
+    fn pool_write_during_concurrent_reads() {
+        let path = temp_db_path();
+        let pool = SqlitePoolBuilder::new()
+            .path(&path)
+            .reader_count(4)
+            .build()
+            .unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER)").unwrap();
+        for i in 0..100 {
+            pool.simple_exec(&format!("INSERT INTO t VALUES ({i})"))
+                .unwrap();
+        }
+
+        let pool = Arc::new(pool);
+        let barrier = Arc::new(std::sync::Barrier::new(5));
+        let mut handles = Vec::new();
+
+        // 4 reader threads
+        for _ in 0..4 {
+            let pool = Arc::clone(&pool);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..50 {
+                    let sql = "SELECT COUNT(*) FROM t";
+                    let hash = hash_sql(sql);
+                    let (result, arena) = pool.query_readonly(sql, hash, SmallVec::new()).unwrap();
+                    // Count may be 100 or more (writer may have inserted)
+                    let count = result.get_i64(0, 0, &arena).unwrap();
+                    assert!(count >= 100, "count should be >= 100, got {count}");
+                }
+            }));
+        }
+
+        // 1 writer thread
+        {
+            let pool = Arc::clone(&pool);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                let sql = "INSERT INTO t VALUES (?1)";
+                let hash = hash_sql(sql);
+                for i in 100..150 {
+                    // Writer may get SQLITE_BUSY with busy_timeout=0 — that's OK.
+                    let _ = pool.execute(sql, hash, smallvec::smallvec![ParamValue::Int(i)]);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        pool.close();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- Gap: very large result 10K rows via pool ----
+
+    #[test]
+    fn pool_query_10k_rows() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER)").unwrap();
+        pool.simple_exec("BEGIN").unwrap();
+        for i in 0..10_000 {
+            pool.simple_exec(&format!("INSERT INTO t VALUES ({i})"))
+                .unwrap();
+        }
+        pool.simple_exec("COMMIT").unwrap();
+
+        let sql = "SELECT id FROM t ORDER BY id";
+        let hash = hash_sql(sql);
+        let (result, arena) = pool.query_readonly(sql, hash, SmallVec::new()).unwrap();
+        assert_eq!(result.len(), 10_000);
+        assert_eq!(result.get_i64(0, 0, &arena), Some(0));
+        assert_eq!(result.get_i64(9_999, 0, &arena), Some(9_999));
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- Gap: NULL handling for all types via pool ----
+
+    #[test]
+    fn pool_null_handling_all_types() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec(
+            "CREATE TABLE t (
+                a INTEGER, b REAL, c TEXT, d BLOB, e INTEGER
+            )",
+        )
+        .unwrap();
+
+        // Insert a row where all columns are NULL
+        let sql_ins = "INSERT INTO t VALUES (?1, ?2, ?3, ?4, ?5)";
+        let hash_ins = hash_sql(sql_ins);
+        pool.execute(
+            sql_ins,
+            hash_ins,
+            smallvec::smallvec![
+                ParamValue::Null,
+                ParamValue::Null,
+                ParamValue::Null,
+                ParamValue::Null,
+                ParamValue::Null,
+            ],
+        )
+        .unwrap();
+
+        // Also insert a row with real values to confirm mixed handling
+        pool.execute(
+            sql_ins,
+            hash_ins,
+            smallvec::smallvec![
+                ParamValue::Int(42),
+                ParamValue::Real(3.14),
+                ParamValue::Text("hello".into()),
+                ParamValue::Blob(vec![0xDE, 0xAD]),
+                ParamValue::Bool(true),
+            ],
+        )
+        .unwrap();
+
+        let sql_sel = "SELECT a, b, c, d, e FROM t ORDER BY rowid";
+        let hash_sel = hash_sql(sql_sel);
+        let (result, arena) = pool
+            .query_readonly(sql_sel, hash_sel, SmallVec::new())
+            .unwrap();
+        assert_eq!(result.len(), 2);
+
+        // Row 0: all NULLs
+        for col in 0..5 {
+            assert!(result.is_null(0, col), "row 0, col {col} should be NULL");
+        }
+        assert_eq!(result.get_i64(0, 0, &arena), None);
+        assert_eq!(result.get_f64(0, 1, &arena), None);
+        assert_eq!(result.get_str(0, 2, &arena), None);
+        assert_eq!(result.get_bytes(0, 3, &arena), None);
+        assert_eq!(result.get_bool(0, 4, &arena), None);
+
+        // Row 1: real values
+        assert_eq!(result.get_i64(1, 0, &arena), Some(42));
+        let f = result.get_f64(1, 1, &arena).unwrap();
+        assert!((f - 3.14).abs() < f64::EPSILON);
+        assert_eq!(result.get_str(1, 2, &arena), Some("hello"));
+        assert_eq!(result.get_bytes(1, 3, &arena), Some(&[0xDE, 0xAD][..]));
+        // Bool is stored as integer: 1 = true
+        assert_eq!(result.get_bool(1, 4, &arena), Some(true));
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- Gap: concurrent stress with many readers ----
+
+    #[test]
+    fn pool_concurrent_8_threads_read_stress() {
+        let path = temp_db_path();
+        let pool = SqlitePoolBuilder::new()
+            .path(&path)
+            .reader_count(4)
+            .build()
+            .unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER, val TEXT)")
+            .unwrap();
+        pool.simple_exec("BEGIN").unwrap();
+        for i in 0..500 {
+            pool.simple_exec(&format!("INSERT INTO t VALUES ({i}, 'value_{i}')"))
+                .unwrap();
+        }
+        pool.simple_exec("COMMIT").unwrap();
+
+        let pool = Arc::new(pool);
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+
+        for _ in 0..8 {
+            let pool = Arc::clone(&pool);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..100 {
+                    let sql = "SELECT id, val FROM t WHERE id = ?1";
+                    let hash = hash_sql(sql);
+                    let tid_hash = {
+                        use std::hash::{Hash, Hasher};
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        std::thread::current().id().hash(&mut h);
+                        h.finish()
+                    };
+                    let row_id = (tid_hash % 500) as i64;
+                    let (result, _arena) = pool
+                        .query_readonly(sql, hash, smallvec::smallvec![ParamValue::Int(row_id)])
+                        .unwrap();
+                    // May get 0 or 1 rows depending on the thread ID
+                    assert!(result.len() <= 1);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        pool.close();
+        let _ = std::fs::remove_file(&path);
+    }
 }

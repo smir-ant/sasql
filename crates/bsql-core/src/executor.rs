@@ -329,4 +329,62 @@ mod tests {
         assert!(owned.is_empty());
         assert_eq!(owned.result.affected_rows(), 42);
     }
+
+    // --- OwnedResult::without_arena ---
+
+    #[test]
+    fn owned_result_without_arena_len_zero() {
+        let cols: Arc<[ColumnDesc]> = Arc::from(Vec::new());
+        let result = QueryResult::from_parts(vec![], 0, cols, 0);
+        let owned = OwnedResult::without_arena(result);
+        assert_eq!(owned.len(), 0);
+    }
+
+    #[test]
+    fn owned_result_without_arena_is_empty() {
+        let cols: Arc<[ColumnDesc]> = Arc::from(Vec::new());
+        let result = QueryResult::from_parts(vec![], 0, cols, 0);
+        let owned = OwnedResult::without_arena(result);
+        assert!(owned.is_empty());
+    }
+
+    #[test]
+    fn owned_result_without_arena_with_rows() {
+        let cols: Arc<[ColumnDesc]> = vec![ColumnDesc {
+            name: "c0".into(),
+            type_oid: 23,
+            type_size: 4,
+            table_oid: 0,
+            column_id: 0,
+        }]
+        .into();
+        let col_offsets = vec![(0, -1); 3]; // 3 rows, 1 col each (all NULL)
+        let result = QueryResult::from_parts(col_offsets, 1, cols, 0);
+        let owned = OwnedResult::without_arena(result);
+        assert_eq!(owned.len(), 3);
+        assert!(!owned.is_empty());
+    }
+
+    // --- OwnedResult Debug ---
+
+    #[test]
+    fn owned_result_debug_format() {
+        let owned = make_owned_result(5, 2);
+        let dbg = format!("{owned:?}");
+        assert!(
+            dbg.contains("OwnedResult"),
+            "Debug should contain struct name: {dbg}"
+        );
+        assert!(dbg.contains("5"), "Debug should contain row count: {dbg}");
+    }
+
+    // --- OwnedResult drop without_arena variant ---
+
+    #[test]
+    fn owned_result_without_arena_drop_does_not_panic() {
+        let cols: Arc<[ColumnDesc]> = Arc::from(Vec::new());
+        let result = QueryResult::from_parts(vec![], 0, cols, 0);
+        let owned = OwnedResult::without_arena(result);
+        drop(owned); // Must not panic — arena is Arena::empty()
+    }
 }

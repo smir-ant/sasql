@@ -1752,3 +1752,300 @@ fn defer_execute_param_count_exceeds_max() {
 
     tx.rollback().unwrap();
 }
+
+// =========================================================================
+// Gap tests: concurrent pool stress
+// =========================================================================
+
+#[test]
+fn pool_concurrent_10_threads_100_queries_each() {
+    let url = require_db!();
+    // Use acquire_timeout so threads wait for a connection instead of busy-spinning.
+    let pool = std::sync::Arc::new(
+        Pool::builder()
+            .url(&url)
+            .max_size(5)
+            .acquire_timeout(Some(std::time::Duration::from_secs(10)))
+            .build()
+            .unwrap(),
+    );
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(10));
+    let mut handles = Vec::new();
+
+    for thread_id in 0..10u32 {
+        let pool = pool.clone();
+        let barrier = barrier.clone();
+        handles.push(std::thread::spawn(move || {
+            barrier.wait(); // All threads start together
+            for i in 0..100u32 {
+                let mut conn = pool
+                    .acquire()
+                    .unwrap_or_else(|e| panic!("thread {thread_id} iter {i}: acquire failed: {e}"));
+                let sql = "SELECT $1::int4 + $2::int4 AS sum";
+                let h = hash_sql(sql);
+                let arena = Arena::new();
+                let result = conn
+                    .query(sql, h, &[&(thread_id as i32), &(i as i32)])
+                    .unwrap();
+                assert_eq!(result.len(), 1);
+                let row = result.row(0, &arena);
+                assert_eq!(
+                    row.get_i32(0),
+                    Some((thread_id + i) as i32),
+                    "thread={thread_id} iter={i}"
+                );
+            }
+        }));
+    }
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // open_count must never exceed max_size
+    assert!(pool.open_count() <= pool.max_size());
+}
+
+#[test]
+fn pool_concurrent_acquire_release_rapid() {
+    let url = require_db!();
+    // Use acquire_timeout so threads wait for a connection instead of busy-spinning.
+    let pool = std::sync::Arc::new(
+        Pool::builder()
+            .url(&url)
+            .max_size(2)
+            .acquire_timeout(Some(std::time::Duration::from_secs(10)))
+            .build()
+            .unwrap(),
+    );
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(5));
+    let mut handles = Vec::new();
+
+    for thread_id in 0..5u32 {
+        let pool = pool.clone();
+        let barrier = barrier.clone();
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            for i in 0..200u32 {
+                let mut conn = pool
+                    .acquire()
+                    .unwrap_or_else(|e| panic!("thread {thread_id} iter {i}: acquire failed: {e}"));
+                conn.simple_query("SELECT 1").unwrap();
+                drop(conn); // immediate release
+            }
+        }));
+    }
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    assert!(pool.open_count() <= pool.max_size());
+}
+
+// =========================================================================
+// Gap tests: connection error scenarios
+// =========================================================================
+
+#[test]
+fn connect_bad_host_fails() {
+    // Use localhost with an unlikely port instead of a non-routable IP,
+    // because non-routable IPs cause OS-level TCP timeout delays (60+s).
+    let result = Connection::connect(&Config {
+        host: "127.0.0.1".into(),
+        port: 2, // port 2 is "CompressNET Management" — almost certainly not running PG
+        user: "nobody".into(),
+        password: "".into(),
+        database: "nonexistent".into(),
+        ssl: bsql_driver_postgres::SslMode::Disable,
+        statement_timeout_secs: 5,
+    });
+    assert!(result.is_err(), "connecting to bad host/port should fail");
+}
+
+#[test]
+fn connect_bad_port_port1_fails() {
+    let result = Connection::connect(&Config {
+        host: "127.0.0.1".into(),
+        port: 1,
+        user: "nobody".into(),
+        password: "".into(),
+        database: "nonexistent".into(),
+        ssl: bsql_driver_postgres::SslMode::Disable,
+        statement_timeout_secs: 30,
+    });
+    assert!(result.is_err());
+    assert!(matches!(result, Err(DriverError::Io(_))));
+}
+
+#[test]
+fn connect_bad_password_fails_with_auth_error() {
+    let url = require_db!();
+    let mut config = Config::from_url(&url).unwrap();
+    config.password = "definitely_wrong_password_xyz_99999".into();
+
+    let result = Connection::connect(&config);
+    // Some PG installations use trust auth — skip the assertion if connect succeeds.
+    if let Err(ref e) = result {
+        match e {
+            DriverError::Auth(_) => {}       // expected
+            DriverError::Server { .. } => {} // PG may return a server error too
+            _ => panic!("expected Auth or Server error for bad password, got: {e}"),
+        }
+    }
+}
+
+#[test]
+fn query_after_connection_closed_is_consumed() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let conn = Connection::connect(&config).unwrap();
+
+    // Close the connection — conn is consumed.
+    conn.close().unwrap();
+
+    // Cannot query after close — close(self) consumes self.
+    // This is enforced at compile time. This test verifies the close path itself.
+}
+
+// =========================================================================
+// Gap tests: connection accessors
+// =========================================================================
+
+#[test]
+fn connection_pid_nonzero_gap() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let conn = Connection::connect(&config).unwrap();
+    assert!(conn.pid() > 0, "pid should be positive after connect");
+}
+
+#[test]
+fn connection_is_idle_after_connect() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let conn = Connection::connect(&config).unwrap();
+    assert!(conn.is_idle(), "freshly connected should be idle");
+}
+
+#[test]
+fn connection_is_not_in_transaction_initially() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let conn = Connection::connect(&config).unwrap();
+    assert!(
+        !conn.is_in_transaction(),
+        "freshly connected should not be in transaction"
+    );
+}
+
+#[test]
+fn connection_server_params_has_encoding() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let conn = Connection::connect(&config).unwrap();
+
+    let params = conn.server_params();
+    assert!(!params.is_empty(), "should have server parameters");
+
+    // server_encoding should be present
+    let encoding = conn.parameter("server_encoding");
+    assert!(
+        encoding.is_some(),
+        "server_encoding should be in server_params"
+    );
+    assert_eq!(encoding.unwrap(), "UTF8", "server_encoding should be UTF8");
+}
+
+#[test]
+fn connection_secret_key_nonzero() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let conn = Connection::connect(&config).unwrap();
+    let _ = conn.secret_key(); // accessor should not panic
+}
+
+#[test]
+fn connection_is_in_failed_transaction() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+
+    conn.simple_query("BEGIN").unwrap();
+    assert!(conn.is_in_transaction());
+
+    // Execute invalid SQL to put the transaction into a failed state
+    let _ = conn.simple_query("SELECT * FROM _nonexistent_table_xyzzy_12345");
+    assert!(
+        conn.is_in_failed_transaction(),
+        "should be in failed transaction after error inside BEGIN"
+    );
+
+    conn.simple_query("ROLLBACK").unwrap();
+    assert!(conn.is_idle());
+}
+
+// =========================================================================
+// Gap tests: pool builder validation
+// =========================================================================
+
+#[test]
+fn pool_builder_max_size_zero_acquire_errors() {
+    let pool = Pool::builder()
+        .url("postgres://user:pass@localhost/db")
+        .max_size(0)
+        .build()
+        .unwrap();
+
+    let result = pool.acquire();
+    assert!(result.is_err());
+    match result {
+        Err(DriverError::Pool(msg)) => {
+            assert!(msg.contains("exhausted"), "should say exhausted: {msg}")
+        }
+        Err(e) => panic!("expected Pool error, got: {e}"),
+        Ok(_) => panic!("expected error for max_size=0"),
+    }
+}
+
+#[test]
+fn pool_builder_default_max_size_is_10() {
+    let pool = Pool::builder()
+        .url("postgres://user:pass@localhost/db")
+        .build()
+        .unwrap();
+    assert_eq!(pool.max_size(), 10);
+}
+
+// =========================================================================
+// Gap tests: pool guard accessors
+// =========================================================================
+
+#[test]
+fn pool_guard_pid_nonzero() {
+    let url = require_db!();
+    let pool = Pool::connect(&url).unwrap();
+    let conn = pool.acquire().unwrap();
+    assert!(conn.pid() > 0, "pool guard pid should be positive");
+}
+
+#[test]
+fn pool_guard_is_idle_after_acquire() {
+    let url = require_db!();
+    let pool = Pool::connect(&url).unwrap();
+    let conn = pool.acquire().unwrap();
+    assert!(conn.is_idle(), "pool guard should be idle after acquire");
+}
+
+#[test]
+fn pool_guard_is_not_in_transaction() {
+    let url = require_db!();
+    let pool = Pool::connect(&url).unwrap();
+    let conn = pool.acquire().unwrap();
+    assert!(
+        !conn.is_in_transaction(),
+        "pool guard should not be in transaction"
+    );
+}

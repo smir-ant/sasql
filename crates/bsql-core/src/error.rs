@@ -1003,4 +1003,132 @@ mod tests {
     fn bsql_error_is_sync() {
         _assert_sync::<BsqlError>();
     }
+
+    // --- Gap: BsqlError Display for Connect variant includes message ---
+
+    #[test]
+    fn bsql_error_display_connect_includes_message() {
+        let e = ConnectError::create("tcp connection refused at 127.0.0.1:5432");
+        let display = e.to_string();
+        assert!(
+            display.contains("connect error:"),
+            "should start with 'connect error:': {display}"
+        );
+        assert!(
+            display.contains("tcp connection refused at 127.0.0.1:5432"),
+            "should include the message: {display}"
+        );
+    }
+
+    // --- Gap: QueryError Display with pg_code ---
+
+    #[test]
+    fn bsql_error_display_query_includes_pg_code() {
+        let e = BsqlError::Query(QueryError {
+            message: Cow::Borrowed("relation \"users\" does not exist"),
+            pg_code: Some(Box::from("42P01")),
+            source: None,
+        });
+        let display = e.to_string();
+        assert!(
+            display.contains("42P01"),
+            "should include pg_code: {display}"
+        );
+        assert!(
+            display.contains("relation \"users\" does not exist"),
+            "should include message: {display}"
+        );
+    }
+
+    // --- Gap: QueryError Display without pg_code ---
+
+    #[test]
+    fn bsql_error_display_query_no_code() {
+        let e = BsqlError::Query(QueryError {
+            message: Cow::Borrowed("I/O error during query"),
+            pg_code: None,
+            source: None,
+        });
+        let display = e.to_string();
+        assert!(
+            display.contains("I/O error during query"),
+            "should include message: {display}"
+        );
+        assert!(
+            !display.contains('['),
+            "should not contain brackets without code: {display}"
+        );
+    }
+
+    // --- Gap: QueryError::row_count produces expected message ---
+
+    #[test]
+    fn query_error_row_count_message() {
+        let e = QueryError::row_count("exactly 1 row", 5);
+        let display = e.to_string();
+        assert!(
+            display.contains("expected exactly 1 row, got 5 rows"),
+            "row_count message: {display}"
+        );
+    }
+
+    #[test]
+    fn query_error_row_count_zero() {
+        let e = QueryError::row_count("at least 1 row", 0);
+        let display = e.to_string();
+        assert!(
+            display.contains("expected at least 1 row, got 0 rows"),
+            "row_count zero: {display}"
+        );
+    }
+
+    // --- Gap: DecodeError::with_source preserves all fields ---
+
+    #[test]
+    fn decode_error_with_source_preserves_fields() {
+        let inner = std::io::Error::new(std::io::ErrorKind::InvalidData, "bad utf-8");
+        let e = DecodeError::with_source("email", "String", "bytes", inner);
+        let display = e.to_string();
+        assert!(
+            display.contains("email"),
+            "should contain column: {display}"
+        );
+        assert!(
+            display.contains("String"),
+            "should contain expected type: {display}"
+        );
+        assert!(
+            display.contains("bytes"),
+            "should contain actual type: {display}"
+        );
+    }
+
+    // --- Gap: PoolError Display ---
+
+    #[test]
+    fn pool_error_display_custom_message() {
+        let e = BsqlError::Pool(PoolError {
+            message: Cow::Owned("all 10 connections in use".to_owned()),
+            source: None,
+        });
+        let display = e.to_string();
+        assert!(
+            display.contains("pool error: all 10 connections in use"),
+            "pool error display: {display}"
+        );
+    }
+
+    // --- Gap: ConnectError::with_source preserves source ---
+
+    #[test]
+    fn connect_error_with_source_display() {
+        let inner = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        let e = ConnectError::with_source("failed to connect to PG", inner);
+        let display = e.to_string();
+        assert!(
+            display.contains("failed to connect to PG"),
+            "should include msg: {display}"
+        );
+        assert!(e.source().is_some());
+    }
 }

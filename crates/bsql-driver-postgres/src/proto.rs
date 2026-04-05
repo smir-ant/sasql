@@ -1684,4 +1684,166 @@ mod tests {
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("unknown backend message type"));
     }
+
+    // --- Gap: error response with only severity field ---
+
+    #[test]
+    fn error_response_only_severity() {
+        let mut data = Vec::new();
+        data.push(b'S');
+        data.extend_from_slice(b"FATAL\0");
+        data.push(0); // terminator
+
+        let fields = parse_error_response(&data);
+        assert_eq!(&*fields.severity, "FATAL");
+        // No code or message fields, so message should be synthetic
+        assert!(!fields.message.is_empty());
+        assert!(fields.message.contains("malformed"));
+        assert_eq!(&*fields.code, "");
+        assert!(fields.detail.is_none());
+        assert!(fields.hint.is_none());
+        assert!(fields.position.is_none());
+    }
+
+    // --- Gap: error response completely empty data (zero bytes) ---
+
+    #[test]
+    fn error_response_empty_data_zero_bytes() {
+        let data: Vec<u8> = Vec::new();
+        let fields = parse_error_response(&data);
+        // Should not panic, should produce synthetic message
+        assert!(!fields.message.is_empty());
+        assert!(fields.message.contains("malformed"));
+    }
+
+    // --- Gap: individual parse_command_tag tests ---
+
+    #[test]
+    fn parse_command_tag_update_standalone() {
+        assert_eq!(parse_command_tag("UPDATE 10"), 10);
+    }
+
+    #[test]
+    fn parse_command_tag_delete_standalone() {
+        assert_eq!(parse_command_tag("DELETE 3"), 3);
+    }
+
+    #[test]
+    fn parse_command_tag_select_standalone() {
+        assert_eq!(parse_command_tag("SELECT 100"), 100);
+    }
+
+    // --- Gap: parse_command_tag_bytes individual variants ---
+
+    #[test]
+    fn parse_command_tag_bytes_insert_standalone() {
+        assert_eq!(parse_command_tag_bytes(b"INSERT 0 5\0"), 5);
+    }
+
+    #[test]
+    fn parse_command_tag_bytes_update_standalone() {
+        assert_eq!(parse_command_tag_bytes(b"UPDATE 10\0"), 10);
+    }
+
+    #[test]
+    fn parse_command_tag_bytes_delete_standalone() {
+        assert_eq!(parse_command_tag_bytes(b"DELETE 3\0"), 3);
+    }
+
+    #[test]
+    fn parse_command_tag_bytes_select_standalone() {
+        assert_eq!(parse_command_tag_bytes(b"SELECT 100\0"), 100);
+    }
+
+    // --- Gap: ParameterDescription valid parse ---
+
+    #[test]
+    fn parameter_description_valid_two_params() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&2i16.to_be_bytes()); // 2 params
+        data.extend_from_slice(&23u32.to_be_bytes()); // int4
+        data.extend_from_slice(&25u32.to_be_bytes()); // text
+        let oids = parse_parameter_description(&data).unwrap();
+        assert_eq!(oids, vec![23, 25]);
+    }
+
+    #[test]
+    fn parameter_description_zero_params() {
+        let data = 0i16.to_be_bytes();
+        let oids = parse_parameter_description(&data).unwrap();
+        assert!(oids.is_empty());
+    }
+
+    #[test]
+    fn parameter_description_truncated() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&2i16.to_be_bytes()); // says 2 params
+        data.extend_from_slice(&23u32.to_be_bytes()); // only 1 param worth of data
+        let result = parse_parameter_description(&data);
+        assert!(result.is_err());
+    }
+
+    // --- Gap: simple_data_row edge cases ---
+
+    #[test]
+    fn simple_data_row_null_value() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&1i16.to_be_bytes()); // 1 column
+        data.extend_from_slice(&(-1i32).to_be_bytes()); // NULL
+        let row = parse_simple_data_row(&data).unwrap();
+        assert_eq!(row, vec![None]);
+    }
+
+    #[test]
+    fn simple_data_row_one_text_value() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&1i16.to_be_bytes()); // 1 column
+        data.extend_from_slice(&5i32.to_be_bytes()); // 5 bytes
+        data.extend_from_slice(b"hello");
+        let row = parse_simple_data_row(&data).unwrap();
+        assert_eq!(row, vec![Some("hello".to_owned())]);
+    }
+
+    #[test]
+    fn simple_data_row_truncated_value() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&1i16.to_be_bytes()); // 1 column
+        data.extend_from_slice(&100i32.to_be_bytes()); // says 100 bytes
+        data.extend_from_slice(b"short"); // only 5 bytes
+        let result = parse_simple_data_row(&data);
+        assert!(result.is_err());
+    }
+
+    // --- Gap: multiple fields in RowDescription ---
+
+    #[test]
+    fn row_description_two_fields() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&2i16.to_be_bytes()); // 2 fields
+
+        // Field 1: "id" int4
+        data.extend_from_slice(b"id\0");
+        data.extend_from_slice(&0u32.to_be_bytes()); // table OID
+        data.extend_from_slice(&0i16.to_be_bytes()); // column attr
+        data.extend_from_slice(&23u32.to_be_bytes()); // type OID (int4)
+        data.extend_from_slice(&4i16.to_be_bytes()); // type size
+        data.extend_from_slice(&(-1i32).to_be_bytes()); // type mod
+        data.extend_from_slice(&1i16.to_be_bytes()); // format
+
+        // Field 2: "name" text
+        data.extend_from_slice(b"name\0");
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.extend_from_slice(&0i16.to_be_bytes());
+        data.extend_from_slice(&25u32.to_be_bytes()); // text
+        data.extend_from_slice(&(-1i16).to_be_bytes()); // variable
+        data.extend_from_slice(&(-1i32).to_be_bytes());
+        data.extend_from_slice(&0i16.to_be_bytes()); // text format
+
+        let cols = parse_row_description(&data).unwrap();
+        assert_eq!(cols.len(), 2);
+        assert_eq!(&*cols[0].name, "id");
+        assert_eq!(cols[0].type_oid, 23);
+        assert_eq!(&*cols[1].name, "name");
+        assert_eq!(cols[1].type_oid, 25);
+    }
 }
