@@ -69,7 +69,7 @@ pub mod driver_sqlite {
 }
 
 pub use error::{BsqlError, BsqlResult};
-pub use executor::Executor;
+pub use executor::{Executor, OwnedResult};
 pub use listener::{Listener, Notification};
 pub use pool::{Pool, PoolBuilder, PoolConnection, PoolStatus};
 #[cfg(feature = "sqlite")]
