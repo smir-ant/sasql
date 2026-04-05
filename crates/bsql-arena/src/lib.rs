@@ -18,13 +18,13 @@
 
 use std::cell::RefCell;
 
-/// Initial chunk size: 64KB covers most result sets without regrowth.
+/// Initial chunk size: 8KB.
 ///
-/// 64KB fits ~800 rows of typical width (80 bytes/row). The old 8KB caused
-/// chunk growth at ~100 rows, adding allocation + prefix_sums rebuild overhead
-/// that scaled with row count. 64KB eliminates regrowth for the common case
-/// while remaining small enough for thread-local pooling (4 × 64KB = 256KB).
-const INITIAL_CHUNK_SIZE: usize = 64 * 1024;
+/// Arena is used only for streaming queries (portal-based chunked fetch).
+/// Regular queries store data in QueryResult.data_buf (a Vec<u8>), not arena.
+/// 8KB is sufficient for streaming chunks and keeps thread-local pool light
+/// (4 arenas × 8KB = 32KB per thread).
+const INITIAL_CHUNK_SIZE: usize = 8 * 1024;
 
 /// Maximum chunk size: 1MB cap to prevent runaway growth.
 const MAX_CHUNK_SIZE: usize = 1024 * 1024;
@@ -67,6 +67,19 @@ impl Arena {
         Self {
             chunks: vec![chunk],
             prefix_sums: vec![0],
+            current: 0,
+            offset: 0,
+        }
+    }
+
+    /// Create an empty arena with zero allocation.
+    ///
+    /// No memory is allocated until `alloc` or `alloc_copy` is called.
+    /// Used by query paths that store data in `QueryResult.data_buf` instead.
+    pub fn empty() -> Self {
+        Self {
+            chunks: Vec::new(),
+            prefix_sums: Vec::new(),
             current: 0,
             offset: 0,
         }

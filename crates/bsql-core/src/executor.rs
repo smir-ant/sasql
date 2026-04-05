@@ -37,6 +37,15 @@ impl OwnedResult {
         Self { result, arena }
     }
 
+    /// Create without arena — for queries that use data_buf instead of arena.
+    /// Zero allocation: Arena::empty() allocates nothing.
+    pub(crate) fn without_arena(result: QueryResult) -> Self {
+        Self {
+            result,
+            arena: Arena::empty(),
+        }
+    }
+
     /// Number of rows.
     pub fn len(&self) -> usize {
         self.result.len()
@@ -105,11 +114,10 @@ impl Executor for Pool {
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<OwnedResult> {
         let mut guard = self.inner.acquire().map_err(BsqlError::from)?;
-        let arena = acquire_arena();
         let result = guard
             .query(sql, sql_hash, params)
             .map_err(BsqlError::from_driver_query)?;
-        Ok(OwnedResult::new(result, arena))
+        Ok(OwnedResult::without_arena(result))
     }
 
     fn query_raw_readonly(
@@ -120,11 +128,10 @@ impl Executor for Pool {
     ) -> BsqlResult<OwnedResult> {
         let pool = self.read_pool.as_ref().unwrap_or(&self.inner);
         let mut guard = pool.acquire().map_err(BsqlError::from)?;
-        let arena = acquire_arena();
         let result = guard
             .query(sql, sql_hash, params)
             .map_err(BsqlError::from_driver_query)?;
-        Ok(OwnedResult::new(result, arena))
+        Ok(OwnedResult::without_arena(result))
     }
 
     fn execute_raw(
