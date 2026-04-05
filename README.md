@@ -8,6 +8,7 @@ Compile-time safe SQL for Rust. PostgreSQL and SQLite.
 - **Always checked** -- there is no unchecked SQL function. In sqlx, one missing `!` (`query()` vs `query!()`) silently skips compile-time validation. In bsql, there is only one function, and it always checks. You cannot accidentally write unchecked SQL because the unchecked version does not exist.
 - **Pure SQL** -- write real SQL. CTEs, JOINs, window functions, subqueries. No DSL, no method chains, no `.filter().select().join()` (hi, diesel). If PostgreSQL or SQLite supports it, bsql validates it.
 - **Faster than C** -- 1.05–2.5x faster than raw C (libpq, sqlite3) on every benchmark. Not synthetic tuning — the same code paths run in benchmarks and in your production app. See [benchmarks](bench/README.md).
+- **Minimal footprint** -- 2.2 MB peak memory (RSS) — 3–7x less than sqlx, diesel, C (libpq), and Go. See [memory benchmarks](bench/README.md#memory-peak-rss).
 - **PostgreSQL and SQLite** -- same `query!` macro, same compile-time safety, both databases. SQLite is not a second-class citizen.
 
 ```rust
@@ -27,7 +28,7 @@ let user = &users[0];
 
 ---
 
-## Performance
+## Performance & Memory
 
 [**You need to see this** 🫢](bench/README.md) — bsql vs C vs Go vs diesel vs sqlx, PostgreSQL and SQLite, full methodology and how to reproduce.
 
