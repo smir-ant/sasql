@@ -317,7 +317,7 @@ fn bytea_column_round_trip() {
 
     let r = user.get().unwrap();
     assert_eq!(r.id, 1);
-    assert_eq!(r.avatar.as_deref(), Some(&[0xDE, 0xAD, 0xBE, 0xEF][..]));
+    assert_eq!(r.avatar, Some(&[0xDE, 0xAD, 0xBE, 0xEF][..]));
 }
 
 #[test]

@@ -39,7 +39,7 @@ fn pg_enum_select_as_text() {
     let r = ticket.get().unwrap();
     assert_eq!(r.id, 1);
     // ::text cast produces a computed column, so PG reports it as nullable
-    assert_eq!(r.status.as_deref(), Some("new"));
+    assert_eq!(r.status, Some("new"));
 }
 
 #[test]
@@ -287,7 +287,7 @@ fn enum_column_cast_to_text() {
 
     let r = ticket.get().unwrap();
     assert_eq!(r.id, 1);
-    assert_eq!(r.status.as_deref(), Some("new"));
+    assert_eq!(r.status, Some("new"));
 }
 
 #[test]
