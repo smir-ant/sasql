@@ -23,8 +23,9 @@ fn singleflight_fetch_one_works() {
         .fetch_one(&pool)
         .unwrap();
 
-    assert_eq!(user.id, 1);
-    assert_eq!(user.login, "alice");
+    let r = user.get().unwrap();
+    assert_eq!(r.id, 1);
+    assert_eq!(r.login, "alice");
 }
 
 /// Basic: singleflight is transparent for fetch_all.
@@ -79,13 +80,13 @@ fn parameterized_query_works_with_singleflight() {
     let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
         .fetch_one(&pool)
         .unwrap();
-    assert_eq!(user.id, 1);
+    assert_eq!(user.get().unwrap().id, 1);
 
     let id = 2i32;
     let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
         .fetch_one(&pool)
         .unwrap();
-    assert_eq!(user.id, 2);
+    assert_eq!(user.get().unwrap().id, 2);
 }
 
 /// Singleflight does NOT apply to transactions (snapshot isolation).
@@ -158,8 +159,9 @@ fn queries_work_after_concurrent_burst() {
     let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
         .fetch_one(pool.as_ref())
         .unwrap();
-    assert_eq!(user.id, 1);
-    assert_eq!(user.login, "alice");
+    let r = user.get().unwrap();
+    assert_eq!(r.id, 1);
+    assert_eq!(r.login, "alice");
 }
 
 /// fetch_optional through singleflight path works.
@@ -171,7 +173,7 @@ fn singleflight_fetch_optional_works() {
         .fetch_optional(&pool)
         .unwrap();
     assert!(user.is_some());
-    assert_eq!(user.unwrap().login, "alice");
+    assert_eq!(user.unwrap().get().unwrap().login, "alice");
 }
 
 /// Different SQL texts are independently handled by singleflight.

@@ -19,10 +19,11 @@ fn select_fetch_one() {
             .fetch_one(&pool)
             .unwrap();
 
-    assert_eq!(user.id, 1);
-    assert_eq!(user.login, "alice");
-    assert_eq!(user.first_name, "Alice");
-    assert_eq!(user.last_name, "Smith");
+    let r = user.get().unwrap();
+    assert_eq!(r.id, 1);
+    assert_eq!(r.login, "alice");
+    assert_eq!(r.first_name, "Alice");
+    assert_eq!(r.last_name, "Smith");
 }
 
 #[test]
@@ -46,7 +47,7 @@ fn select_fetch_optional_found() {
         .unwrap();
 
     assert!(user.is_some());
-    assert_eq!(user.unwrap().login, "alice");
+    assert_eq!(user.unwrap().get().unwrap().login, "alice");
 }
 
 #[test]
@@ -68,8 +69,9 @@ fn select_nullable_column() {
         .fetch_one(&pool)
         .unwrap();
 
-    assert_eq!(user.id, 1);
-    assert!(user.middle_name.is_none());
+    let r = user.get().unwrap();
+    assert_eq!(r.id, 1);
+    assert!(r.middle_name.is_none());
 }
 
 #[test]
@@ -151,12 +153,13 @@ fn select_multiple_types() {
     .fetch_one(&pool)
     .unwrap();
 
-    assert_eq!(user.id, 1i32);
-    assert_eq!(user.login, "alice");
-    assert!(user.active);
-    assert_eq!(user.score, 42i16);
-    assert!((user.rating - 4.5f32).abs() < f32::EPSILON);
-    assert!((user.balance - 100.50f64).abs() < f64::EPSILON);
+    let r = user.get().unwrap();
+    assert_eq!(r.id, 1i32);
+    assert_eq!(r.login, "alice");
+    assert!(r.active);
+    assert_eq!(r.score, 42i16);
+    assert!((r.rating - 4.5f32).abs() < f32::EPSILON);
+    assert!((r.balance - 100.50f64).abs() < f64::EPSILON);
 }
 
 #[test]
@@ -166,10 +169,11 @@ fn select_count_expression() {
     let result = bsql::query!("SELECT COUNT(*) as cnt FROM users")
         .fetch_one(&pool)
         .unwrap();
+    let r = result.get().unwrap();
     // COUNT(*) never returns NULL (returns 0 for empty sets)
     // but our system defaults computed columns to nullable -> Option<i64>
-    assert!(result.cnt.is_some());
-    assert!(result.cnt.unwrap() >= 2);
+    assert!(r.cnt.is_some());
+    assert!(r.cnt.unwrap() >= 2);
 }
 
 #[test]
@@ -184,9 +188,10 @@ fn select_with_join_and_aliases() {
     )
     .fetch_one(&pool)
     .unwrap();
-    assert_eq!(result.ticket_id, 1);
-    assert_eq!(result.title, "Fix login bug");
-    assert_eq!(result.creator, "alice");
+    let r = result.get().unwrap();
+    assert_eq!(r.ticket_id, 1);
+    assert_eq!(r.title, "Fix login bug");
+    assert_eq!(r.creator, "alice");
 }
 
 #[test]
@@ -220,8 +225,9 @@ fn select_expression_arithmetic() {
     let result = bsql::query!("SELECT 1 + 1 as sum_val")
         .fetch_one(&pool)
         .unwrap();
+    let r = result.get().unwrap();
     // Computed expression -> nullable by default
-    assert_eq!(result.sum_val, Some(2i32));
+    assert_eq!(r.sum_val, Some(2i32));
 }
 
 #[test]
@@ -270,7 +276,8 @@ fn param_reuse_in_real_query() {
     let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32 AND id = $id: i32")
         .fetch_one(&pool)
         .unwrap();
-    assert_eq!(user.id, 1);
+    let r = user.get().unwrap();
+    assert_eq!(r.id, 1);
 }
 
 #[test]
@@ -308,8 +315,9 @@ fn bytea_column_round_trip() {
         .fetch_one(&pool)
         .unwrap();
 
-    assert_eq!(user.id, 1);
-    assert_eq!(user.avatar.as_deref(), Some(&[0xDE, 0xAD, 0xBE, 0xEF][..]));
+    let r = user.get().unwrap();
+    assert_eq!(r.id, 1);
+    assert_eq!(r.avatar.as_deref(), Some(&[0xDE, 0xAD, 0xBE, 0xEF][..]));
 }
 
 #[test]
@@ -320,8 +328,9 @@ fn array_column_type() {
         .fetch_one(&pool)
         .unwrap();
 
-    assert_eq!(user.id, 1);
-    assert!(user.tag_ids.is_empty()); // default '{}'
+    let r = user.get().unwrap();
+    assert_eq!(r.id, 1);
+    assert!(r.tag_ids.is_empty()); // default '{}'
 }
 
 #[test]
@@ -337,7 +346,8 @@ fn select_star() {
     let user = bsql::query!("SELECT * FROM users WHERE id = $id: i32")
         .fetch_one(&pool)
         .unwrap();
-    assert_eq!(user.id, 1);
+    let r = user.get().unwrap();
+    assert_eq!(r.id, 1);
 }
 
 #[test]
@@ -404,7 +414,8 @@ fn pool_acquire_and_use() {
     let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
         .fetch_one(&conn)
         .unwrap();
-    assert_eq!(user.id, 1);
+    let r = user.get().unwrap();
+    assert_eq!(r.id, 1);
 }
 
 #[test]
@@ -455,8 +466,9 @@ fn warmup_prepares_statements() {
     let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
         .fetch_one(&conn)
         .unwrap();
-    assert_eq!(user.id, 1);
-    assert_eq!(user.login, "alice");
+    let r = user.get().unwrap();
+    assert_eq!(r.id, 1);
+    assert_eq!(r.login, "alice");
 }
 
 // ---------------------------------------------------------------------------
@@ -525,7 +537,8 @@ fn fetch_stream_drop_mid_iteration() {
     let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
         .fetch_one(&pool)
         .unwrap();
-    assert_eq!(user.id, 1);
+    let r = user.get().unwrap();
+    assert_eq!(r.id, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -550,5 +563,6 @@ fn fetch_stream_fully_consumed() {
     let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
         .fetch_one(&pool)
         .unwrap();
-    assert_eq!(user.id, 1);
+    let r = user.get().unwrap();
+    assert_eq!(r.id, 1);
 }

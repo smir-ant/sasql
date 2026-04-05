@@ -682,7 +682,7 @@ impl PoolGuard {
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
-    ) -> Result<Box<str>, DriverError> {
+    ) -> Result<[u8; 18], DriverError> {
         self.conn
             .as_mut()
             .ok_or_else(|| DriverError::Pool("connection already taken".into()))?

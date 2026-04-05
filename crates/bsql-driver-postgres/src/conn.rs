@@ -402,9 +402,10 @@ impl Connection {
             return Ok(());
         }
         let name = make_stmt_name(sql_hash);
+        let name_s: &str = std::str::from_utf8(&name).expect("ASCII");
         self.write_buf.clear();
-        proto::write_parse(&mut self.write_buf, &name, sql, &[]);
-        proto::write_describe(&mut self.write_buf, b'S', &name);
+        proto::write_parse(&mut self.write_buf, name_s, sql, &[]);
+        proto::write_describe(&mut self.write_buf, b'S', name_s);
         proto::write_sync(&mut self.write_buf);
         self.flush_write()?;
 
@@ -634,11 +635,11 @@ impl Connection {
                 has_exec_sync = true;
             } else {
                 self.write_buf.clear();
-                proto::write_bind_params(&mut self.write_buf, "", &info.name, params);
+                proto::write_bind_params(&mut self.write_buf, "", info.name_str(), params);
                 info.bind_template = None;
             }
         } else {
-            proto::write_bind_params(&mut self.write_buf, "", &info.name, params);
+            proto::write_bind_params(&mut self.write_buf, "", info.name_str(), params);
         }
 
         // Snapshot bind template on first use or after invalidation.
@@ -813,13 +814,14 @@ impl Connection {
         }
 
         let name = make_stmt_name(sql_hash);
+        let name_s: &str = std::str::from_utf8(&name).expect("ASCII");
         let param_oids: smallvec::SmallVec<[u32; 8]> =
             params.iter().map(|p| p.type_oid()).collect();
 
         self.write_buf.clear();
-        proto::write_parse(&mut self.write_buf, &name, sql, &param_oids);
-        proto::write_describe(&mut self.write_buf, b'S', &name);
-        proto::write_bind_params(&mut self.write_buf, "", &name, params);
+        proto::write_parse(&mut self.write_buf, name_s, sql, &param_oids);
+        proto::write_describe(&mut self.write_buf, b'S', name_s);
+        proto::write_bind_params(&mut self.write_buf, "", name_s, params);
         self.write_buf.extend_from_slice(proto::EXECUTE_SYNC);
         self.stream
             .write_all(&self.write_buf)
@@ -973,6 +975,7 @@ impl Connection {
         // Ensure statement is prepared.
         if !self.stmts.contains_key(&sql_hash) {
             let name = make_stmt_name(sql_hash);
+            let name_s: &str = std::str::from_utf8(&name).expect("ASCII");
             let first_params = param_sets[0];
             if first_params.len() > i16::MAX as usize {
                 return Err(DriverError::Protocol(format!(
@@ -983,8 +986,8 @@ impl Connection {
             }
             let param_oids: smallvec::SmallVec<[u32; 8]> =
                 first_params.iter().map(|p| p.type_oid()).collect();
-            proto::write_parse(&mut self.write_buf, &name, sql, &param_oids);
-            proto::write_describe(&mut self.write_buf, b'S', &name);
+            proto::write_parse(&mut self.write_buf, name_s, sql, &param_oids);
+            proto::write_describe(&mut self.write_buf, b'S', name_s);
             proto::write_sync(&mut self.write_buf);
             self.flush_write()?;
 
@@ -1011,8 +1014,8 @@ impl Connection {
             .stmts
             .get(&sql_hash)
             .expect("BUG: stmt just cached but not found")
-            .name
-            .clone();
+            .name_str()
+            .to_owned();
         let count = param_sets.len();
 
         for params in param_sets {
@@ -1077,12 +1080,13 @@ impl Connection {
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
-    ) -> Result<Box<str>, DriverError> {
+    ) -> Result<[u8; 18], DriverError> {
         if let Some(info) = self.stmts.get(&sql_hash) {
-            return Ok(info.name.clone());
+            return Ok(info.name);
         }
 
         let name = make_stmt_name(sql_hash);
+        let name_s: &str = std::str::from_utf8(&name).expect("ASCII");
         if params.len() > i16::MAX as usize {
             return Err(DriverError::Protocol(format!(
                 "parameter count {} exceeds maximum {}",
@@ -1094,8 +1098,8 @@ impl Connection {
             params.iter().map(|p| p.type_oid()).collect();
 
         self.write_buf.clear();
-        proto::write_parse(&mut self.write_buf, &name, sql, &param_oids);
-        proto::write_describe(&mut self.write_buf, b'S', &name);
+        proto::write_parse(&mut self.write_buf, name_s, sql, &param_oids);
+        proto::write_describe(&mut self.write_buf, b'S', name_s);
         proto::write_sync(&mut self.write_buf);
         self.flush_write()?;
 
@@ -1104,7 +1108,6 @@ impl Connection {
         self.expect_ready()?;
 
         self.query_counter += 1;
-        let stmt_name = name.clone();
         self.cache_stmt(
             sql_hash,
             StmtInfo {
@@ -1115,7 +1118,7 @@ impl Connection {
             },
         );
 
-        Ok(stmt_name)
+        Ok(name)
     }
 
     /// Write Bind+Execute message bytes for a prepared statement into an
@@ -1126,11 +1129,11 @@ impl Connection {
         params: &[&(dyn Encode + Sync)],
         buf: &mut Vec<u8>,
     ) {
-        let stmt_name = &self
+        let stmt_name = self
             .stmts
             .get(&sql_hash)
             .expect("BUG: stmt just cached but not found")
-            .name;
+            .name_str();
         proto::write_bind_params(buf, "", stmt_name, params);
         buf.extend_from_slice(proto::EXECUTE_ONLY);
     }
@@ -1372,11 +1375,11 @@ impl Connection {
                 has_exec_sync = true;
             } else {
                 self.write_buf.clear();
-                proto::write_bind_params(&mut self.write_buf, "", &info.name, params);
+                proto::write_bind_params(&mut self.write_buf, "", info.name_str(), params);
                 info.bind_template = None;
             }
         } else {
-            proto::write_bind_params(&mut self.write_buf, "", &info.name, params);
+            proto::write_bind_params(&mut self.write_buf, "", info.name_str(), params);
         }
 
         // Snapshot bind template on first use or after invalidation.
@@ -1598,13 +1601,14 @@ impl Connection {
         }
 
         let name = make_stmt_name(sql_hash);
+        let name_s: &str = std::str::from_utf8(&name).expect("ASCII");
         let param_oids: smallvec::SmallVec<[u32; 8]> =
             params.iter().map(|p| p.type_oid()).collect();
 
         self.write_buf.clear();
-        proto::write_parse(&mut self.write_buf, &name, sql, &param_oids);
-        proto::write_describe(&mut self.write_buf, b'S', &name);
-        proto::write_bind_params(&mut self.write_buf, "", &name, params);
+        proto::write_parse(&mut self.write_buf, name_s, sql, &param_oids);
+        proto::write_describe(&mut self.write_buf, b'S', name_s);
+        proto::write_bind_params(&mut self.write_buf, "", name_s, params);
         self.write_buf.extend_from_slice(proto::EXECUTE_SYNC);
         self.stream
             .write_all(&self.write_buf)
@@ -1977,11 +1981,11 @@ impl Connection {
 
                 if !template_ok {
                     self.write_buf.clear();
-                    proto::write_bind_params(&mut self.write_buf, "", &info.name, params);
+                    proto::write_bind_params(&mut self.write_buf, "", info.name_str(), params);
                     info.bind_template = None;
                 }
             } else {
-                proto::write_bind_params(&mut self.write_buf, "", &info.name, params);
+                proto::write_bind_params(&mut self.write_buf, "", info.name_str(), params);
             }
 
             let cols = info.columns.clone();
@@ -1999,11 +2003,12 @@ impl Connection {
         } else {
             // Cache miss: Parse+Describe+Bind+Execute+Flush
             let name = make_stmt_name(sql_hash);
+            let name_s: &str = std::str::from_utf8(&name).expect("ASCII");
             let param_oids: smallvec::SmallVec<[u32; 8]> =
                 params.iter().map(|p| p.type_oid()).collect();
-            proto::write_parse(&mut self.write_buf, &name, sql, &param_oids);
-            proto::write_describe(&mut self.write_buf, b'S', &name);
-            proto::write_bind_params(&mut self.write_buf, "", &name, params);
+            proto::write_parse(&mut self.write_buf, name_s, sql, &param_oids);
+            proto::write_describe(&mut self.write_buf, b'S', name_s);
+            proto::write_bind_params(&mut self.write_buf, "", name_s, params);
 
             proto::write_execute(&mut self.write_buf, "", chunk_size);
             proto::write_flush(&mut self.write_buf);
@@ -2276,12 +2281,12 @@ impl Connection {
                     has_exec_sync = true; // Template includes EXECUTE_SYNC.
                 } else {
                     self.write_buf.clear();
-                    proto::write_bind_params(&mut self.write_buf, "", &info.name, params);
+                    proto::write_bind_params(&mut self.write_buf, "", info.name_str(), params);
                     // Invalidate stale template so we re-snapshot below.
                     info.bind_template = None;
                 }
             } else {
-                proto::write_bind_params(&mut self.write_buf, "", &info.name, params);
+                proto::write_bind_params(&mut self.write_buf, "", info.name_str(), params);
             }
 
             let cols = if need_columns {
@@ -2306,11 +2311,12 @@ impl Connection {
         } else {
             // Cache miss: Parse+Describe+Bind+Execute+Sync
             let name = make_stmt_name(sql_hash);
+            let name_s: &str = std::str::from_utf8(&name).expect("ASCII");
             let param_oids: smallvec::SmallVec<[u32; 8]> =
                 params.iter().map(|p| p.type_oid()).collect();
-            proto::write_parse(&mut self.write_buf, &name, sql, &param_oids);
-            proto::write_describe(&mut self.write_buf, b'S', &name);
-            proto::write_bind_params(&mut self.write_buf, "", &name, params);
+            proto::write_parse(&mut self.write_buf, name_s, sql, &param_oids);
+            proto::write_describe(&mut self.write_buf, b'S', name_s);
+            proto::write_bind_params(&mut self.write_buf, "", name_s, params);
 
             self.write_buf.extend_from_slice(proto::EXECUTE_SYNC);
             self.flush_write()?;
@@ -2368,7 +2374,7 @@ impl Connection {
     fn cache_stmt(&mut self, sql_hash: u64, info: StmtInfo) {
         if self.stmts.len() >= self.max_stmt_cache_size && !self.stmts.contains_key(&sql_hash) {
             if let Some((_lru_hash, evicted)) = self.stmts.evict_lru() {
-                proto::write_close(&mut self.write_buf, b'S', &evicted.name);
+                proto::write_close(&mut self.write_buf, b'S', evicted.name_str());
             }
         }
         self.stmts.insert(sql_hash, info);

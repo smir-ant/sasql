@@ -229,8 +229,9 @@ fn transaction_read_your_writes() {
     let found = bsql::query!("SELECT id, title FROM tickets WHERE id = $ticket_id: i32")
         .fetch_one(&tx)
         .unwrap();
-    assert_eq!(found.id, ticket_id);
-    assert_eq!(found.title, "tx_read_write_test");
+    let r = found.get().unwrap();
+    assert_eq!(r.id, ticket_id);
+    assert_eq!(r.title, "tx_read_write_test");
 
     tx.rollback().unwrap();
 }
@@ -317,7 +318,8 @@ fn transaction_commit_without_queries_is_noop() {
     let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
         .fetch_one(&pool)
         .unwrap();
-    assert_eq!(user.id, 1);
+    let r = user.get().unwrap();
+    assert_eq!(r.id, 1);
 }
 
 #[test]
@@ -336,7 +338,8 @@ fn transaction_rollback_without_queries_is_noop() {
     let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
         .fetch_one(&pool)
         .unwrap();
-    assert_eq!(user.id, 1);
+    let r = user.get().unwrap();
+    assert_eq!(r.id, 1);
 }
 
 #[test]
@@ -360,7 +363,8 @@ fn transaction_drop_without_queries_returns_connection_clean() {
     let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
         .fetch_one(&pool)
         .unwrap();
-    assert_eq!(user.id, 1, "connection should be clean and reusable");
+    let r = user.get().unwrap();
+    assert_eq!(r.id, 1, "connection should be clean and reusable");
 }
 
 #[test]
@@ -373,8 +377,9 @@ fn transaction_lazy_begin_first_query_triggers_begin() {
     let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
         .fetch_one(&tx)
         .unwrap();
-    assert_eq!(user.id, 1);
-    assert_eq!(user.login, "alice");
+    let r = user.get().unwrap();
+    assert_eq!(r.id, 1);
+    assert_eq!(r.login, "alice");
 
     tx.commit().unwrap();
 }

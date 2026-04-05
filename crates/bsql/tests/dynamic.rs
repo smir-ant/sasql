@@ -203,7 +203,7 @@ fn optional_clause_fetch_optional_found() {
     .unwrap();
 
     assert!(result.is_some());
-    assert_eq!(result.unwrap().login, "alice");
+    assert_eq!(result.unwrap().get().unwrap().login, "alice");
 }
 
 #[test]

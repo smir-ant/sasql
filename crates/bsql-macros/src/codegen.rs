@@ -233,8 +233,96 @@ pub fn generate_sort_query_code(
         let result_name = result_struct_name(parsed);
         let stream_name = stream_struct_name(parsed);
         let row_decode = gen_row_decode(validation);
+        let r_rows_name = rows_struct_name(parsed);
+        let r_single_name = single_ref_struct_name(parsed);
 
         let qm = &query_method;
+
+        // For SELECT: fetch/fetch_one/fetch_optional return zero-copy borrowed wrappers.
+        // For non-SELECT: fetch_one/fetch_optional return owned types.
+        let zero_copy_methods = if is_select {
+            quote! {
+                /// Fetch all rows, returning a wrapper with zero-allocation borrowed access.
+                pub fn fetch<E: ::bsql_core::Executor>(
+                    self,
+                    executor: &E,
+                ) -> ::bsql_core::BsqlResult<#r_rows_name> {
+                    #build_sql
+                    let owned = executor.query_raw_readonly(sql, sql_hash, #params_slice)?;
+                    Ok(#r_rows_name { owned })
+                }
+
+                /// Fetch exactly one row as a borrowed wrapper.
+                pub fn fetch_one<E: ::bsql_core::Executor>(
+                    self,
+                    executor: &E,
+                ) -> ::bsql_core::BsqlResult<#r_single_name> {
+                    #build_limited_sql
+                    let owned = executor.query_raw_readonly(sql, sql_hash, #params_slice)?;
+                    if owned.len() != 1 {
+                        return Err(::bsql_core::error::QueryError::row_count(
+                            "exactly 1 row",
+                            owned.len() as u64,
+                        ));
+                    }
+                    Ok(#r_single_name { owned })
+                }
+
+                /// Fetch zero or one row as a borrowed wrapper.
+                pub fn fetch_optional<E: ::bsql_core::Executor>(
+                    self,
+                    executor: &E,
+                ) -> ::bsql_core::BsqlResult<Option<#r_single_name>> {
+                    #build_limited_sql
+                    let owned = executor.query_raw_readonly(sql, sql_hash, #params_slice)?;
+                    match owned.len() {
+                        0 => Ok(None),
+                        1 => Ok(Some(#r_single_name { owned })),
+                        n => Err(::bsql_core::error::QueryError::row_count(
+                            "0 or 1 rows",
+                            n as u64,
+                        )),
+                    }
+                }
+            }
+        } else {
+            quote! {
+                pub fn fetch_one<E: ::bsql_core::Executor>(
+                    self,
+                    executor: &E,
+                ) -> ::bsql_core::BsqlResult<#result_name> {
+                    #build_limited_sql
+                    let owned = executor.#qm(sql, sql_hash, #params_slice)?;
+                    if owned.len() != 1 {
+                        return Err(::bsql_core::error::QueryError::row_count(
+                            "exactly 1 row",
+                            owned.len() as u64,
+                        ));
+                    }
+                    let row = owned.row(0);
+                    Ok(#result_name { #row_decode })
+                }
+
+                pub fn fetch_optional<E: ::bsql_core::Executor>(
+                    self,
+                    executor: &E,
+                ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
+                    #build_limited_sql
+                    let owned = executor.#qm(sql, sql_hash, #params_slice)?;
+                    match owned.len() {
+                        0 => Ok(None),
+                        1 => {
+                            let row = owned.row(0);
+                            Ok(Some(#result_name { #row_decode }))
+                        }
+                        n => Err(::bsql_core::error::QueryError::row_count(
+                            "0 or 1 rows",
+                            n as u64,
+                        )),
+                    }
+                }
+            }
+        };
 
         quote! {
             #[allow(non_camel_case_types)]
@@ -264,21 +352,7 @@ pub fn generate_sort_query_code(
 
             #[allow(non_camel_case_types)]
             impl<'_bsql> #executor_name<'_bsql> {
-                pub fn fetch_one<E: ::bsql_core::Executor>(
-                    self,
-                    executor: &E,
-                ) -> ::bsql_core::BsqlResult<#result_name> {
-                    #build_limited_sql
-                    let owned = executor.#qm(sql, sql_hash, #params_slice)?;
-                    if owned.len() != 1 {
-                        return Err(::bsql_core::error::QueryError::row_count(
-                            "exactly 1 row",
-                            owned.len() as u64,
-                        ));
-                    }
-                    let row = owned.row(0);
-                    Ok(#result_name { #row_decode })
-                }
+                #zero_copy_methods
 
                 pub fn fetch_all<E: ::bsql_core::Executor>(
                     self,
@@ -287,25 +361,6 @@ pub fn generate_sort_query_code(
                     #build_sql
                     let owned = executor.#qm(sql, sql_hash, #params_slice)?;
                     owned.iter().map(|row| Ok(#result_name { #row_decode })).collect::<::bsql_core::BsqlResult<Vec<_>>>()
-                }
-
-                pub fn fetch_optional<E: ::bsql_core::Executor>(
-                    self,
-                    executor: &E,
-                ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
-                    #build_limited_sql
-                    let owned = executor.#qm(sql, sql_hash, #params_slice)?;
-                    match owned.len() {
-                        0 => Ok(None),
-                        1 => {
-                            let row = owned.row(0);
-                            Ok(Some(#result_name { #row_decode }))
-                        }
-                        n => Err(::bsql_core::error::QueryError::row_count(
-                            "0 or 1 rows",
-                            n as u64,
-                        )),
-                    }
                 }
 
                 pub fn fetch_stream(
@@ -329,16 +384,6 @@ pub fn generate_sort_query_code(
                 pub fn defer(self, tx: &::bsql_core::Transaction) -> ::bsql_core::BsqlResult<()> {
                     #build_sql
                     tx.defer_execute(sql, sql_hash, #params_slice)
-                }
-
-                // --- Simple API ---
-
-                /// Fetch all rows as a Vec.
-                pub fn fetch<E: ::bsql_core::Executor>(
-                    self,
-                    executor: &E,
-                ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
-                    self.fetch_all(executor)
                 }
 
                 /// Execute (INSERT/UPDATE/DELETE). Returns affected row count.
@@ -380,61 +425,9 @@ pub fn generate_sort_query_code(
         }
     };
 
-    // --- fetch_ref for sort queries ---
-    let fetch_ref_block = if has_columns && is_select {
-        let r_rows_name = rows_struct_name(parsed);
-        let r_single_name = single_ref_struct_name(parsed);
-
-        quote! {
-            #[allow(non_camel_case_types)]
-            impl<'_bsql> #executor_name<'_bsql> {
-                /// Fetch all rows, returning a wrapper with zero-allocation borrowed access.
-                pub fn fetch_ref<E: ::bsql_core::Executor>(
-                    self,
-                    executor: &E,
-                ) -> ::bsql_core::BsqlResult<#r_rows_name> {
-                    #build_sql
-                    let owned = executor.query_raw_readonly(sql, sql_hash, #params_slice)?;
-                    Ok(#r_rows_name { owned })
-                }
-
-                /// Fetch exactly one row as a borrowed wrapper.
-                pub fn fetch_one_ref<E: ::bsql_core::Executor>(
-                    self,
-                    executor: &E,
-                ) -> ::bsql_core::BsqlResult<#r_single_name> {
-                    #build_limited_sql
-                    let owned = executor.query_raw_readonly(sql, sql_hash, #params_slice)?;
-                    if owned.len() != 1 {
-                        return Err(::bsql_core::error::QueryError::row_count(
-                            "exactly 1 row",
-                            owned.len() as u64,
-                        ));
-                    }
-                    Ok(#r_single_name { owned })
-                }
-
-                /// Fetch zero or one row as a borrowed wrapper.
-                pub fn fetch_optional_ref<E: ::bsql_core::Executor>(
-                    self,
-                    executor: &E,
-                ) -> ::bsql_core::BsqlResult<Option<#r_single_name>> {
-                    #build_limited_sql
-                    let owned = executor.query_raw_readonly(sql, sql_hash, #params_slice)?;
-                    match owned.len() {
-                        0 => Ok(None),
-                        1 => Ok(Some(#r_single_name { owned })),
-                        n => Err(::bsql_core::error::QueryError::row_count(
-                            "0 or 1 rows",
-                            n as u64,
-                        )),
-                    }
-                }
-            }
-        }
-    } else {
-        TokenStream::new()
-    };
+    // fetch_ref / fetch_one_ref / fetch_optional_ref removed for sort queries —
+    // fetch/fetch_one/fetch_optional now return zero-copy borrowed wrappers directly.
+    let fetch_ref_block = TokenStream::new();
 
     let for_each_row_struct = gen_pg_for_each_row_struct(parsed, validation);
     let rows_struct = gen_rows_struct(parsed, validation);
@@ -589,21 +582,50 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
         let result_name = result_struct_name(parsed);
         let stream_name = stream_struct_name(parsed);
 
-        quote! {
-            pub fn fetch_one<E: ::bsql_core::Executor>(
-                self,
-                executor: &E,
-            ) -> ::bsql_core::BsqlResult<#result_name> {
-                let owned = executor.#query_method(#limited_sql_lit, #limited_sql_hash_val, #params_slice)?;
-                if owned.len() != 1 {
-                    return Err(::bsql_core::error::QueryError::row_count(
-                        "exactly 1 row",
-                        owned.len() as u64,
-                    ));
+        // For SELECT queries, fetch_one/fetch_optional are generated in simple_api_fetch
+        // returning zero-copy borrowed wrappers. For non-SELECT (e.g. INSERT RETURNING),
+        // they return owned types here.
+        let owned_fetch_one_optional = if is_select {
+            TokenStream::new()
+        } else {
+            quote! {
+                pub fn fetch_one<E: ::bsql_core::Executor>(
+                    self,
+                    executor: &E,
+                ) -> ::bsql_core::BsqlResult<#result_name> {
+                    let owned = executor.#query_method(#limited_sql_lit, #limited_sql_hash_val, #params_slice)?;
+                    if owned.len() != 1 {
+                        return Err(::bsql_core::error::QueryError::row_count(
+                            "exactly 1 row",
+                            owned.len() as u64,
+                        ));
+                    }
+                    let row = owned.row(0);
+                    Ok(#result_name { #row_decode })
                 }
-                let row = owned.row(0);
-                Ok(#result_name { #row_decode })
+
+                pub fn fetch_optional<E: ::bsql_core::Executor>(
+                    self,
+                    executor: &E,
+                ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
+                    let owned = executor.#query_method(#limited_sql_lit, #limited_sql_hash_val, #params_slice)?;
+                    match owned.len() {
+                        0 => Ok(None),
+                        1 => {
+                            let row = owned.row(0);
+                            Ok(Some(#result_name { #row_decode }))
+                        }
+                        n => Err(::bsql_core::error::QueryError::row_count(
+                            "0 or 1 rows",
+                            n as u64,
+                        )),
+                    }
+                }
             }
+        };
+
+        quote! {
+            #owned_fetch_one_optional
 
             pub fn fetch_all<E: ::bsql_core::Executor>(
                 self,
@@ -611,24 +633,6 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
             ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
                 let owned = executor.#query_method(#sql_lit, #sql_hash_val, #params_slice)?;
                 owned.iter().map(|row| Ok(#result_name { #row_decode })).collect::<::bsql_core::BsqlResult<Vec<_>>>()
-            }
-
-            pub fn fetch_optional<E: ::bsql_core::Executor>(
-                self,
-                executor: &E,
-            ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
-                let owned = executor.#query_method(#limited_sql_lit, #limited_sql_hash_val, #params_slice)?;
-                match owned.len() {
-                    0 => Ok(None),
-                    1 => {
-                        let row = owned.row(0);
-                        Ok(Some(#result_name { #row_decode }))
-                    }
-                    n => Err(::bsql_core::error::QueryError::row_count(
-                        "0 or 1 rows",
-                        n as u64,
-                    )),
-                }
             }
 
             pub fn fetch_stream(
@@ -643,59 +647,9 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
         TokenStream::new()
     };
 
-    // --- fetch_ref / fetch_one_ref / fetch_optional_ref (zero-allocation borrowed) ---
-    let fetch_ref_methods = if has_columns && is_select {
-        let r_rows_name = rows_struct_name(parsed);
-        let r_single_name = single_ref_struct_name(parsed);
-
-        quote! {
-            /// Fetch all rows, returning a wrapper with zero-allocation borrowed access.
-            ///
-            /// Unlike `fetch_all` which copies every `String`/`Vec<u8>` into owned
-            /// structs, `fetch_ref` keeps the data in the arena and hands out `&str` /
-            /// `&[u8]` references via the `get(idx)` / `iter()` methods.
-            pub fn fetch_ref<E: ::bsql_core::Executor>(
-                self,
-                executor: &E,
-            ) -> ::bsql_core::BsqlResult<#r_rows_name> {
-                let owned = executor.query_raw_readonly(#sql_lit, #sql_hash_val, #params_slice)?;
-                Ok(#r_rows_name { owned })
-            }
-
-            /// Fetch exactly one row as a borrowed wrapper.
-            pub fn fetch_one_ref<E: ::bsql_core::Executor>(
-                self,
-                executor: &E,
-            ) -> ::bsql_core::BsqlResult<#r_single_name> {
-                let owned = executor.query_raw_readonly(#limited_sql_lit, #limited_sql_hash_val, #params_slice)?;
-                if owned.len() != 1 {
-                    return Err(::bsql_core::error::QueryError::row_count(
-                        "exactly 1 row",
-                        owned.len() as u64,
-                    ));
-                }
-                Ok(#r_single_name { owned })
-            }
-
-            /// Fetch zero or one row as a borrowed wrapper.
-            pub fn fetch_optional_ref<E: ::bsql_core::Executor>(
-                self,
-                executor: &E,
-            ) -> ::bsql_core::BsqlResult<Option<#r_single_name>> {
-                let owned = executor.query_raw_readonly(#limited_sql_lit, #limited_sql_hash_val, #params_slice)?;
-                match owned.len() {
-                    0 => Ok(None),
-                    1 => Ok(Some(#r_single_name { owned })),
-                    n => Err(::bsql_core::error::QueryError::row_count(
-                        "0 or 1 rows",
-                        n as u64,
-                    )),
-                }
-            }
-        }
-    } else {
-        TokenStream::new()
-    };
+    // fetch_ref / fetch_one_ref / fetch_optional_ref removed — fetch/fetch_one/fetch_optional
+    // now return the zero-copy borrowed wrappers directly.
+    let fetch_ref_methods = TokenStream::new();
 
     // Use extracted gen_stream_struct (F-26)
     let stream_struct = if has_columns {
@@ -800,17 +754,57 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
         TokenStream::new()
     };
 
-    // --- Simple API (fetch/run) ---
-    let simple_api_fetch = if has_columns {
-        let result_name = result_struct_name(parsed);
+    // --- Simple API (fetch/fetch_one/fetch_optional/run) ---
+    // fetch(), fetch_one(), fetch_optional() now return zero-copy borrowed wrappers
+    // (the old fetch_ref / fetch_one_ref / fetch_optional_ref).
+    // fetch_all() remains as the owned-String variant for users who need it.
+    let simple_api_fetch = if has_columns && is_select {
+        let r_rows_name = rows_struct_name(parsed);
+        let r_single_name = single_ref_struct_name(parsed);
 
         quote! {
-            /// Fetch all rows as a Vec.
+            /// Fetch all rows, returning a wrapper with zero-allocation borrowed access.
+            ///
+            /// Unlike `fetch_all` which copies every `String`/`Vec<u8>` into owned
+            /// structs, `fetch` keeps the data in the arena and hands out `&str` /
+            /// `&[u8]` references via the `get(idx)` / `iter()` methods.
             pub fn fetch<E: ::bsql_core::Executor>(
                 self,
                 executor: &E,
-            ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
-                self.fetch_all(executor)
+            ) -> ::bsql_core::BsqlResult<#r_rows_name> {
+                let owned = executor.query_raw_readonly(#sql_lit, #sql_hash_val, #params_slice)?;
+                Ok(#r_rows_name { owned })
+            }
+
+            /// Fetch exactly one row as a borrowed wrapper.
+            pub fn fetch_one<E: ::bsql_core::Executor>(
+                self,
+                executor: &E,
+            ) -> ::bsql_core::BsqlResult<#r_single_name> {
+                let owned = executor.query_raw_readonly(#limited_sql_lit, #limited_sql_hash_val, #params_slice)?;
+                if owned.len() != 1 {
+                    return Err(::bsql_core::error::QueryError::row_count(
+                        "exactly 1 row",
+                        owned.len() as u64,
+                    ));
+                }
+                Ok(#r_single_name { owned })
+            }
+
+            /// Fetch zero or one row as a borrowed wrapper.
+            pub fn fetch_optional<E: ::bsql_core::Executor>(
+                self,
+                executor: &E,
+            ) -> ::bsql_core::BsqlResult<Option<#r_single_name>> {
+                let owned = executor.query_raw_readonly(#limited_sql_lit, #limited_sql_hash_val, #params_slice)?;
+                match owned.len() {
+                    0 => Ok(None),
+                    1 => Ok(Some(#r_single_name { owned })),
+                    n => Err(::bsql_core::error::QueryError::row_count(
+                        "0 or 1 rows",
+                        n as u64,
+                    )),
+                }
             }
         }
     } else {
@@ -914,20 +908,61 @@ fn gen_dynamic_executor_impls(
             && !parsed.normalized_sql.contains(" for ");
 
         let qm = &query_method;
-        let fetch_one_dispatcher =
-            gen_variant_dispatcher(parsed, variants, needs_limit, |sql_lit, sql_hash| {
-                quote! {
-                    let owned = executor.#qm(#sql_lit, #sql_hash, &params_slice[..])?;
-                    if owned.len() != 1 {
-                        return Err(::bsql_core::error::QueryError::row_count(
-                            "exactly 1 row",
-                            owned.len() as u64,
-                        ));
+
+        // For non-SELECT (e.g. INSERT RETURNING), generate owned fetch_one/fetch_optional.
+        // For SELECT, these are generated in simple_api_fetch as zero-copy wrappers.
+        let owned_fetch_one_optional = if is_select {
+            TokenStream::new()
+        } else {
+            let fetch_one_dispatcher =
+                gen_variant_dispatcher(parsed, variants, needs_limit, |sql_lit, sql_hash| {
+                    quote! {
+                        let owned = executor.#qm(#sql_lit, #sql_hash, &params_slice[..])?;
+                        if owned.len() != 1 {
+                            return Err(::bsql_core::error::QueryError::row_count(
+                                "exactly 1 row",
+                                owned.len() as u64,
+                            ));
+                        }
+                        let row = owned.row(0);
+                        Ok(#result_name { #row_decode })
                     }
-                    let row = owned.row(0);
-                    Ok(#result_name { #row_decode })
+                });
+
+            let fetch_optional_dispatcher =
+                gen_variant_dispatcher(parsed, variants, needs_limit, |sql_lit, sql_hash| {
+                    quote! {
+                        let owned = executor.#qm(#sql_lit, #sql_hash, &params_slice[..])?;
+                        match owned.len() {
+                            0 => Ok(None),
+                            1 => {
+                                let row = owned.row(0);
+                                Ok(Some(#result_name { #row_decode }))
+                            }
+                            n => Err(::bsql_core::error::QueryError::row_count(
+                                "0 or 1 rows",
+                                n as u64,
+                            )),
+                        }
+                    }
+                });
+
+            quote! {
+                pub fn fetch_one<E: ::bsql_core::Executor>(
+                    self,
+                    executor: &E,
+                ) -> ::bsql_core::BsqlResult<#result_name> {
+                    #fetch_one_dispatcher
                 }
-            });
+
+                pub fn fetch_optional<E: ::bsql_core::Executor>(
+                    self,
+                    executor: &E,
+                ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
+                    #fetch_optional_dispatcher
+                }
+            }
+        };
 
         let fetch_all_dispatcher = gen_variant_dispatcher(
             parsed,
@@ -941,24 +976,6 @@ fn gen_dynamic_executor_impls(
             },
         );
 
-        let fetch_optional_dispatcher =
-            gen_variant_dispatcher(parsed, variants, needs_limit, |sql_lit, sql_hash| {
-                quote! {
-                    let owned = executor.#qm(#sql_lit, #sql_hash, &params_slice[..])?;
-                    match owned.len() {
-                        0 => Ok(None),
-                        1 => {
-                            let row = owned.row(0);
-                            Ok(Some(#result_name { #row_decode }))
-                        }
-                        n => Err(::bsql_core::error::QueryError::row_count(
-                            "0 or 1 rows",
-                            n as u64,
-                        )),
-                    }
-                }
-            });
-
         let fetch_stream_dispatcher =
             gen_variant_dispatcher(parsed, variants, false, |sql_lit, sql_hash| {
                 quote! {
@@ -968,25 +985,13 @@ fn gen_dynamic_executor_impls(
             });
 
         quote! {
-            pub fn fetch_one<E: ::bsql_core::Executor>(
-                self,
-                executor: &E,
-            ) -> ::bsql_core::BsqlResult<#result_name> {
-                #fetch_one_dispatcher
-            }
+            #owned_fetch_one_optional
 
             pub fn fetch_all<E: ::bsql_core::Executor>(
                 self,
                 executor: &E,
             ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
                 #fetch_all_dispatcher
-            }
-
-            pub fn fetch_optional<E: ::bsql_core::Executor>(
-                self,
-                executor: &E,
-            ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
-                #fetch_optional_dispatcher
             }
 
             pub fn fetch_stream(
@@ -1000,81 +1005,9 @@ fn gen_dynamic_executor_impls(
         TokenStream::new()
     };
 
-    // --- fetch_ref / fetch_one_ref / fetch_optional_ref for dynamic queries ---
-    let fetch_ref_methods = if has_columns && is_select {
-        let r_rows_name = rows_struct_name(parsed);
-        let r_single_name = single_ref_struct_name(parsed);
-
-        let needs_limit = has_columns
-            && is_select
-            && !parsed.normalized_sql.contains(" limit ")
-            && !parsed.normalized_sql.contains(" for ");
-
-        let fetch_ref_dispatcher =
-            gen_variant_dispatcher(parsed, variants, false, |sql_lit, sql_hash| {
-                quote! {
-                    let owned = executor.query_raw_readonly(#sql_lit, #sql_hash, &params_slice[..])?;
-                    Ok(#r_rows_name { owned })
-                }
-            });
-
-        let fetch_one_ref_dispatcher =
-            gen_variant_dispatcher(parsed, variants, needs_limit, |sql_lit, sql_hash| {
-                quote! {
-                    let owned = executor.query_raw_readonly(#sql_lit, #sql_hash, &params_slice[..])?;
-                    if owned.len() != 1 {
-                        return Err(::bsql_core::error::QueryError::row_count(
-                            "exactly 1 row",
-                            owned.len() as u64,
-                        ));
-                    }
-                    Ok(#r_single_name { owned })
-                }
-            });
-
-        let fetch_optional_ref_dispatcher =
-            gen_variant_dispatcher(parsed, variants, needs_limit, |sql_lit, sql_hash| {
-                quote! {
-                    let owned = executor.query_raw_readonly(#sql_lit, #sql_hash, &params_slice[..])?;
-                    match owned.len() {
-                        0 => Ok(None),
-                        1 => Ok(Some(#r_single_name { owned })),
-                        n => Err(::bsql_core::error::QueryError::row_count(
-                            "0 or 1 rows",
-                            n as u64,
-                        )),
-                    }
-                }
-            });
-
-        quote! {
-            /// Fetch all rows, returning a wrapper with zero-allocation borrowed access.
-            pub fn fetch_ref<E: ::bsql_core::Executor>(
-                self,
-                executor: &E,
-            ) -> ::bsql_core::BsqlResult<#r_rows_name> {
-                #fetch_ref_dispatcher
-            }
-
-            /// Fetch exactly one row as a borrowed wrapper.
-            pub fn fetch_one_ref<E: ::bsql_core::Executor>(
-                self,
-                executor: &E,
-            ) -> ::bsql_core::BsqlResult<#r_single_name> {
-                #fetch_one_ref_dispatcher
-            }
-
-            /// Fetch zero or one row as a borrowed wrapper.
-            pub fn fetch_optional_ref<E: ::bsql_core::Executor>(
-                self,
-                executor: &E,
-            ) -> ::bsql_core::BsqlResult<Option<#r_single_name>> {
-                #fetch_optional_ref_dispatcher
-            }
-        }
-    } else {
-        TokenStream::new()
-    };
+    // fetch_ref / fetch_one_ref / fetch_optional_ref removed for dynamic queries —
+    // fetch/fetch_one/fetch_optional now return zero-copy borrowed wrappers directly.
+    let fetch_ref_methods = TokenStream::new();
 
     // Use extracted gen_stream_struct (F-26)
     let stream_struct = if has_columns {
@@ -1191,17 +1124,78 @@ fn gen_dynamic_executor_impls(
         TokenStream::new()
     };
 
-    // --- Simple API (fetch/run) ---
-    let simple_api_fetch = if has_columns {
-        let result_name = result_struct_name(parsed);
+    // --- Simple API (fetch/fetch_one/fetch_optional/run) ---
+    // For SELECT queries, fetch/fetch_one/fetch_optional return zero-copy borrowed wrappers.
+    // For non-SELECT (e.g. dynamic INSERT RETURNING), they delegate to the owned variants.
+    let simple_api_fetch = if has_columns && is_select {
+        let r_rows_name = rows_struct_name(parsed);
+        let r_single_name = single_ref_struct_name(parsed);
+
+        let needs_limit = has_columns
+            && is_select
+            && !parsed.normalized_sql.contains(" limit ")
+            && !parsed.normalized_sql.contains(" for ");
+
+        let fetch_dispatcher =
+            gen_variant_dispatcher(parsed, variants, false, |sql_lit, sql_hash| {
+                quote! {
+                    let owned = executor.query_raw_readonly(#sql_lit, #sql_hash, &params_slice[..])?;
+                    Ok(#r_rows_name { owned })
+                }
+            });
+
+        let fetch_one_dispatcher =
+            gen_variant_dispatcher(parsed, variants, needs_limit, |sql_lit, sql_hash| {
+                quote! {
+                    let owned = executor.query_raw_readonly(#sql_lit, #sql_hash, &params_slice[..])?;
+                    if owned.len() != 1 {
+                        return Err(::bsql_core::error::QueryError::row_count(
+                            "exactly 1 row",
+                            owned.len() as u64,
+                        ));
+                    }
+                    Ok(#r_single_name { owned })
+                }
+            });
+
+        let fetch_optional_dispatcher =
+            gen_variant_dispatcher(parsed, variants, needs_limit, |sql_lit, sql_hash| {
+                quote! {
+                    let owned = executor.query_raw_readonly(#sql_lit, #sql_hash, &params_slice[..])?;
+                    match owned.len() {
+                        0 => Ok(None),
+                        1 => Ok(Some(#r_single_name { owned })),
+                        n => Err(::bsql_core::error::QueryError::row_count(
+                            "0 or 1 rows",
+                            n as u64,
+                        )),
+                    }
+                }
+            });
 
         quote! {
-            /// Fetch all rows as a Vec.
+            /// Fetch all rows, returning a wrapper with zero-allocation borrowed access.
             pub fn fetch<E: ::bsql_core::Executor>(
                 self,
                 executor: &E,
-            ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
-                self.fetch_all(executor)
+            ) -> ::bsql_core::BsqlResult<#r_rows_name> {
+                #fetch_dispatcher
+            }
+
+            /// Fetch exactly one row as a borrowed wrapper.
+            pub fn fetch_one<E: ::bsql_core::Executor>(
+                self,
+                executor: &E,
+            ) -> ::bsql_core::BsqlResult<#r_single_name> {
+                #fetch_one_dispatcher
+            }
+
+            /// Fetch zero or one row as a borrowed wrapper.
+            pub fn fetch_optional<E: ::bsql_core::Executor>(
+                self,
+                executor: &E,
+            ) -> ::bsql_core::BsqlResult<Option<#r_single_name>> {
+                #fetch_optional_dispatcher
             }
         }
     } else {
@@ -2498,6 +2492,7 @@ fn gen_rows_struct(
 
     quote! {
         /// Wrapper owning `OwnedResult` with zero-allocation borrowed row access.
+        #[derive(Debug)]
         #[allow(non_camel_case_types)]
         pub struct #rows_name {
             owned: ::bsql_core::OwnedResult,
@@ -2523,7 +2518,8 @@ fn gen_rows_struct(
             }
         }
 
-        /// Wrapper owning `OwnedResult` for a single borrowed row (fetch_one_ref / fetch_optional_ref).
+        /// Wrapper owning `OwnedResult` for a single borrowed row (fetch_one / fetch_optional).
+        #[derive(Debug)]
         #[allow(non_camel_case_types)]
         pub struct #single_ref_name {
             owned: ::bsql_core::OwnedResult,
@@ -3068,23 +3064,25 @@ mod tests {
     // --- fetch_ref tests ---
 
     #[test]
-    fn generates_fetch_ref_methods_for_select() {
+    fn generates_zero_copy_fetch_methods_for_select() {
         let parsed = parse_query("SELECT id, name FROM t WHERE id = $id: i32").unwrap();
         let validation = make_validation(vec![col("id", "i32"), col("name", "String")]);
         let code = generate_query_code(&parsed, &validation);
         let code_str = code.to_string();
 
+        // fetch_ref / fetch_one_ref / fetch_optional_ref are removed;
+        // fetch / fetch_one / fetch_optional now return the zero-copy wrappers directly.
         assert!(
-            code_str.contains("fetch_ref"),
-            "missing fetch_ref: {code_str}"
+            !code_str.contains("fetch_ref"),
+            "fetch_ref should be removed: {code_str}"
         );
         assert!(
-            code_str.contains("fetch_one_ref"),
-            "missing fetch_one_ref: {code_str}"
+            !code_str.contains("fetch_one_ref"),
+            "fetch_one_ref should be removed: {code_str}"
         );
         assert!(
-            code_str.contains("fetch_optional_ref"),
-            "missing fetch_optional_ref: {code_str}"
+            !code_str.contains("fetch_optional_ref"),
+            "fetch_optional_ref should be removed: {code_str}"
         );
         assert!(
             code_str.contains("BsqlRows_"),
@@ -3093,6 +3091,15 @@ mod tests {
         assert!(
             code_str.contains("BsqlSingleRef_"),
             "missing BsqlSingleRef struct: {code_str}"
+        );
+        // fetch_one should return BsqlSingleRef, not BsqlResult
+        assert!(
+            code_str.contains("fn fetch_one"),
+            "missing fetch_one method: {code_str}"
+        );
+        assert!(
+            code_str.contains("fn fetch_optional"),
+            "missing fetch_optional method: {code_str}"
         );
     }
 

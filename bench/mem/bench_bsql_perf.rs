@@ -39,22 +39,22 @@ fn main() -> Result<(), BsqlError> {
         );
     }
 
-    // fetch_many — uses fetch_ref (borrowed &str, like C's PQgetvalue returns char*)
-    // Both C and bsql_fetch_ref return pointers/references without heap allocation.
+    // fetch_many — uses fetch (borrowed &str, like C's PQgetvalue returns char*)
+    // Both C and bsql fetch() return pointers/references without heap allocation.
     for limit in [10i64, 100, 1000, 10000] {
         let iters = if limit >= 10000 { ITERATIONS_SLOW } else { ITERATIONS };
         // warm up
         let _ = bsql::query!(
             "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $limit: i64"
         )
-        .fetch_ref(&pool)?;
+        .fetch(&pool)?;
 
         let start = Instant::now();
         for _ in 0..iters {
             let rows = bsql::query!(
                 "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $limit: i64"
             )
-            .fetch_ref(&pool)?;
+            .fetch(&pool)?;
             // Read all columns to match C's PQgetvalue loop (prevent dead-code elimination)
             for row in rows.iter() {
                 let r = row.unwrap();
@@ -170,17 +170,27 @@ fn main() -> Result<(), BsqlError> {
         );
     }
 
-    // === fetch vs fetch_ref on 10K rows ===
-    // Isolates the allocation overhead: fetch_ref returns borrowed &str instead of String.
+    // === fetch (zero-copy) vs fetch_all (owned) on 10K rows ===
+    // Isolates the allocation overhead: fetch returns borrowed &str, fetch_all returns String.
     {
         let limit = 10000i64;
         // warm up
         let _ = bsql::query!(
             "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $limit: i64"
         )
-        .fetch(&pool)?;
+        .fetch_all(&pool)?;
 
         let iters = 200;
+
+        let start = Instant::now();
+        for _ in 0..iters {
+            let rows = bsql::query!(
+                "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $limit: i64"
+            )
+            .fetch_all(&pool)?;
+            std::hint::black_box(&rows);
+        }
+        let fetch_all_elapsed = start.elapsed();
 
         let start = Instant::now();
         for _ in 0..iters {
@@ -192,32 +202,22 @@ fn main() -> Result<(), BsqlError> {
         }
         let fetch_elapsed = start.elapsed();
 
-        let start = Instant::now();
-        for _ in 0..iters {
-            let rows = bsql::query!(
-                "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $limit: i64"
-            )
-            .fetch_ref(&pool)?;
-            std::hint::black_box(&rows);
-        }
-        let fetch_ref_elapsed = start.elapsed();
-
-        println!("\n--- fetch vs fetch_ref (10K rows, {} iters) ---", iters);
+        println!("\n--- fetch_all vs fetch (10K rows, {} iters) ---", iters);
+        println!(
+            "fetch_all(): {} us/op",
+            fetch_all_elapsed.as_micros() / iters as u128
+        );
         println!(
             "fetch():     {} us/op",
             fetch_elapsed.as_micros() / iters as u128
         );
-        println!(
-            "fetch_ref(): {} us/op",
-            fetch_ref_elapsed.as_micros() / iters as u128
-        );
-        let pct = if fetch_elapsed > fetch_ref_elapsed {
-            let saved = (fetch_elapsed - fetch_ref_elapsed).as_nanos() as f64 / fetch_elapsed.as_nanos() as f64 * 100.0;
+        let pct = if fetch_all_elapsed > fetch_elapsed {
+            let saved = (fetch_all_elapsed - fetch_elapsed).as_nanos() as f64 / fetch_all_elapsed.as_nanos() as f64 * 100.0;
             format!("{:.1}% faster", saved)
         } else {
             "no improvement".to_string()
         };
-        println!("fetch_ref is {pct}");
+        println!("fetch is {pct}");
     }
 
     // === Raw driver-level comparison: query vs for_each on 10K rows ===

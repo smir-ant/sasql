@@ -23,6 +23,14 @@ pub struct OwnedResult {
     arena: Arena,
 }
 
+impl std::fmt::Debug for OwnedResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedResult")
+            .field("rows", &self.result.len())
+            .finish()
+    }
+}
+
 impl OwnedResult {
     /// Create from a result and its arena.
     pub(crate) fn new(result: QueryResult, arena: Arena) -> Self {

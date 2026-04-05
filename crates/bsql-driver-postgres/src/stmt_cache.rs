@@ -94,11 +94,11 @@ impl StmtCache {
 ///
 /// Stack-allocated formatting. The name is always exactly 18 bytes:
 /// "s_" (2) + 16 hex digits (16).
-/// Uses a fixed [u8; 18] buffer with manual hex encoding — no heap allocation.
+/// Returns a fixed `[u8; 18]` — no heap allocation.
 #[inline]
-pub(crate) fn make_stmt_name(hash: u64) -> Box<str> {
+pub(crate) fn make_stmt_name(hash: u64) -> [u8; 18] {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut buf = [0u8; 18]; // "s_" + 16 hex = 18 bytes
+    let mut buf = [0u8; 18];
     buf[0] = b's';
     buf[1] = b'_';
     let bytes = hash.to_be_bytes();
@@ -106,10 +106,7 @@ pub(crate) fn make_stmt_name(hash: u64) -> Box<str> {
         buf[2 + i * 2] = HEX[(b >> 4) as usize];
         buf[2 + i * 2 + 1] = HEX[(b & 0x0f) as usize];
     }
-    // buf contains only ASCII hex digits ('0'-'9','a'-'f') and 's','_'.
-    // from_utf8 is infallible here — the expect documents why.
-    let s = std::str::from_utf8(&buf).expect("BUG: stmt name buffer contains only ASCII hex");
-    s.into()
+    buf
 }
 
 /// Cached information about a prepared statement.
@@ -121,8 +118,8 @@ pub(crate) fn make_stmt_name(hash: u64) -> Box<str> {
 /// data corruption. If you have an adversarial workload that could craft
 /// collisions, consider a verified cache keyed on the full SQL text.
 pub(crate) struct StmtInfo {
-    /// Statement name: `"s_{hash:016x}"`
-    pub(crate) name: Box<str>,
+    /// Statement name: `"s_{hash:016x}"` — fixed stack array, no heap allocation.
+    pub(crate) name: [u8; 18],
     /// Column metadata from RowDescription.
     pub(crate) columns: Arc<[ColumnDesc]>,
     /// Monotonic counter value at last use for LRU eviction.
@@ -138,6 +135,17 @@ pub(crate) struct StmtInfo {
     ///
     /// `None` until the first execution populates it.
     pub(crate) bind_template: Option<BindTemplate>,
+}
+
+impl StmtInfo {
+    /// Return the statement name as a `&str`.
+    ///
+    /// Safe because name contains only ASCII characters: 's', '_', and hex digits.
+    #[inline]
+    pub(crate) fn name_str(&self) -> &str {
+        // SAFETY: name is built by make_stmt_name which only writes ASCII bytes.
+        std::str::from_utf8(&self.name).expect("stmt name is ASCII")
+    }
 }
 
 /// Pre-built Bind+Execute+Sync message template for fast re-execution.
@@ -263,7 +271,7 @@ mod tests {
     fn stmt_cache_insert_get_remove() {
         let mut cache = StmtCache::default();
         let info = StmtInfo {
-            name: "s_test".into(),
+            name: *b"s_test\0\0\0\0\0\0\0\0\0\0\0\0",
             columns: Arc::from(Vec::new()),
             last_used: 1,
             bind_template: None,
@@ -287,7 +295,7 @@ mod tests {
             cache.insert(
                 i,
                 StmtInfo {
-                    name: format!("s_{i}").into(),
+                    name: make_stmt_name(i),
                     columns: Arc::from(Vec::new()),
                     last_used: i + 1,
                     bind_template: None,
@@ -304,13 +312,13 @@ mod tests {
     fn stmt_cache_insert_overwrite() {
         let mut cache = StmtCache::default();
         let info1 = StmtInfo {
-            name: "s_a".into(),
+            name: *b"s_aaaaaaaaaaaaaaaa",
             columns: Arc::from(Vec::new()),
             last_used: 1,
             bind_template: None,
         };
         let info2 = StmtInfo {
-            name: "s_b".into(),
+            name: *b"s_bbbbbbbbbbbbbbbb",
             columns: Arc::from(Vec::new()),
             last_used: 2,
             bind_template: None,
@@ -318,65 +326,71 @@ mod tests {
         cache.insert(42, info1);
         cache.insert(42, info2);
         assert_eq!(cache.len(), 1);
-        assert_eq!(&*cache.get(&42).unwrap().name, "s_b");
+        assert_eq!(cache.get(&42).unwrap().name_str(), "s_bbbbbbbbbbbbbbbb");
     }
 
     // ---- make_stmt_name tests ----
+
+    /// Helper: convert [u8; 18] to &str for test assertions.
+    fn name_str(name: &[u8; 18]) -> &str {
+        std::str::from_utf8(name).expect("ASCII")
+    }
 
     /// Statement name formatting uses hex encoding.
     #[test]
     fn stmt_name_format() {
         let name = make_stmt_name(0);
-        assert_eq!(&*name, "s_0000000000000000");
+        assert_eq!(name_str(&name), "s_0000000000000000");
         let name = make_stmt_name(0xDEADBEEF12345678);
-        assert_eq!(&*name, "s_deadbeef12345678");
+        assert_eq!(name_str(&name), "s_deadbeef12345678");
         let name = make_stmt_name(u64::MAX);
-        assert_eq!(&*name, "s_ffffffffffffffff");
+        assert_eq!(name_str(&name), "s_ffffffffffffffff");
     }
 
     #[test]
     fn stmt_name_format_verification() {
         let name = make_stmt_name(0xDEADBEEFCAFEBABE);
-        assert!(name.starts_with("s_"), "must start with s_");
-        assert_eq!(name.len(), 18, "s_ (2) + 16 hex = 18");
+        let s = name_str(&name);
+        assert!(s.starts_with("s_"), "must start with s_");
+        assert_eq!(s.len(), 18, "s_ (2) + 16 hex = 18");
         assert!(
-            name[2..].chars().all(|c| c.is_ascii_hexdigit()),
-            "remaining chars must be hex: {}",
-            &*name
+            s[2..].chars().all(|c| c.is_ascii_hexdigit()),
+            "remaining chars must be hex: {s}",
         );
     }
 
     #[test]
     fn stmt_name_zero() {
         let name = make_stmt_name(0);
-        assert_eq!(&*name, "s_0000000000000000");
+        assert_eq!(name_str(&name), "s_0000000000000000");
     }
 
     #[test]
     fn stmt_name_max() {
         let name = make_stmt_name(u64::MAX);
-        assert_eq!(&*name, "s_ffffffffffffffff");
+        assert_eq!(name_str(&name), "s_ffffffffffffffff");
     }
 
     #[test]
     fn stmt_name_one() {
         let name = make_stmt_name(1);
-        assert_eq!(&*name, "s_0000000000000001");
+        assert_eq!(name_str(&name), "s_0000000000000001");
     }
 
     #[test]
     fn stmt_name_powers_of_two() {
         let name = make_stmt_name(256);
-        assert_eq!(&*name, "s_0000000000000100");
+        assert_eq!(name_str(&name), "s_0000000000000100");
     }
 
     #[test]
     fn stmt_name_format_always_18_chars() {
         for val in [0u64, 1, 0xFF, 0xFFFF, 0xFFFF_FFFF, u64::MAX] {
             let name = make_stmt_name(val);
-            assert_eq!(name.len(), 18, "name len for {val:x}");
-            assert!(name.starts_with("s_"));
-            assert!(name[2..].chars().all(|c| c.is_ascii_hexdigit()));
+            let s = name_str(&name);
+            assert_eq!(s.len(), 18, "name len for {val:x}");
+            assert!(s.starts_with("s_"));
+            assert!(s[2..].chars().all(|c| c.is_ascii_hexdigit()));
         }
     }
 
@@ -385,7 +399,7 @@ mod tests {
     #[test]
     fn stmt_info_has_last_used_counter() {
         let info = StmtInfo {
-            name: "s_test".into(),
+            name: *b"s_test\0\0\0\0\0\0\0\0\0\0\0\0",
             columns: Arc::from(Vec::new()),
             last_used: 42,
             bind_template: None,
