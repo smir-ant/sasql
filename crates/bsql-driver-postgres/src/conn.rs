@@ -1741,7 +1741,12 @@ impl Connection {
                 | BackendMessage::DataRow { .. }
                 | BackendMessage::EmptyQuery
                 | BackendMessage::NoticeResponse { .. }
-                | BackendMessage::ParameterStatus { .. } => {}
+                | BackendMessage::ParameterStatus { .. }
+                // Auth messages may arrive late under extreme server load
+                // (e.g., AuthSaslFinal delayed past ReadyForQuery in startup).
+                // Skip them defensively rather than treating as protocol error.
+                | BackendMessage::AuthOk
+                | BackendMessage::AuthSaslFinal { .. } => {}
                 BackendMessage::ErrorResponse { data } => {
                     let fields = proto::parse_error_response(data);
                     self.drain_to_ready()?;
