@@ -416,3 +416,68 @@ fn try_recv_empty() {
         "try_recv with no pending notifications should return None"
     );
 }
+
+// ---------------------------------------------------------------------------
+// subscribed_channels
+// ---------------------------------------------------------------------------
+
+#[test]
+fn subscribed_channels_returns_list() {
+    let listener = Listener::connect(DB_URL).unwrap();
+
+    // Before any listen, subscribed_channels should be empty
+    let channels = listener.subscribed_channels();
+    assert!(channels.is_empty());
+
+    // Listen to two channels
+    listener.listen("sub_ch_a").unwrap();
+    listener.listen("sub_ch_b").unwrap();
+
+    let mut channels = listener.subscribed_channels();
+    channels.sort();
+    assert_eq!(channels, vec!["sub_ch_a", "sub_ch_b"]);
+}
+
+#[test]
+fn subscribed_channels_updates_on_unlisten() {
+    let listener = Listener::connect(DB_URL).unwrap();
+
+    listener.listen("sub_ul_a").unwrap();
+    listener.listen("sub_ul_b").unwrap();
+    listener.listen("sub_ul_c").unwrap();
+
+    let mut channels = listener.subscribed_channels();
+    channels.sort();
+    assert_eq!(channels, vec!["sub_ul_a", "sub_ul_b", "sub_ul_c"]);
+
+    listener.unlisten("sub_ul_b").unwrap();
+
+    let mut channels = listener.subscribed_channels();
+    channels.sort();
+    assert_eq!(channels, vec!["sub_ul_a", "sub_ul_c"]);
+}
+
+#[test]
+fn subscribed_channels_empty_after_unlisten_all() {
+    let listener = Listener::connect(DB_URL).unwrap();
+
+    listener.listen("sub_ua_a").unwrap();
+    listener.listen("sub_ua_b").unwrap();
+    assert_eq!(listener.subscribed_channels().len(), 2);
+
+    listener.unlisten_all().unwrap();
+    assert!(listener.subscribed_channels().is_empty());
+}
+
+#[test]
+fn subscribed_channels_idempotent_listen() {
+    let listener = Listener::connect(DB_URL).unwrap();
+
+    listener.listen("sub_idem").unwrap();
+    listener.listen("sub_idem").unwrap(); // duplicate
+
+    let channels = listener.subscribed_channels();
+    // Should have exactly 1 entry, not 2
+    assert_eq!(channels.len(), 1);
+    assert_eq!(channels[0], "sub_idem");
+}

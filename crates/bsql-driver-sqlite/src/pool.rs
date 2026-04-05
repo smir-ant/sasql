@@ -2478,4 +2478,127 @@ mod tests {
         pool.close();
         let _ = std::fs::remove_file(&path);
     }
+
+    // ---- execute_batch ----
+
+    #[test]
+    fn pool_execute_batch_inserts() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER, name TEXT)")
+            .unwrap();
+
+        let sql = "INSERT INTO t VALUES (?1, ?2)";
+        let sql_hash = hash_sql(sql);
+
+        let id1: i64 = 1;
+        let name1: &str = "alice";
+        let id2: i64 = 2;
+        let name2: &str = "bob";
+        let id3: i64 = 3;
+        let name3: &str = "carol";
+
+        let param_sets: &[&[&dyn SqliteEncode]] =
+            &[&[&id1, &name1], &[&id2, &name2], &[&id3, &name3]];
+
+        let total_affected = pool.execute_batch(sql, sql_hash, param_sets).unwrap();
+        assert_eq!(total_affected, 3);
+
+        let sel = "SELECT id, name FROM t ORDER BY id";
+        let sel_hash = hash_sql(sel);
+        let (result, arena) = pool.query_readonly(sel, sel_hash, SmallVec::new()).unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result.get_i64(0, 0, &arena), Some(1));
+        assert_eq!(result.get_str(0, 1, &arena), Some("alice"));
+        assert_eq!(result.get_i64(1, 0, &arena), Some(2));
+        assert_eq!(result.get_str(1, 1, &arena), Some("bob"));
+        assert_eq!(result.get_i64(2, 0, &arena), Some(3));
+        assert_eq!(result.get_str(2, 1, &arena), Some("carol"));
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pool_execute_batch_empty() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER)").unwrap();
+
+        let sql = "INSERT INTO t VALUES (?1)";
+        let sql_hash = hash_sql(sql);
+        let param_sets: &[&[&dyn SqliteEncode]] = &[];
+        let total = pool.execute_batch(sql, sql_hash, param_sets).unwrap();
+        assert_eq!(total, 0);
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pool_execute_batch_single_set() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER)").unwrap();
+
+        let sql = "INSERT INTO t VALUES (?1)";
+        let sql_hash = hash_sql(sql);
+        let id: i64 = 42;
+        let param_sets: &[&[&dyn SqliteEncode]] = &[&[&id]];
+        let total = pool.execute_batch(sql, sql_hash, param_sets).unwrap();
+        assert_eq!(total, 1);
+
+        let sel = "SELECT id FROM t";
+        let sel_hash = hash_sql(sel);
+        let (result, arena) = pool.query_readonly(sel, sel_hash, SmallVec::new()).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result.get_i64(0, 0, &arena), Some(42));
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pool_execute_batch_100_inserts() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER)").unwrap();
+
+        let sql = "INSERT INTO t VALUES (?1)";
+        let sql_hash = hash_sql(sql);
+
+        let ids: Vec<i64> = (0..100).collect();
+        let param_sets: Vec<Vec<&dyn SqliteEncode>> =
+            ids.iter().map(|id| vec![id as &dyn SqliteEncode]).collect();
+        let param_refs: Vec<&[&dyn SqliteEncode]> =
+            param_sets.iter().map(|v| v.as_slice()).collect();
+
+        let total = pool.execute_batch(sql, sql_hash, &param_refs).unwrap();
+        assert_eq!(total, 100);
+
+        let sel = "SELECT COUNT(*) FROM t";
+        let sel_hash = hash_sql(sel);
+        let (result, arena) = pool.query_readonly(sel, sel_hash, SmallVec::new()).unwrap();
+        assert_eq!(result.get_i64(0, 0, &arena), Some(100));
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pool_execute_batch_closed_pool_errors() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER)").unwrap();
+        pool.close();
+
+        let sql = "INSERT INTO t VALUES (?1)";
+        let sql_hash = hash_sql(sql);
+        let id: i64 = 1;
+        let param_sets: &[&[&dyn SqliteEncode]] = &[&[&id]];
+        let result = pool.execute_batch(sql, sql_hash, param_sets);
+        assert!(result.is_err());
+
+        let _ = std::fs::remove_file(&path);
+    }
 }

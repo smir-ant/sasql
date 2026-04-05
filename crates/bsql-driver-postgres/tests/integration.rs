@@ -2049,3 +2049,246 @@ fn pool_guard_is_not_in_transaction() {
         "pool guard should not be in transaction"
     );
 }
+
+// =========================================================================
+// Gap tests: low-level Connection methods
+// =========================================================================
+
+#[test]
+fn prepare_only_caches_statement() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+
+    let sql = "SELECT $1::int4 + $2::int4 AS sum";
+    let h = hash_sql(sql);
+
+    assert_eq!(conn.stmt_cache_len(), 0);
+
+    // prepare_only should parse+describe but NOT execute
+    conn.prepare_only(sql, h).unwrap();
+    assert_eq!(conn.stmt_cache_len(), 1);
+
+    // Now query using the same SQL — should use cached statement
+    let arena = Arena::new();
+    let result = conn.query(sql, h, &[&3i32, &7i32]).unwrap();
+    assert_eq!(result.row(0, &arena).get_i32(0), Some(10));
+
+    // Still only 1 entry in cache
+    assert_eq!(conn.stmt_cache_len(), 1);
+}
+
+#[test]
+fn prepare_only_idempotent() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+
+    let sql = "SELECT 1::int4";
+    let h = hash_sql(sql);
+
+    conn.prepare_only(sql, h).unwrap();
+    assert_eq!(conn.stmt_cache_len(), 1);
+
+    // Second prepare_only for same SQL should be a no-op
+    conn.prepare_only(sql, h).unwrap();
+    assert_eq!(conn.stmt_cache_len(), 1);
+}
+
+#[test]
+fn simple_query_rows_returns_data() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+
+    let rows = conn
+        .simple_query_rows("SELECT 1 AS n, 'hello' AS msg")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    // SimpleRow = Vec<Option<String>>
+    assert_eq!(rows[0].len(), 2);
+    assert_eq!(rows[0][0].as_deref(), Some("1"));
+    assert_eq!(rows[0][1].as_deref(), Some("hello"));
+}
+
+#[test]
+fn simple_query_rows_multiple_rows() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+
+    let rows = conn
+        .simple_query_rows("SELECT generate_series(1, 3) AS n")
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0][0].as_deref(), Some("1"));
+    assert_eq!(rows[1][0].as_deref(), Some("2"));
+    assert_eq!(rows[2][0].as_deref(), Some("3"));
+}
+
+#[test]
+fn simple_query_rows_empty_result() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+
+    let rows = conn.simple_query_rows("SELECT 1 WHERE false").unwrap();
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn simple_query_rows_null_value() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+
+    let rows = conn.simple_query_rows("SELECT NULL::text AS val").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], None);
+}
+
+#[test]
+fn execute_monolithic_returns_affected() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+
+    conn.simple_query("CREATE TEMP TABLE _driver_test_mono (id int, name text)")
+        .unwrap();
+
+    let sql = "INSERT INTO _driver_test_mono VALUES ($1::int4, $2::text)";
+    let h = hash_sql(sql);
+    let affected = conn.execute_monolithic(sql, h, &[&1i32, &"alice"]).unwrap();
+    assert_eq!(affected, 1);
+
+    let affected2 = conn.execute_monolithic(sql, h, &[&2i32, &"bob"]).unwrap();
+    assert_eq!(affected2, 1);
+
+    // Verify both rows exist
+    let arena = Arena::new();
+    let sel = "SELECT count(*)::int4 FROM _driver_test_mono";
+    let sel_h = hash_sql(sel);
+    let result = conn.query(sel, sel_h, &[]).unwrap();
+    assert_eq!(result.row(0, &arena).get_i32(0), Some(2));
+}
+
+#[test]
+fn execute_monolithic_update() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+
+    conn.simple_query(
+        "CREATE TEMP TABLE _driver_test_mono_upd (id int, val text);
+         INSERT INTO _driver_test_mono_upd VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+    )
+    .unwrap();
+
+    let sql = "UPDATE _driver_test_mono_upd SET val = $1::text WHERE id > $2::int4";
+    let h = hash_sql(sql);
+    let affected = conn.execute_monolithic(sql, h, &[&"new", &1i32]).unwrap();
+    assert_eq!(affected, 2);
+}
+
+#[test]
+fn for_each_raw_processes_rows() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+
+    let sql = "SELECT generate_series(1, 10)::int4 AS n";
+    let h = hash_sql(sql);
+    let mut count = 0usize;
+    conn.for_each_raw(sql, h, &[], |_raw_row_data| {
+        count += 1;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(count, 10);
+}
+
+#[test]
+fn for_each_raw_zero_rows() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+
+    let sql = "SELECT 1 WHERE false";
+    let h = hash_sql(sql);
+    let mut count = 0usize;
+    conn.for_each_raw(sql, h, &[], |_raw_row_data| {
+        count += 1;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn drain_notifications_empty() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+
+    // No LISTEN — no notifications pending
+    let notifs = conn.drain_notifications();
+    assert!(notifs.is_empty());
+    assert_eq!(conn.pending_notification_count(), 0);
+}
+
+#[test]
+fn stmt_cache_len_after_queries() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+
+    assert_eq!(conn.stmt_cache_len(), 0);
+
+    let sql1 = "SELECT 1::int4";
+    let h1 = hash_sql(sql1);
+    conn.query(sql1, h1, &[]).unwrap();
+    assert_eq!(conn.stmt_cache_len(), 1);
+
+    let sql2 = "SELECT 2::int4";
+    let h2 = hash_sql(sql2);
+    conn.query(sql2, h2, &[]).unwrap();
+    assert_eq!(conn.stmt_cache_len(), 2);
+
+    let sql3 = "SELECT $1::text";
+    let h3 = hash_sql(sql3);
+    conn.query(sql3, h3, &[&"hello"]).unwrap();
+    assert_eq!(conn.stmt_cache_len(), 3);
+
+    // Repeat sql1 — should NOT increase cache size
+    conn.query(sql1, h1, &[]).unwrap();
+    assert_eq!(conn.stmt_cache_len(), 3);
+}
+
+#[test]
+fn stmt_cache_len_with_prepare_only() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+
+    assert_eq!(conn.stmt_cache_len(), 0);
+
+    let sql1 = "SELECT $1::int4 + 1 AS inc";
+    let h1 = hash_sql(sql1);
+    conn.prepare_only(sql1, h1).unwrap();
+    assert_eq!(conn.stmt_cache_len(), 1);
+
+    let sql2 = "SELECT $1::text || $2::text AS concat";
+    let h2 = hash_sql(sql2);
+    conn.prepare_only(sql2, h2).unwrap();
+    assert_eq!(conn.stmt_cache_len(), 2);
+
+    // Now execute both — cache should still be 2
+    let arena = Arena::new();
+    let r1 = conn.query(sql1, h1, &[&5i32]).unwrap();
+    assert_eq!(r1.row(0, &arena).get_i32(0), Some(6));
+    assert_eq!(conn.stmt_cache_len(), 2);
+
+    let r2 = conn.query(sql2, h2, &[&"hello ", &"world"]).unwrap();
+    assert_eq!(r2.row(0, &arena).get_str(0), Some("hello world"));
+    assert_eq!(conn.stmt_cache_len(), 2);
+}

@@ -608,3 +608,77 @@ fn raw_query_syntax_error() {
     let result = pool.raw_query("SELECTTTT");
     assert!(result.is_err(), "syntax error should return Err");
 }
+
+// ---------------------------------------------------------------------------
+// QueryStream low-level tests (advance + next_row pattern)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fetch_stream_iterate_all() {
+    let pool = pool();
+    let sql = "SELECT generate_series(1, 200)::int4 AS n";
+    let h = bsql::driver::hash_sql(sql);
+    let params: &[&(dyn bsql::driver::Encode + Sync)] = &[];
+
+    let mut stream = pool.query_stream(sql, h, params).unwrap();
+    let mut count = 0usize;
+    while stream.advance().unwrap() {
+        let row = stream.next_row().unwrap();
+        let n = row.get_i32(0).unwrap();
+        count += 1;
+        assert_eq!(n, count as i32);
+    }
+    assert_eq!(count, 200);
+}
+
+#[test]
+fn fetch_stream_empty_result() {
+    let pool = pool();
+    let sql = "SELECT 1::int4 AS n WHERE false";
+    let h = bsql::driver::hash_sql(sql);
+    let params: &[&(dyn bsql::driver::Encode + Sync)] = &[];
+
+    let mut stream = pool.query_stream(sql, h, params).unwrap();
+
+    // advance() should immediately return false for an empty result
+    let has_rows = stream.advance().unwrap();
+    assert!(!has_rows, "empty result stream should have no rows");
+
+    // next_row should return None
+    assert!(stream.next_row().is_none());
+}
+
+#[test]
+fn fetch_stream_columns() {
+    let pool = pool();
+    let sql = "SELECT 1::int4 AS id, 'hello'::text AS name, true::bool AS active";
+    let h = bsql::driver::hash_sql(sql);
+    let params: &[&(dyn bsql::driver::Encode + Sync)] = &[];
+
+    let stream = pool.query_stream(sql, h, params).unwrap();
+
+    let columns = stream.columns();
+    assert_eq!(columns.len(), 3);
+    assert_eq!(&*columns[0].name, "id");
+    assert_eq!(columns[0].type_oid, 23); // int4
+    assert_eq!(&*columns[1].name, "name");
+    assert_eq!(columns[1].type_oid, 25); // text
+    assert_eq!(&*columns[2].name, "active");
+    assert_eq!(columns[2].type_oid, 16); // bool
+}
+
+#[test]
+fn fetch_stream_single_row() {
+    let pool = pool();
+    let sql = "SELECT 42::int4 AS n";
+    let h = bsql::driver::hash_sql(sql);
+    let params: &[&(dyn bsql::driver::Encode + Sync)] = &[];
+
+    let mut stream = pool.query_stream(sql, h, params).unwrap();
+    assert!(stream.advance().unwrap());
+    let row = stream.next_row().unwrap();
+    assert_eq!(row.get_i32(0), Some(42));
+
+    // No more rows
+    assert!(!stream.advance().unwrap());
+}
