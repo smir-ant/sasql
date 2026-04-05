@@ -801,4 +801,68 @@ mod tests {
         let dbg = format!("{row:?}");
         assert!(dbg.contains("RawRow"), "Debug should show RawRow: {dbg}");
     }
+
+    // --- RawRow additional edge cases ---
+
+    #[test]
+    fn raw_row_all_null_values() {
+        let row = RawRow(vec![None, None, None]);
+        assert_eq!(row.len(), 3);
+        assert!(!row.is_empty());
+        assert_eq!(row.get(0), None);
+        assert_eq!(row.get(1), None);
+        assert_eq!(row.get(2), None);
+        // iter should produce all None
+        let vals: Vec<_> = row.iter().collect();
+        assert_eq!(vals, vec![None, None, None]);
+    }
+
+    #[test]
+    fn raw_row_empty_string_values() {
+        let row = RawRow(vec![Some(String::new()), Some("".into())]);
+        assert_eq!(row.len(), 2);
+        // Empty string is Some(""), not None
+        assert_eq!(row.get(0), Some(""));
+        assert_eq!(row.get(1), Some(""));
+    }
+
+    #[test]
+    fn raw_row_get_out_of_bounds() {
+        let row = RawRow(vec![Some("only".into())]);
+        assert_eq!(row.get(0), Some("only"));
+        assert_eq!(row.get(1), None);
+        assert_eq!(row.get(100), None);
+        assert_eq!(row.get(usize::MAX), None);
+    }
+
+    #[test]
+    fn raw_row_iter_empty() {
+        let row = RawRow(vec![]);
+        let vals: Vec<_> = row.iter().collect();
+        assert!(vals.is_empty());
+    }
+
+    #[test]
+    fn raw_row_iter_mixed() {
+        let row = RawRow(vec![
+            Some("hello".into()),
+            None,
+            Some("world".into()),
+            None,
+            Some("".into()),
+        ]);
+        let vals: Vec<_> = row.iter().collect();
+        assert_eq!(
+            vals,
+            vec![Some("hello"), None, Some("world"), None, Some("")]
+        );
+    }
+
+    #[test]
+    fn raw_row_single_null() {
+        let row = RawRow(vec![None]);
+        assert_eq!(row.len(), 1);
+        assert!(!row.is_empty());
+        assert_eq!(row.get(0), None);
+    }
 }

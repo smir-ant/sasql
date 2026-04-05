@@ -526,4 +526,88 @@ mod tests {
         let stream = make_stream(0, 0, true);
         assert_eq!(stream.columns().len(), 0);
     }
+
+    // --- Creation patterns ---
+
+    #[test]
+    fn make_stream_finished_true_needs_execute_false() {
+        let stream = make_stream(3, 2, true);
+        assert!(!stream.needs_execute, "finished stream should not need execute");
+        assert!(stream.finished);
+    }
+
+    #[test]
+    fn make_stream_not_finished_needs_execute_true() {
+        let stream = make_stream(3, 2, false);
+        assert!(stream.needs_execute, "unfinished stream should need execute");
+        assert!(!stream.finished);
+    }
+
+    #[test]
+    fn make_stream_zero_rows_zero_cols_remaining_zero() {
+        let stream = make_stream(0, 0, true);
+        assert_eq!(stream.remaining(), 0);
+        assert!(!stream.has_more());
+    }
+
+    // --- remaining/has_more interaction after partial consumption ---
+
+    #[test]
+    fn remaining_and_has_more_consistency() {
+        let mut stream = make_stream(3, 1, true);
+        // Before consuming: remaining=3, has_more=true
+        assert_eq!(stream.remaining(), 3);
+        assert!(stream.has_more());
+        // Consume 1: remaining=2, has_more=true
+        let _ = stream.next_row();
+        assert_eq!(stream.remaining(), 2);
+        assert!(stream.has_more());
+        // Consume all: remaining=0, has_more=false (finished=true)
+        let _ = stream.next_row();
+        let _ = stream.next_row();
+        assert_eq!(stream.remaining(), 0);
+        assert!(!stream.has_more());
+    }
+
+    #[test]
+    fn remaining_and_has_more_when_not_finished() {
+        let mut stream = make_stream(1, 1, false);
+        // Before consuming: remaining=1, has_more=true
+        assert_eq!(stream.remaining(), 1);
+        assert!(stream.has_more());
+        // After consuming last row: remaining=0, but has_more=true (server may have more)
+        let _ = stream.next_row();
+        assert_eq!(stream.remaining(), 0);
+        assert!(stream.has_more(), "unfinished stream should report has_more even with empty buffer");
+    }
+
+    // --- Drop behavior ---
+
+    #[test]
+    fn drop_finished_stream_does_not_panic() {
+        let mut stream = make_stream(1, 1, true);
+        let _ = stream.next_row();
+        // Stream is finished and consumed, drop should be clean
+        drop(stream);
+    }
+
+    #[test]
+    fn drop_unfinished_stream_does_not_panic() {
+        // Unfinished stream (guard=None so mark_discard is not called)
+        let stream = make_stream(5, 2, false);
+        drop(stream);
+    }
+
+    // --- advance with rows already available ---
+
+    #[test]
+    fn advance_does_not_consume_row() {
+        let mut stream = make_stream(2, 1, true);
+        assert!(stream.advance().unwrap());
+        // advance should not advance position, just check availability
+        assert_eq!(stream.remaining(), 2);
+        // next_row consumes
+        let _ = stream.next_row();
+        assert_eq!(stream.remaining(), 1);
+    }
 }

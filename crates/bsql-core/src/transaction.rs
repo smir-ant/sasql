@@ -482,4 +482,44 @@ mod tests {
         _assert_send::<IsolationLevel>();
         _assert_sync::<IsolationLevel>();
     }
+
+    // --- IsolationLevel as_sql covers all variants ---
+
+    #[test]
+    fn isolation_level_as_sql_all_variants() {
+        assert_eq!(IsolationLevel::ReadUncommitted.as_sql(), "READ UNCOMMITTED");
+        assert_eq!(IsolationLevel::ReadCommitted.as_sql(), "READ COMMITTED");
+        assert_eq!(IsolationLevel::RepeatableRead.as_sql(), "REPEATABLE READ");
+        assert_eq!(IsolationLevel::Serializable.as_sql(), "SERIALIZABLE");
+    }
+
+    // --- Savepoint name validation edge cases ---
+
+    #[test]
+    fn validate_savepoint_name_single_char() {
+        assert!(validate_savepoint_name("a").is_ok());
+        assert!(validate_savepoint_name("_").is_ok());
+    }
+
+    #[test]
+    fn validate_savepoint_name_all_digits_after_letter() {
+        assert!(validate_savepoint_name("a123456789").is_ok());
+    }
+
+    #[test]
+    fn validate_savepoint_name_all_underscores() {
+        assert!(validate_savepoint_name("___").is_ok());
+    }
+
+    #[test]
+    fn validate_savepoint_name_unicode_rejected() {
+        assert!(validate_savepoint_name("sp_\u{00e9}").is_err(), "unicode chars should be rejected");
+    }
+
+    #[test]
+    fn validate_savepoint_name_sql_injection_rejected() {
+        assert!(validate_savepoint_name("sp; DROP TABLE").is_err());
+        assert!(validate_savepoint_name("sp'--").is_err());
+        assert!(validate_savepoint_name("sp\"test").is_err());
+    }
 }

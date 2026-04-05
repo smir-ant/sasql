@@ -1438,4 +1438,91 @@ mod tests {
         assert_eq!(arena.get(0, 0), &[]);
         assert_eq!(arena.get(9999, 0), &[]);
     }
+
+    // --- Arena::empty() edge cases ---
+
+    // Arena::empty() is designed for query paths that use data_buf instead of arena.
+    // Direct alloc on an empty arena (no chunks) panics because it indexes into
+    // an empty chunks vec. Call reset() first to initialize a chunk.
+
+    #[test]
+    #[should_panic]
+    fn arena_empty_alloc_copy_panics_without_reset() {
+        let mut arena = Arena::empty();
+        assert_eq!(arena.chunks.len(), 0);
+        // alloc_copy on empty arena panics -- must call reset() first
+        let _ = arena.alloc_copy(b"boom");
+    }
+
+    #[test]
+    #[should_panic]
+    fn arena_empty_alloc_panics_without_reset() {
+        let mut arena = Arena::empty();
+        // alloc on empty arena panics -- must call reset() first
+        let _ = arena.alloc(8);
+    }
+
+    #[test]
+    fn arena_empty_reset_does_not_panic() {
+        let mut arena = Arena::empty();
+        // reset on empty arena should not crash
+        arena.reset();
+        // After reset, arena should be usable with a fresh chunk
+        assert!(arena.chunks.len() >= 1, "reset should create initial chunk if empty");
+        assert_eq!(arena.allocated(), 0);
+        assert_eq!(arena.current, 0);
+        assert_eq!(arena.offset, 0);
+    }
+
+    #[test]
+    fn arena_empty_reset_then_alloc() {
+        let mut arena = Arena::empty();
+        arena.reset();
+        let offset = arena.alloc_copy(b"after reset on empty");
+        assert_eq!(arena.get(offset, 20), b"after reset on empty");
+    }
+
+    #[test]
+    fn arena_empty_capacity_is_zero() {
+        let arena = Arena::empty();
+        assert_eq!(arena.capacity(), 0);
+        assert_eq!(arena.allocated(), 0);
+    }
+
+    #[test]
+    fn arena_empty_reset_then_multiple_allocs() {
+        let mut arena = Arena::empty();
+        arena.reset(); // initialize a chunk
+        let o1 = arena.alloc_copy(b"first");
+        let o2 = arena.alloc_copy(b"second");
+        assert_eq!(arena.get(o1, 5), b"first");
+        assert_eq!(arena.get(o2, 6), b"second");
+    }
+
+    // --- alloc_copy exactly at chunk boundary ---
+
+    #[test]
+    fn alloc_copy_exactly_fills_chunk() {
+        let mut arena = Arena::new();
+        // Fill exactly to the 8KB boundary
+        let data = vec![0xCC; INITIAL_CHUNK_SIZE];
+        let offset = arena.alloc_copy(&data);
+        assert_eq!(arena.chunks.len(), 1, "should still be one chunk");
+        assert_eq!(arena.get(offset, INITIAL_CHUNK_SIZE)[0], 0xCC);
+        assert_eq!(arena.allocated(), INITIAL_CHUNK_SIZE);
+
+        // Allocating 0 bytes should not trigger a new chunk
+        let o2 = arena.alloc_copy(b"");
+        assert_eq!(arena.get(o2, 0), &[]);
+    }
+
+    // --- get with offset=0, len=0 on empty Arena ---
+
+    #[test]
+    fn arena_empty_get_zero_len() {
+        // Even on Arena::empty(), get with len=0 should return empty slice
+        // without panicking (no chunks to index into)
+        let arena = Arena::empty();
+        assert_eq!(arena.get(0, 0), &[]);
+    }
 }

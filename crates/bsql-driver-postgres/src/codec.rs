@@ -2685,4 +2685,119 @@ mod tests {
         check(3.14f64, 8);
         check(42u32, 4);
     }
+
+    // --- 10KB string encode/decode roundtrip ---
+
+    #[test]
+    fn str_10kb_roundtrip() {
+        let big = "A".repeat(10 * 1024);
+        let mut buf = Vec::new();
+        big.as_str().encode_binary(&mut buf);
+        assert_eq!(buf.len(), 10 * 1024);
+        assert_eq!(decode_str(&buf).unwrap(), big);
+    }
+
+    // --- Empty Vec<u8> encode roundtrip ---
+
+    #[test]
+    fn empty_vec_u8_encode_roundtrip() {
+        let mut buf = Vec::new();
+        Vec::<u8>::new().encode_binary(&mut buf);
+        assert!(buf.is_empty(), "empty Vec<u8> should produce no bytes");
+        assert_eq!(decode_bytes(&buf).len(), 0);
+    }
+
+    // --- f32 MIN/MAX roundtrip ---
+
+    #[test]
+    fn f32_min_max_roundtrip() {
+        let mut buf = Vec::new();
+        f32::MIN.encode_binary(&mut buf);
+        assert_eq!(decode_f32(&buf).unwrap(), f32::MIN);
+
+        buf.clear();
+        f32::MAX.encode_binary(&mut buf);
+        assert_eq!(decode_f32(&buf).unwrap(), f32::MAX);
+    }
+
+    // --- f64 MIN/MAX roundtrip ---
+
+    #[test]
+    fn f64_min_max_roundtrip() {
+        let mut buf = Vec::new();
+        f64::MIN.encode_binary(&mut buf);
+        assert_eq!(decode_f64(&buf).unwrap(), f64::MIN);
+
+        buf.clear();
+        f64::MAX.encode_binary(&mut buf);
+        assert_eq!(decode_f64(&buf).unwrap(), f64::MAX);
+    }
+
+    // --- i32 zero roundtrip ---
+
+    #[test]
+    fn i32_zero_roundtrip() {
+        let mut buf = Vec::new();
+        0i32.encode_binary(&mut buf);
+        assert_eq!(decode_i32(&buf).unwrap(), 0);
+    }
+
+    // --- i64 zero roundtrip ---
+
+    #[test]
+    fn i64_zero_roundtrip() {
+        let mut buf = Vec::new();
+        0i64.encode_binary(&mut buf);
+        assert_eq!(decode_i64(&buf).unwrap(), 0);
+    }
+
+    // --- i16 zero roundtrip ---
+
+    #[test]
+    fn i16_zero_roundtrip() {
+        let mut buf = Vec::new();
+        0i16.encode_binary(&mut buf);
+        assert_eq!(decode_i16(&buf).unwrap(), 0);
+    }
+
+    // --- f32 subnormal roundtrip ---
+
+    #[test]
+    fn f32_subnormal_roundtrip() {
+        let mut buf = Vec::new();
+        f32::MIN_POSITIVE.encode_binary(&mut buf);
+        assert_eq!(decode_f32(&buf).unwrap(), f32::MIN_POSITIVE);
+    }
+
+    // --- f64 subnormal roundtrip ---
+
+    #[test]
+    fn f64_subnormal_roundtrip() {
+        let mut buf = Vec::new();
+        f64::MIN_POSITIVE.encode_binary(&mut buf);
+        assert_eq!(decode_f64(&buf).unwrap(), f64::MIN_POSITIVE);
+    }
+
+    // --- f32 NaN bit-pattern preservation ---
+
+    #[test]
+    fn f32_nan_bit_preservation() {
+        let mut buf = Vec::new();
+        f32::NAN.encode_binary(&mut buf);
+        let decoded = decode_f32(&buf).unwrap();
+        assert!(decoded.is_nan());
+        // Bit-pattern should be preserved
+        assert_eq!(decoded.to_bits(), f32::NAN.to_bits());
+    }
+
+    // --- f64 NaN bit-pattern preservation ---
+
+    #[test]
+    fn f64_nan_bit_preservation() {
+        let mut buf = Vec::new();
+        f64::NAN.encode_binary(&mut buf);
+        let decoded = decode_f64(&buf).unwrap();
+        assert!(decoded.is_nan());
+        assert_eq!(decoded.to_bits(), f64::NAN.to_bits());
+    }
 }

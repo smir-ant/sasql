@@ -1160,6 +1160,109 @@ mod tests {
         assert_eq!(url_decode("%2f").unwrap(), "/");
     }
 
+    // --- Config URL edge cases ---
+
+    // Unicode password: Cyrillic пароль (percent-encoded)
+    #[test]
+    fn config_unicode_password() {
+        // "пароль" in UTF-8 is D0 BF D0 B0 D1 80 D0 BE D0 BB D1 8C
+        let cfg = Config::from_url(
+            "postgres://user:%D0%BF%D0%B0%D1%80%D0%BE%D0%BB%D1%8C@localhost/db",
+        )
+        .unwrap();
+        assert_eq!(cfg.user, "user");
+        assert_eq!(cfg.password, "\u{043F}\u{0430}\u{0440}\u{043E}\u{043B}\u{044C}"); // пароль
+        assert_eq!(cfg.host, "localhost");
+        assert_eq!(cfg.database, "db");
+    }
+
+    // Port 0 (edge of u16 range)
+    #[test]
+    fn config_port_zero() {
+        let cfg = Config::from_url("postgres://user:pass@localhost:0/db").unwrap();
+        assert_eq!(cfg.port, 0);
+    }
+
+    // Port 65535 (max u16)
+    #[test]
+    fn config_port_max() {
+        let cfg = Config::from_url("postgres://user:pass@localhost:65535/db").unwrap();
+        assert_eq!(cfg.port, 65535);
+    }
+
+    // Port 65536 (overflow, should error)
+    #[test]
+    fn config_port_overflow() {
+        let result = Config::from_url("postgres://user:pass@localhost:65536/db");
+        assert!(result.is_err(), "port 65536 exceeds u16 max");
+    }
+
+    // Unknown query parameter should be silently ignored
+    #[test]
+    fn config_unknown_param_ignored() {
+        let cfg = Config::from_url(
+            "postgres://user:pass@localhost/db?application_name=myapp&connect_timeout=10",
+        )
+        .unwrap();
+        // Should parse without error, ignoring unknown params
+        assert_eq!(cfg.user, "user");
+        assert_eq!(cfg.host, "localhost");
+        assert_eq!(cfg.database, "db");
+        // Default values for known params should be unaffected
+        assert_eq!(cfg.statement_timeout_secs, 30);
+        assert_eq!(cfg.ssl, SslMode::Prefer);
+    }
+
+    // Double percent encoding: %2525 should decode to %25
+    #[test]
+    fn url_decode_double_percent_encoding() {
+        // %25 decodes to '%', so %2525 decodes to '%25'
+        assert_eq!(url_decode("%2525").unwrap(), "%25");
+    }
+
+    // URL with empty password field (explicit colon, empty password)
+    #[test]
+    fn config_explicit_empty_password() {
+        let cfg = Config::from_url("postgres://user:@localhost/db").unwrap();
+        assert_eq!(cfg.user, "user");
+        assert_eq!(cfg.password, "");
+    }
+
+    // URL with special characters in user and database
+    #[test]
+    fn config_special_chars_in_user() {
+        let cfg = Config::from_url("postgres://my%2Fuser:pass@localhost/my%2Fdb").unwrap();
+        assert_eq!(cfg.user, "my/user");
+        assert_eq!(cfg.database, "my/db");
+    }
+
+    // url_decode with plus sign (should be literal, not space -- this is not form encoding)
+    #[test]
+    fn url_decode_plus_is_literal() {
+        assert_eq!(url_decode("a+b").unwrap(), "a+b");
+    }
+
+    // Config with only host, port, and user (minimal valid URL)
+    #[test]
+    fn config_minimal_valid_url() {
+        let cfg = Config::from_url("postgres://user@localhost/db").unwrap();
+        assert_eq!(cfg.user, "user");
+        assert_eq!(cfg.password, "");
+        assert_eq!(cfg.host, "localhost");
+        assert_eq!(cfg.port, 5432);
+        assert_eq!(cfg.database, "db");
+    }
+
+    // Multiple ampersands and empty param segments
+    #[test]
+    fn config_empty_param_segments() {
+        let cfg = Config::from_url(
+            "postgres://user:pass@localhost/db?&&statement_timeout=60&&",
+        )
+        .unwrap();
+        assert_eq!(cfg.statement_timeout_secs, 60);
+    }
+
     // ===================================================================
     // hash_sql tests
     // ===================================================================
