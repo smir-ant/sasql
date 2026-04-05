@@ -17,16 +17,17 @@ Every SQL string passed to `bsql::query!` is validated against a real PostgreSQL
 
 ---
 
-### 2. No escape hatch. Period.
+### 2. Checked by default. Escape hatch for the rare exception.
 
-There is no `query()`. No `raw_sql()`. No `execute_unchecked()`. No `#[allow(unchecked)]`. No "advanced users only" API. No backdoor hidden in a submodule. The unsafe path does not exist because the function does not exist.
+Every query through `query!` is validated at compile time. There is no `query()` function. The checked path is the only path for application queries.
 
-This is not a philosophical position. It is an architectural one. If an unchecked path exists, someone will use it. One unchecked query in a codebase of 500 checked queries breaks the guarantee. The guarantee is binary: 100% or meaningless.
+For the rare cases that `query!` cannot express --- DDL (`CREATE INDEX CONCURRENTLY`), dynamic table names, migrations --- `Pool::raw_query()` and `Pool::raw_execute()` exist. They bypass compile-time validation entirely. They use PostgreSQL's simple query protocol (text, no binary, no prepared statements). They are explicitly documented as unsafe-for-SQL and should never be used with user input.
 
 **In practice:**
-- The crate exports macros and traits. It does not export any function that accepts `&str` SQL.
-- Edge cases (dynamic table names, migration tooling) are solved through compile-time macros or separate crates. Not by weakening the guarantee.
-- If you need unchecked SQL, use `tokio-postgres` directly. bsql will not become the thing it replaces.
+- 99%+ of queries go through `query!` --- fully validated, type-safe, zero risk.
+- `raw_query`/`raw_execute` exist for DDL, ad-hoc admin queries, and migrations.
+- The crate does not export any function that takes `&str` SQL *and* returns typed results. `raw_query` returns `Vec<RawRow>` (text values) --- the type system reminds you this is unvalidated.
+- If you find yourself using `raw_query` for SELECT queries, reconsider. `query!` probably handles it.
 
 ---
 
@@ -47,26 +48,22 @@ DSLs inevitably diverge from the SQL they model. They cannot express the full po
 
 Not because users notice nanoseconds. Because the mindset that says "nanoseconds don't matter" produces millisecond-level bloat through a thousand "doesn't matter" decisions. bsql fights for every cycle.
 
-**In practice:**
-- **Arena allocation** *(planned)*: every query execution uses a bump allocator. All row data allocates in a contiguous arena. One deallocation for everything. 300 pointer bumps at ~2ns each vs. 300 malloc/free pairs at ~27ns each. 13x less allocation overhead.
-- **Binary protocol** *(planned)*: PostgreSQL's binary wire format eliminates parsing entirely for numeric types. `i32` is `i32::from_be_bytes()` --- one instruction. Timestamps are 8-byte memcpy. UUIDs are 16-byte memcpy. 50% less data on the wire for typical results.
-- **SIMD** *(planned)*: `simdutf` for UTF-8 validation (70 GB/s vs 3 GB/s scalar). `sonic-rs` for JSONB columns. `memchr` for enum string matching.
-- **Zero-copy deserialization** *(planned)*: `FromRow` reads directly from the wire buffer into struct fields. No intermediate `Row` type. No hash lookups. No string comparisons.
-- **Pipelining** *(planned)*: N queries sent on one connection in one round-trip. Same wall-clock latency as N parallel connections, 1/N the connection pressure.
-- **Pre-computed column offsets** *(planned)*: fixed-width columns (`i32`, `i64`, `bool`, `f64`, `uuid`) have their byte offsets computed at compile time as constants. Only variable-width columns need runtime offset calculation.
+**In practice (implemented in v0.17):**
+- **Zero-copy fetch**: `fetch()` returns borrowed `&str` fields pointing directly into the wire response buffer. No `String::to_owned()`. No heap allocation per text column.
+- **Binary protocol**: PostgreSQL's binary wire format. `i32` is `i32::from_be_bytes()` --- one instruction. Timestamps are 8-byte memcpy.
+- **SIMD UTF-8 validation**: `simdutf8` for bulk string validation.
+- **Pipelining**: `INSERT` batch sends N Bind+Execute messages in one round-trip. 2.5x faster than C's per-query approach.
+- **Thread-local buffer recycling**: response buffers and arenas recycled via thread-local pools. Zero malloc on the hot query path.
+- **Monolithic execute path**: entire send+receive inlined in one function. No abstraction layers, no virtual dispatch.
+- **Statement cache**: Vec-based O(n) cache with u64 hash keys. Faster than HashMap for < 30 entries. BindTemplate with `encode_at` for parameter patching without rebuild.
 
 ---
 
-### 5. mimalloc is the recommended global allocator. *(planned)*
+### 5. Allocator-agnostic. System allocator works fine.
 
-For multi-threaded async workloads (which is every non-trivial web server), mimalloc outperforms glibc malloc, jemalloc, and the default Rust allocator. Smaller thread-local heaps, better cache locality, faster small-object allocation. The numbers are not close.
+bsql's allocation profile is already minimal: zero-copy fetch, thread-local buffer recycling, arena for streaming. The system allocator is sufficient. Peak RSS: 1.70 MB for 10K queries --- 3.8x less than C (libpq).
 
-bsql does not bundle or force an allocator. But the documentation, examples, and benchmarks will use mimalloc. The `bsql::recommended_allocator!()` macro will set it up in one line. If you have a reason to use something else, you can. But you probably do not.
-
-**In practice** *(not yet implemented --- planned)*:
-- `#[global_allocator] static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;` in your `main.rs`.
-- Or: `bsql::recommended_allocator!();` --- expands to the above.
-- Benchmarks show the difference: mimalloc + arena allocation makes bsql's allocation profile essentially invisible in profiling.
+If you want further improvement, mimalloc or jemalloc can help with multi-threaded workloads. But bsql does not require or recommend a specific allocator.
 
 ---
 
@@ -94,18 +91,17 @@ bitcode is the fastest and most compact binary serialization format in the Rust 
 
 ---
 
-### 8. Zero allocations where possible. *(partially implemented; arena planned)*
+### 8. Zero allocations where possible.
 
-`fetch_one` and `fetch_optional` return stack-allocated structs. No heap allocation for the result container. *(Currently uses owned `String`/`Vec` fields; arena-borrowed strings planned.)*
+`fetch()` returns borrowed rows with `&str` fields. No `String` heap allocation per text column. Data lives in a response buffer owned by `BsqlRows` --- when `BsqlRows` drops, one deallocation frees everything.
 
-Multi-row results will use the arena. All rows from a single query share one arena. When the result set is dropped, one deallocation frees everything.
+`fetch_all()` exists for cases where owned `String` fields are needed (sending to another thread, storing long-term). But `fetch()` is the default and the fast path.
 
-Owned `String` only when data escapes the arena's lifetime --- and even then, consider whether the architecture can be restructured so it does not need to escape.
-
-**In practice** *(arena allocation not yet implemented --- planned)*:
-- A typical web handler (query -> serialize to JSON -> respond) never converts arena strings to owned `String`. The serializer borrows from the arena. The arena lives until the response is sent. Zero string allocations.
-- `Vec<T>` for `fetch_all` is the only heap allocation in the common path. The `T` values inside contain arena-borrowed strings.
-- The arena is recycled from a thread-local pool. The arena object itself is never heap-allocated.
+**In practice (implemented in v0.17):**
+- `fetch()` on 10K rows: zero String allocations. All text fields are `&str` borrowed from the wire buffer.
+- Response buffer recycled via thread-local pool. Second query on the same connection: zero malloc.
+- Arena used only for streaming queries (chunk-based fetch). Regular queries bypass arena entirely.
+- `fetch_one()` returns `BsqlSingleRef` --- access row via `.get()`. Data borrowed, not owned.
 
 ---
 
@@ -145,15 +141,22 @@ The query lives where it is used. In the function that calls it. Not in a `.sql`
 
 ---
 
-### 12. Async and parallel by design.
+### 12. Sync-first. Async when you need it.
 
-Not bolted on. Not "supports async if you add the right feature flag." The entire architecture assumes tokio, async/await, and concurrent connection usage. Because that is how every production Rust web application works.
+The core API is synchronous. Every method returns directly --- no `.await`, no runtime dependency. This gives maximum performance (no async state machine overhead) and maximum portability (works from `fn main()`, threads, tokio, async-std, anywhere).
 
-**In practice:**
-- All execution methods (`.fetch_one()`, `.fetch_all()`, `.execute()`) are async.
-- Connection pooling (deadpool-postgres, upgradeable to custom LIFO pool) is built in.
-- `bsql::pipeline!` sends N queries on one connection in one round-trip.
-- The proc macro shares a connection pool across invocations within a single `cargo build` --- parallel macro expansion validates concurrently.
+For async web servers: wrap bsql calls in `spawn_blocking` or use the planned `feature = "async"` wrapper. The synchronous core is *faster* than async for the common case (UDS, low-latency local PG), and equally fast for TCP.
+
+**Why sync beats async for database drivers:**
+- PostgreSQL wire protocol is request-response. One query per connection at a time. Async adds overhead (future state machines, waker polling) without enabling concurrency on a single connection.
+- Concurrency comes from the connection pool, not from async. 10 pool connections = 10 concurrent queries, whether sync or async.
+- sync eliminates tokio as a dependency. Smaller binary, faster compile, fewer version conflicts.
+
+**In practice (v0.17):**
+- All methods are `fn`, not `async fn`. No tokio dependency. No `.await`.
+- Connection pool with LIFO ordering, `Condvar`-based wait, `std::thread` for background tasks.
+- Pipeline batching: N operations in one round-trip via `defer()` + `commit()`.
+- Works from any context: `fn main()`, `std::thread::spawn`, tokio `spawn_blocking`, actix-web, etc.
 
 ---
 
@@ -173,14 +176,12 @@ A confusing error message is a bug. Error quality is a feature, not a nice-to-ha
 
 ### 14. Doc-tests are the contract.
 
-Every public API has a doc-test. The doc-test compiles, runs, and demonstrates correct usage. If the doc-test fails, the release does not ship. If the doc-test is wrong, the API is wrong.
+Every public API has a doc-test or a `rust,ignore` example (for `query!` which requires a live database at compile time). If the doc-test is wrong, the API is wrong.
 
 **In practice:**
-- README examples are extracted from doc-tests. One source of truth.
-- The `examples/` directory is generated from doc-tests. Not the other way around.
-- CI runs `cargo test --doc` on every commit. A doc-test failure blocks the merge.
-- Doc-tests use real PostgreSQL (via testcontainers or the CI database). No mocking.
-- The `.bsql/` query cache is committed to the repository. Cloned repos and local builds without a running database auto-fallback to this cache, so doc-tests compile everywhere. Online builds refresh the cache automatically.
+- `lib.rs` doc examples use `rust,ignore` for `query!` (requires PG at compile time). Non-macro API examples compile and run.
+- The `.bsql/` query cache is committed to the repository. Cloned repos auto-fallback to this cache for offline builds.
+- 1801 tests (unit + integration) cover all public API paths. Doc examples are supplementary, not the sole test source.
 
 ---
 
@@ -198,7 +199,7 @@ Every nullable column is `Option<T>`. Every parameter type is verified against `
 
 ### 16. Total query knowledge is a superpower.
 
-bsql has no escape hatch. This means it sees every query the application executes --- at compile time and at runtime. This complete visibility enables optimizations that are fundamentally impossible in libraries with backdoors: singleflight coalescing, automatic cache invalidation, read/write splitting without annotations, cross-query deadlock detection, and N+1 batching. The no-escape-hatch design is not just a safety feature. It is a performance feature.
+bsql sees every `query!` the application executes --- at compile time and at runtime. `raw_query`/`raw_execute` are the exception, not the rule (DDL/migrations only). This near-complete visibility enables: singleflight coalescing, read/write splitting, statement cache optimization, and pipeline batching. The more queries go through `query!`, the more bsql can optimize.
 
 ---
 
@@ -206,10 +207,9 @@ bsql has no escape hatch. This means it sees every query the application execute
 
 Timeouts are an admission of helplessness: "I don't know how long this will take, so I'll just cut it off." bsql does not wait and hope.
 
-**Fail-fast, not timeout:**
-- Pool exhausted → immediate `PoolExhausted` error. Not "wait 5 seconds and maybe a connection frees up." The caller decides what to do (retry, fallback, 503). A thousand handlers blocked for 5 seconds each is not a timeout strategy --- it is a denial-of-service against yourself.
-- Deadlock (transaction holds connection, needs another from the same full pool) → immediate error, not silent hang.
-- Dropped transaction without commit/rollback → connection marked dirty, discarded from pool, warning logged. The next pool user gets a clean connection, not a corrupted one.
+**Fail-fast by default, configurable wait:**
+- Pool exhausted → immediate `PoolExhausted` error by default. Configurable `acquire_timeout` for burst tolerance (e.g., wait up to 50ms before failing). The caller decides the strategy.
+- Dropped transaction without commit/rollback → connection discarded from pool, warning logged. The next pool user gets a clean connection.
 
 **Where timeout is unavoidable** (external systems we do not control):
 - TCP connect to PostgreSQL --- the network may be down. `connect_timeout` exists because TCP itself will wait forever. This is the only legitimate timeout in bsql.
