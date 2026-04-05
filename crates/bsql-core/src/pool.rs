@@ -3,11 +3,11 @@
 //! Delegates all connection management, fail-fast semantics, and LIFO ordering
 //! to the driver. This layer adds only the bsql error type conversions.
 
+use std::sync::Mutex;
 use std::time::Duration;
 
 use bsql_driver_postgres::arena::acquire_arena;
 use bsql_driver_postgres::codec::Encode;
-use tokio::sync::Mutex;
 
 use crate::error::{BsqlError, BsqlResult};
 use crate::stream::QueryStream;
@@ -24,15 +24,14 @@ use crate::transaction::Transaction;
 /// ```rust,ignore
 /// use bsql::Pool;
 ///
-/// let pool = Pool::connect("postgres://user:pass@localhost/mydb").await?;
+/// let pool = Pool::connect("postgres://user:pass@localhost/mydb")?;
 ///
 /// // Or configure via builder:
 /// let pool = Pool::builder()
 ///     .url("postgres://user:pass@localhost/mydb")
 ///     .lifetime_secs(900)
 ///     .timeout_secs(5)
-///     .build()
-///     .await?;
+///     .build()?;
 /// ```
 pub struct Pool {
     pub(crate) inner: bsql_driver_postgres::Pool,
@@ -53,8 +52,7 @@ pub struct Pool {
 ///     .lifetime_secs(900)
 ///     .timeout_secs(5)
 ///     .min_idle(2)
-///     .build()
-///     .await?;
+///     .build()?;
 /// ```
 pub struct PoolBuilder {
     url: Option<String>,
@@ -149,7 +147,7 @@ impl PoolBuilder {
         self
     }
 
-    pub async fn build(self) -> BsqlResult<Pool> {
+    pub fn build(self) -> BsqlResult<Pool> {
         let url = self.url.ok_or_else(|| {
             BsqlError::from(bsql_driver_postgres::DriverError::Pool(
                 "pool builder requires a URL".into(),
@@ -169,7 +167,7 @@ impl PoolBuilder {
             builder = builder.min_idle(mi);
         }
 
-        let inner = builder.build().await.map_err(BsqlError::from)?;
+        let inner = builder.build().map_err(BsqlError::from)?;
 
         // Build replica pool if configured
         let read_pool = if let Some(replica_url) = &self.replica_url {
@@ -183,7 +181,7 @@ impl PoolBuilder {
             if let Some(at) = self.acquire_timeout {
                 rbuilder = rbuilder.acquire_timeout(at);
             }
-            Some(rbuilder.build().await.map_err(BsqlError::from)?)
+            Some(rbuilder.build().map_err(BsqlError::from)?)
         } else {
             None
         };
@@ -196,10 +194,8 @@ impl Pool {
     /// Connect to PostgreSQL using a connection URL.
     ///
     /// Format: `postgres://user:password@host:port/dbname`
-    pub async fn connect(url: &str) -> BsqlResult<Self> {
-        let inner = bsql_driver_postgres::Pool::connect(url)
-            .await
-            .map_err(BsqlError::from)?;
+    pub fn connect(url: &str) -> BsqlResult<Self> {
+        let inner = bsql_driver_postgres::Pool::connect(url).map_err(BsqlError::from)?;
         Ok(Pool {
             inner,
             read_pool: None,
@@ -223,8 +219,8 @@ impl Pool {
     ///
     /// **Fail-fast**: returns `BsqlError::Pool` immediately if no connections
     /// are available (unless `acquire_timeout` is configured).
-    pub async fn acquire(&self) -> BsqlResult<PoolConnection> {
-        let guard = self.inner.acquire().await.map_err(BsqlError::from)?;
+    pub fn acquire(&self) -> BsqlResult<PoolConnection> {
+        let guard = self.inner.acquire().map_err(BsqlError::from)?;
         Ok(PoolConnection {
             inner: Mutex::new(guard),
         })
@@ -233,8 +229,8 @@ impl Pool {
     /// Begin a new transaction.
     ///
     /// Acquires a connection and sends BEGIN immediately.
-    pub async fn begin(&self) -> BsqlResult<Transaction> {
-        let tx = self.inner.begin().await.map_err(BsqlError::from)?;
+    pub fn begin(&self) -> BsqlResult<Transaction> {
+        let tx = self.inner.begin().map_err(BsqlError::from)?;
         Ok(Transaction::from_driver(tx))
     }
 
@@ -246,13 +242,13 @@ impl Pool {
     /// Uses true PG-level streaming via `Execute(max_rows=64)`. Only 64 rows
     /// are in memory at a time. The stream fetches additional chunks on demand
     /// via the `PortalSuspended` / re-`Execute` protocol.
-    pub async fn query_stream(
+    pub fn query_stream(
         &self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<QueryStream> {
-        let mut guard = self.inner.acquire().await.map_err(BsqlError::from)?;
+        let mut guard = self.inner.acquire().map_err(BsqlError::from)?;
         let mut arena = acquire_arena();
 
         // chunk_size=64 rows per Execute call
@@ -260,7 +256,6 @@ impl Pool {
 
         let (columns, _) = guard
             .query_streaming_start(sql, sql_hash, params, CHUNK_SIZE)
-            .await
             .map_err(BsqlError::from)?;
 
         let num_cols = columns.len();
@@ -269,7 +264,6 @@ impl Pool {
 
         let more = guard
             .streaming_next_chunk(&mut arena, &mut all_col_offsets)
-            .await
             .map_err(BsqlError::from)?;
 
         let first_result = bsql_driver_postgres::QueryResult::from_parts(
@@ -311,10 +305,10 @@ impl Pool {
     /// No new connections can be acquired after this call. All idle connections
     /// are closed immediately. Active connections are closed when returned to
     /// the pool.
-    pub async fn close(&self) {
-        self.inner.close().await;
+    pub fn close(&self) {
+        self.inner.close();
         if let Some(ref rp) = self.read_pool {
-            rp.close().await;
+            rp.close();
         }
     }
 
@@ -345,7 +339,7 @@ impl Pool {
     ///
     /// When `readonly` is true and a replica pool is configured, routes
     /// to the replica pool; otherwise uses the primary.
-    pub async fn for_each_raw<F>(
+    pub fn for_each_raw<F>(
         &self,
         sql: &str,
         sql_hash: u64,
@@ -361,22 +355,20 @@ impl Pool {
         } else {
             &self.inner
         };
-        let mut guard = pool.acquire().await.map_err(BsqlError::from)?;
+        let mut guard = pool.acquire().map_err(BsqlError::from)?;
         // Bridge BsqlError from the user closure into DriverError for the
         // driver-level for_each. Any closure error is stashed in `user_err`
         // and re-surfaced after the driver returns.
         let mut user_err: Option<BsqlError> = None;
-        let driver_result = guard
-            .for_each(sql, sql_hash, params, |row| match f(row) {
-                Ok(()) => Ok(()),
-                Err(e) => {
-                    user_err = Some(e);
-                    Err(bsql_driver_postgres::DriverError::Protocol(
-                        "for_each closure error".into(),
-                    ))
-                }
-            })
-            .await;
+        let driver_result = guard.for_each(sql, sql_hash, params, |row| match f(row) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                user_err = Some(e);
+                Err(bsql_driver_postgres::DriverError::Protocol(
+                    "for_each closure error".into(),
+                ))
+            }
+        });
         // If the user closure produced an error, return it directly.
         if let Some(e) = user_err {
             return Err(e);
@@ -391,7 +383,7 @@ impl Pool {
     /// The generated macro code decodes columns inline by advancing a position
     /// cursor through the bytes.
     #[doc(hidden)]
-    pub async fn __for_each_raw_bytes<F>(
+    pub fn __for_each_raw_bytes<F>(
         &self,
         sql: &str,
         sql_hash: u64,
@@ -407,19 +399,17 @@ impl Pool {
         } else {
             &self.inner
         };
-        let mut guard = pool.acquire().await.map_err(BsqlError::from)?;
+        let mut guard = pool.acquire().map_err(BsqlError::from)?;
         let mut user_err: Option<BsqlError> = None;
-        let driver_result = guard
-            .for_each_raw(sql, sql_hash, params, |data| match f(data) {
-                Ok(()) => Ok(()),
-                Err(e) => {
-                    user_err = Some(e);
-                    Err(bsql_driver_postgres::DriverError::Protocol(
-                        "for_each closure error".into(),
-                    ))
-                }
-            })
-            .await;
+        let driver_result = guard.for_each_raw(sql, sql_hash, params, |data| match f(data) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                user_err = Some(e);
+                Err(bsql_driver_postgres::DriverError::Protocol(
+                    "for_each closure error".into(),
+                ))
+            }
+        });
         if let Some(e) = user_err {
             return Err(e);
         }
@@ -446,12 +436,10 @@ impl std::fmt::Debug for Pool {
 
 /// A connection borrowed from the pool.
 ///
-/// Uses `tokio::sync::Mutex` for interior mutability because the driver's
-/// `Connection` requires `&mut self` for queries, but the `Executor` trait
+/// Uses `std::sync::Mutex` for interior mutability because the driver's
+/// `PoolGuard` requires `&mut self` for queries, but the `Executor` trait
 /// takes `&self`. The mutex is uncontended in practice — a single connection
-/// is used by one task at a time, never shared between concurrent tasks.
-/// `tokio::sync::Mutex` is needed (over `RefCell`) because the future holding
-/// the guard must be `Send` for tokio task migration between worker threads.
+/// is used by one caller at a time, never shared between concurrent callers.
 ///
 /// Returned to the pool when dropped.
 pub struct PoolConnection {
@@ -579,38 +567,30 @@ mod tests {
         assert_eq!(b.replica_max_size, Some(20));
     }
 
-    #[tokio::test]
-    async fn pool_connect_has_no_replica() {
-        let pool = Pool::connect("postgres://user:pass@localhost/db")
-            .await
-            .unwrap();
+    #[test]
+    fn pool_connect_has_no_replica() {
+        let pool = Pool::connect("postgres://user:pass@localhost/db").unwrap();
         assert!(!pool.has_replica());
     }
 
     // --- Auto-UDS sync connection tests ---
 
-    #[tokio::test]
-    async fn pool_is_uds_false_for_tcp() {
-        let pool = Pool::connect("postgres://user:pass@localhost/db")
-            .await
-            .unwrap();
+    #[test]
+    fn pool_is_uds_false_for_tcp() {
+        let pool = Pool::connect("postgres://user:pass@localhost/db").unwrap();
         assert!(!pool.is_uds());
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn pool_is_uds_true_for_unix_socket() {
-        let pool = Pool::connect("postgres://user@localhost/db?host=/tmp")
-            .await
-            .unwrap();
+    #[test]
+    fn pool_is_uds_true_for_unix_socket() {
+        let pool = Pool::connect("postgres://user@localhost/db?host=/tmp").unwrap();
         assert!(pool.is_uds());
     }
 
-    #[tokio::test]
-    async fn pool_is_uds_false_for_ip() {
-        let pool = Pool::connect("postgres://user:pass@127.0.0.1/db")
-            .await
-            .unwrap();
+    #[test]
+    fn pool_is_uds_false_for_ip() {
+        let pool = Pool::connect("postgres://user:pass@127.0.0.1/db").unwrap();
         assert!(!pool.is_uds());
     }
 
@@ -640,8 +620,8 @@ mod tests {
 
     // --- PoolConnection Debug ---
 
-    #[tokio::test]
-    async fn pool_connection_debug() {
+    #[test]
+    fn pool_connection_debug() {
         // PoolConnection wraps a Mutex<PoolGuard>, Debug should not panic
         let dbg_str = "PoolConnection";
         assert!(!dbg_str.is_empty());
@@ -653,22 +633,18 @@ mod tests {
 
     // --- Pool Debug ---
 
-    #[tokio::test]
-    async fn pool_debug() {
-        let pool = Pool::connect("postgres://user:pass@localhost/db")
-            .await
-            .unwrap();
+    #[test]
+    fn pool_debug() {
+        let pool = Pool::connect("postgres://user:pass@localhost/db").unwrap();
         let dbg = format!("{pool:?}");
         assert!(dbg.contains("Pool"), "Debug should show Pool: {dbg}");
     }
 
     // --- Pool Clone ---
 
-    #[tokio::test]
-    async fn pool_clone_is_cheap() {
-        let pool = Pool::connect("postgres://user:pass@localhost/db")
-            .await
-            .unwrap();
+    #[test]
+    fn pool_clone_is_cheap() {
+        let pool = Pool::connect("postgres://user:pass@localhost/db").unwrap();
         let pool2 = pool.clone();
         assert_eq!(pool.status().max_size, pool2.status().max_size);
         assert!(!pool.has_replica());
@@ -700,9 +676,9 @@ mod tests {
 
     // --- Builder without URL ---
 
-    #[tokio::test]
-    async fn builder_build_without_url_errors() {
-        let result = Pool::builder().build().await;
+    #[test]
+    fn builder_build_without_url_errors() {
+        let result = Pool::builder().build();
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("URL"), "error should mention URL: {err}");

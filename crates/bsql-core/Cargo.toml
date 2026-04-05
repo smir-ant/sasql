@@ -21,7 +21,6 @@ sqlite-system = ["sqlite", "bsql-driver-sqlite/system"]
 [dependencies]
 bsql-arena = { workspace = true }
 bsql-driver-postgres = { workspace = true }
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros"] }
 rapidhash = { workspace = true }
 smallvec = { workspace = true }
 

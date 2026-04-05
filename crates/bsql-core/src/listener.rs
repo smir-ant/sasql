@@ -1,7 +1,7 @@
 //! LISTEN/NOTIFY support via a dedicated PostgreSQL connection.
 //!
 //! [`Listener`] opens a standalone connection (not from the pool) and
-//! subscribes to named channels. Notifications arrive asynchronously and
+//! subscribes to named channels. Notifications arrive synchronously and
 //! are read via [`recv()`](Listener::recv).
 //!
 //! # Design
@@ -11,17 +11,17 @@
 //! Pooled connections cycle between callers, so LISTEN on a pooled
 //! connection would silently lose the subscription on return-to-pool.
 //!
-//! A background task owns the `Connection` exclusively. It uses
-//! `tokio::select!` to multiplex between:
+//! A background thread owns the `Connection` exclusively. It polls between:
 //!
 //! 1. **Commands** from the caller (listen/unlisten/notify) delivered via
-//!    a bounded mpsc channel (capacity 64 — commands are rare).
-//! 2. **Notifications** from PostgreSQL read via `Connection::wait_for_notification()`,
-//!    forwarded to the caller through a bounded mpsc channel.
+//!    a std mpsc channel.
+//! 2. **Notifications** from PostgreSQL read via `Connection::wait_for_notification()`
+//!    with a 100ms read timeout, forwarded to the caller through a bounded
+//!    sync_channel.
 //!
 //! # Reconnection
 //!
-//! When the background task detects a connection loss, it attempts to
+//! When the background thread detects a connection loss, it attempts to
 //! reconnect with exponential backoff (100ms, 200ms, 400ms, ... up to 5s).
 //! On successful reconnect, all previously subscribed channels are
 //! re-subscribed automatically. A special notification with channel
@@ -29,18 +29,16 @@
 //! may have been lost during the outage.
 
 use std::collections::HashSet;
+use std::io::ErrorKind;
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
-
-use tokio::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use crate::error::{BsqlError, BsqlResult, ConnectError};
 
 /// Buffer capacity for the notification channel.
 const NOTIFICATION_BUFFER_SIZE: usize = 1024;
-
-/// Buffer capacity for the command channel. Commands (listen/unlisten/notify)
-/// are rare relative to notifications, so 64 slots is ample.
-const COMMAND_BUFFER_SIZE: usize = 64;
 
 /// PostgreSQL's maximum NOTIFY payload size in bytes.
 const PG_MAX_PAYLOAD_SIZE: usize = 7999;
@@ -64,17 +62,17 @@ impl Notification {
     }
 }
 
-/// Commands sent from the `Listener` API to the background task.
+/// Commands sent from the `Listener` API to the background thread.
 enum Command {
     Listen(
         String,
-        tokio::sync::oneshot::Sender<Result<(), bsql_driver_postgres::DriverError>>,
+        mpsc::SyncSender<Result<(), bsql_driver_postgres::DriverError>>,
     ),
     Unlisten(
         String,
-        tokio::sync::oneshot::Sender<Result<(), bsql_driver_postgres::DriverError>>,
+        mpsc::SyncSender<Result<(), bsql_driver_postgres::DriverError>>,
     ),
-    UnlistenAll(tokio::sync::oneshot::Sender<Result<(), bsql_driver_postgres::DriverError>>),
+    UnlistenAll(mpsc::SyncSender<Result<(), bsql_driver_postgres::DriverError>>),
 }
 
 /// A dedicated LISTEN/NOTIFY connection to PostgreSQL.
@@ -93,18 +91,18 @@ enum Command {
 /// ```rust,ignore
 /// use bsql::Listener;
 ///
-/// let mut listener = Listener::connect("postgres://user:pass@localhost/mydb").await?;
-/// listener.listen("order_updates").await?;
+/// let mut listener = Listener::connect("postgres://user:pass@localhost/mydb")?;
+/// listener.listen("order_updates")?;
 ///
 /// loop {
-///     let notif = listener.recv().await?;
+///     let notif = listener.recv()?;
 ///     println!("{}: {}", notif.channel(), notif.payload());
 /// }
 /// ```
 pub struct Listener {
     cmd_tx: mpsc::Sender<Command>,
     rx: mpsc::Receiver<Notification>,
-    _task_handle: tokio::task::JoinHandle<()>,
+    _thread_handle: Option<thread::JoinHandle<()>>,
     /// Tracked subscribed channels for reconnection.
     channels: Arc<Mutex<HashSet<String>>>,
     /// Connection config for creating notify connections.
@@ -113,7 +111,9 @@ pub struct Listener {
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        self._task_handle.abort();
+        // Drop the command sender to signal the background thread to exit.
+        // The thread will see cmd_rx.try_recv() return Disconnected and break.
+        // We don't join the thread in drop to avoid blocking.
     }
 }
 
@@ -124,8 +124,12 @@ impl std::fmt::Debug for Listener {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .len();
+        let active = self
+            ._thread_handle
+            .as_ref()
+            .map_or(false, |h| !h.is_finished());
         f.debug_struct("Listener")
-            .field("active", &!self._task_handle.is_finished())
+            .field("active", &active)
             .field("channels", &channel_count)
             .finish()
     }
@@ -135,7 +139,7 @@ impl Listener {
     /// Connect to PostgreSQL and start the background notification reader.
     ///
     /// Opens a dedicated connection (not from any pool).
-    pub async fn connect(url: &str) -> BsqlResult<Self> {
+    pub fn connect(url: &str) -> BsqlResult<Self> {
         let config = bsql_driver_postgres::Config::from_url(url)
             .map_err(|e| ConnectError::create(format!("listener connect failed: {e}")))?;
 
@@ -145,27 +149,24 @@ impl Listener {
         listener_config.statement_timeout_secs = 0;
 
         let conn = bsql_driver_postgres::Connection::connect(&listener_config)
-            .await
             .map_err(|e| ConnectError::create(format!("listener connect failed: {e}")))?;
 
-        let (notif_tx, rx) = mpsc::channel(NOTIFICATION_BUFFER_SIZE);
-        let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_BUFFER_SIZE);
+        let (notif_tx, rx) = mpsc::sync_channel(NOTIFICATION_BUFFER_SIZE);
+        let (cmd_tx, cmd_rx) = mpsc::channel();
         let channels: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
         let config_for_notify = listener_config.clone();
 
-        let handle = tokio::spawn(drive_listener(
-            conn,
-            listener_config,
-            cmd_rx,
-            notif_tx,
-            Arc::clone(&channels),
-        ));
+        let thread_channels = Arc::clone(&channels);
+        let thread_config = listener_config.clone();
+        let handle = thread::spawn(move || {
+            drive_listener(conn, thread_config, cmd_rx, notif_tx, thread_channels);
+        });
 
         Ok(Listener {
             cmd_tx,
             rx,
-            _task_handle: handle,
+            _thread_handle: Some(handle),
             channels,
             config: config_for_notify,
         })
@@ -175,7 +176,7 @@ impl Listener {
     ///
     /// The channel name is properly quoted as a PostgreSQL identifier to
     /// prevent SQL injection.
-    pub async fn listen(&self, channel: &str) -> BsqlResult<()> {
+    pub fn listen(&self, channel: &str) -> BsqlResult<()> {
         if channel.is_empty() {
             return Err(ConnectError::create(
                 "LISTEN channel name must not be empty",
@@ -183,11 +184,11 @@ impl Listener {
         }
         let quoted = quote_ident(channel)?;
         let sql = format!("LISTEN {quoted}");
-        self.send_command_listen(channel.to_owned(), sql).await
+        self.send_command_listen(channel.to_owned(), sql)
     }
 
     /// Unsubscribe from a named notification channel.
-    pub async fn unlisten(&self, channel: &str) -> BsqlResult<()> {
+    pub fn unlisten(&self, channel: &str) -> BsqlResult<()> {
         if channel.is_empty() {
             return Err(ConnectError::create(
                 "UNLISTEN channel name must not be empty",
@@ -195,25 +196,24 @@ impl Listener {
         }
         let quoted = quote_ident(channel)?;
         let sql = format!("UNLISTEN {quoted}");
-        self.send_command_unlisten(channel.to_owned(), sql).await
+        self.send_command_unlisten(channel.to_owned(), sql)
     }
 
     /// Unsubscribe from all channels.
-    pub async fn unlisten_all(&self) -> BsqlResult<()> {
+    pub fn unlisten_all(&self) -> BsqlResult<()> {
         // Clear the tracked set
         self.channels
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
 
-        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        let (resp_tx, resp_rx) = mpsc::sync_channel(1);
         self.cmd_tx
             .send(Command::UnlistenAll(resp_tx))
-            .await
-            .map_err(|_| ConnectError::create("listener background task exited"))?;
+            .map_err(|_| ConnectError::create("listener background thread exited"))?;
         resp_rx
-            .await
-            .map_err(|_| ConnectError::create("listener background task exited"))?
+            .recv()
+            .map_err(|_| ConnectError::create("listener background thread exited"))?
             .map_err(BsqlError::from)
     }
 
@@ -221,22 +221,21 @@ impl Listener {
     ///
     /// Blocks until a notification arrives, or returns an error if the
     /// connection has been closed.
-    pub async fn recv(&mut self) -> BsqlResult<Notification> {
+    pub fn recv(&mut self) -> BsqlResult<Notification> {
         self.rx
             .recv()
-            .await
-            .ok_or_else(|| ConnectError::create("listener connection closed"))
+            .map_err(|_| ConnectError::create("listener connection closed"))
     }
 
     /// Non-blocking receive. Returns `Ok(None)` if no notification is
-    /// available right now (as opposed to `recv()` which awaits).
+    /// available right now (as opposed to `recv()` which blocks).
     ///
     /// Returns `Err` only if the listener connection has been closed.
     pub fn try_recv(&mut self) -> BsqlResult<Option<Notification>> {
         match self.rx.try_recv() {
             Ok(notif) => Ok(Some(notif)),
-            Err(mpsc::error::TryRecvError::Empty) => Ok(None),
-            Err(mpsc::error::TryRecvError::Disconnected) => {
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => {
                 Err(ConnectError::create("listener connection closed"))
             }
         }
@@ -245,7 +244,7 @@ impl Listener {
     /// Send a NOTIFY on a channel with a payload.
     ///
     /// The payload must not exceed 7999 bytes (PostgreSQL's limit).
-    pub async fn notify(&self, channel: &str, payload: &str) -> BsqlResult<()> {
+    pub fn notify(&self, channel: &str, payload: &str) -> BsqlResult<()> {
         if channel.is_empty() {
             return Err(ConnectError::create(
                 "NOTIFY channel name must not be empty",
@@ -272,10 +271,8 @@ impl Listener {
         // is sent on the same connection that LISTENs, the notification
         // arrives during simple_query's response read, creating duplicates.
         let mut conn = bsql_driver_postgres::Connection::connect(&self.config)
-            .await
             .map_err(|e| ConnectError::create(format!("notify connection failed: {e}")))?;
         conn.simple_query(&sql)
-            .await
             .map_err(BsqlError::from_driver_query)?;
         Ok(())
     }
@@ -290,16 +287,15 @@ impl Listener {
             .collect()
     }
 
-    /// Send a LISTEN command to the background task and wait for the response.
-    async fn send_command_listen(&self, channel: String, sql: String) -> BsqlResult<()> {
-        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+    /// Send a LISTEN command to the background thread and wait for the response.
+    fn send_command_listen(&self, channel: String, sql: String) -> BsqlResult<()> {
+        let (resp_tx, resp_rx) = mpsc::sync_channel(1);
         self.cmd_tx
             .send(Command::Listen(sql, resp_tx))
-            .await
-            .map_err(|_| ConnectError::create("listener background task exited"))?;
+            .map_err(|_| ConnectError::create("listener background thread exited"))?;
         let result = resp_rx
-            .await
-            .map_err(|_| ConnectError::create("listener background task exited"))?
+            .recv()
+            .map_err(|_| ConnectError::create("listener background thread exited"))?
             .map_err(BsqlError::from);
 
         if result.is_ok() {
@@ -311,16 +307,15 @@ impl Listener {
         result
     }
 
-    /// Send an UNLISTEN command to the background task and wait for the response.
-    async fn send_command_unlisten(&self, channel: String, sql: String) -> BsqlResult<()> {
-        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+    /// Send an UNLISTEN command to the background thread and wait for the response.
+    fn send_command_unlisten(&self, channel: String, sql: String) -> BsqlResult<()> {
+        let (resp_tx, resp_rx) = mpsc::sync_channel(1);
         self.cmd_tx
             .send(Command::Unlisten(sql, resp_tx))
-            .await
-            .map_err(|_| ConnectError::create("listener background task exited"))?;
+            .map_err(|_| ConnectError::create("listener background thread exited"))?;
         let result = resp_rx
-            .await
-            .map_err(|_| ConnectError::create("listener background task exited"))?
+            .recv()
+            .map_err(|_| ConnectError::create("listener background thread exited"))?
             .map_err(BsqlError::from);
 
         if result.is_ok() {
@@ -352,16 +347,50 @@ fn quote_ident(name: &str) -> BsqlResult<String> {
     Ok(quoted)
 }
 
-/// Background task that owns the Connection and multiplexes between
+/// Check whether a driver error is a timeout/would-block from the read timeout.
+fn is_timeout_error(e: &bsql_driver_postgres::DriverError) -> bool {
+    if let bsql_driver_postgres::DriverError::Io(io_err) = e {
+        matches!(io_err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+    } else {
+        false
+    }
+}
+
+/// Handle a single command from the Listener API.
+fn handle_command(
+    conn: &mut bsql_driver_postgres::Connection,
+    cmd: Command,
+    notif_tx: &SyncSender<Notification>,
+) {
+    match cmd {
+        Command::Listen(sql, resp) => {
+            let result = conn.simple_query(&sql);
+            drain_pending(conn, notif_tx);
+            let _ = resp.send(result);
+        }
+        Command::Unlisten(sql, resp) => {
+            let result = conn.simple_query(&sql);
+            drain_pending(conn, notif_tx);
+            let _ = resp.send(result);
+        }
+        Command::UnlistenAll(resp) => {
+            let result = conn.simple_query("UNLISTEN *");
+            drain_pending(conn, notif_tx);
+            let _ = resp.send(result);
+        }
+    }
+}
+
+/// Background thread that owns the Connection and polls between
 /// reading commands from the API and waiting for PostgreSQL notifications.
 ///
 /// On connection loss, attempts reconnection with exponential backoff and
 /// re-subscribes to all tracked channels.
-async fn drive_listener(
+fn drive_listener(
     mut conn: bsql_driver_postgres::Connection,
     config: bsql_driver_postgres::Config,
-    mut cmd_rx: mpsc::Receiver<Command>,
-    notif_tx: mpsc::Sender<Notification>,
+    cmd_rx: Receiver<Command>,
+    notif_tx: SyncSender<Notification>,
     channels: Arc<Mutex<HashSet<String>>>,
 ) {
     /// Counter for dropped notifications (buffer full).
@@ -370,61 +399,62 @@ async fn drive_listener(
     static DROPPED_NOTIFICATIONS: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);
 
+    // Set a read timeout so wait_for_notification doesn't block forever,
+    // allowing us to check for commands periodically.
+    conn.set_read_timeout(Some(Duration::from_millis(100))).ok();
+
     loop {
-        tokio::select! {
-            // Branch 1: Commands from the Listener API
-            cmd = cmd_rx.recv() => {
-                match cmd {
-                    Some(Command::Listen(sql, resp)) => {
-                        let result = conn.simple_query(&sql).await;
-                        drain_pending(&mut conn, &notif_tx);
-                        let _ = resp.send(result);
-                    }
-                    Some(Command::Unlisten(sql, resp)) => {
-                        let result = conn.simple_query(&sql).await;
-                        drain_pending(&mut conn, &notif_tx);
-                        let _ = resp.send(result);
-                    }
-                    Some(Command::UnlistenAll(resp)) => {
-                        let result = conn.simple_query("UNLISTEN *").await;
-                        drain_pending(&mut conn, &notif_tx);
-                        let _ = resp.send(result);
-                    }
-                    None => break, // Listener dropped, all senders gone
+        // Check for commands (non-blocking)
+        loop {
+            match cmd_rx.try_recv() {
+                Ok(cmd) => handle_command(&mut conn, cmd, &notif_tx),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => return, // Listener dropped
+            }
+        }
+
+        // Try to read a notification (times out after 100ms due to read timeout)
+        match conn.wait_for_notification() {
+            Ok((channel, payload)) => {
+                if notif_tx
+                    .try_send(Notification {
+                        channel: channel.clone(),
+                        payload,
+                    })
+                    .is_err()
+                {
+                    let count = DROPPED_NOTIFICATIONS
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        + 1;
+                    eprintln!(
+                        "bsql: notification buffer full, dropped notification on channel \
+                         \"{channel}\" (total dropped: {count})"
+                    );
                 }
             }
-            // Branch 2: Notifications from PostgreSQL
-            notif = conn.wait_for_notification() => {
-                match notif {
-                    Ok((channel, payload)) => {
-                        if notif_tx.try_send(Notification { channel: channel.clone(), payload }).is_err() {
-                            let count = DROPPED_NOTIFICATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                            eprintln!(
-                                "bsql: notification buffer full, dropped notification on channel \
-                                 \"{channel}\" (total dropped: {count})"
-                            );
-                        }
+            Err(ref e) if is_timeout_error(e) => {
+                // Normal timeout — loop back to check commands
+                continue;
+            }
+            Err(_) => {
+                // Connection lost — attempt reconnection
+                eprintln!("bsql: listener connection lost, attempting reconnect...");
+                match reconnect_with_backoff(&config, &channels) {
+                    Some(new_conn) => {
+                        conn = new_conn;
+                        conn.set_read_timeout(Some(Duration::from_millis(100))).ok();
+                        // Notify application that reconnection occurred
+                        let _ = notif_tx.try_send(Notification {
+                            channel: "_bsql_reconnected".to_owned(),
+                            payload: "connection was lost and re-established; \
+                                      some notifications may have been missed"
+                                .to_owned(),
+                        });
+                        eprintln!("bsql: listener reconnected successfully");
                     }
-                    Err(_) => {
-                        // Connection lost — attempt reconnection
-                        eprintln!("bsql: listener connection lost, attempting reconnect...");
-                        match reconnect_with_backoff(&config, &channels).await {
-                            Some(new_conn) => {
-                                conn = new_conn;
-                                // Notify application that reconnection occurred
-                                let _ = notif_tx.try_send(Notification {
-                                    channel: "_bsql_reconnected".to_owned(),
-                                    payload: "connection was lost and re-established; \
-                                              some notifications may have been missed"
-                                        .to_owned(),
-                                });
-                                eprintln!("bsql: listener reconnected successfully");
-                            }
-                            None => {
-                                eprintln!("bsql: listener reconnection failed, task exiting");
-                                break;
-                            }
-                        }
+                    None => {
+                        eprintln!("bsql: listener reconnection failed, thread exiting");
+                        return;
                     }
                 }
             }
@@ -439,7 +469,7 @@ async fn drive_listener(
 /// that calls `simple_query`, self-notifications would be silently lost.
 fn drain_pending(
     conn: &mut bsql_driver_postgres::Connection,
-    notif_tx: &mpsc::Sender<Notification>,
+    notif_tx: &SyncSender<Notification>,
 ) {
     for notif in conn.drain_notifications() {
         let _ = notif_tx.try_send(Notification {
@@ -451,18 +481,18 @@ fn drain_pending(
 
 /// Attempt to reconnect with exponential backoff: 100ms, 200ms, 400ms, ... up to 5s.
 /// Gives up after 10 consecutive failures.
-async fn reconnect_with_backoff(
+fn reconnect_with_backoff(
     config: &bsql_driver_postgres::Config,
     channels: &Arc<Mutex<HashSet<String>>>,
 ) -> Option<bsql_driver_postgres::Connection> {
-    let mut delay = std::time::Duration::from_millis(100);
-    let max_delay = std::time::Duration::from_secs(5);
+    let mut delay = Duration::from_millis(100);
+    let max_delay = Duration::from_secs(5);
     let max_attempts = 10;
 
     for attempt in 1..=max_attempts {
-        tokio::time::sleep(delay).await;
+        thread::sleep(delay);
 
-        match bsql_driver_postgres::Connection::connect(config).await {
+        match bsql_driver_postgres::Connection::connect(config) {
             Ok(mut new_conn) => {
                 // Re-subscribe to all tracked channels
                 let channel_set = channels.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -471,7 +501,7 @@ async fn reconnect_with_backoff(
                     match quote_ident(channel) {
                         Ok(quoted) => {
                             let sql = format!("LISTEN {quoted}");
-                            if let Err(e) = new_conn.simple_query(&sql).await {
+                            if let Err(e) = new_conn.simple_query(&sql) {
                                 eprintln!(
                                     "bsql: failed to re-subscribe to channel \"{channel}\" \
                                      after reconnect: {e}"
@@ -550,7 +580,7 @@ mod tests {
     // --- Audit gap tests ---
 
     // #94: Notification payload > 7999 validation
-    // (This is validated in Listener::notify, which requires async + connection.
+    // (This is validated in Listener::notify, which requires a connection.
     //  We test the constant and the quote_ident utility instead.)
 
     // #95: quote_ident with various special characters
@@ -631,6 +661,41 @@ mod tests {
         let dbg = format!("{notif:?}");
         assert!(dbg.contains("ch"), "Debug should show channel: {dbg}");
         assert!(dbg.contains("data"), "Debug should show payload: {dbg}");
+    }
+
+    // --- is_timeout_error ---
+
+    #[test]
+    fn is_timeout_error_would_block() {
+        let e = bsql_driver_postgres::DriverError::Io(std::io::Error::new(
+            ErrorKind::WouldBlock,
+            "would block",
+        ));
+        assert!(is_timeout_error(&e));
+    }
+
+    #[test]
+    fn is_timeout_error_timed_out() {
+        let e = bsql_driver_postgres::DriverError::Io(std::io::Error::new(
+            ErrorKind::TimedOut,
+            "timed out",
+        ));
+        assert!(is_timeout_error(&e));
+    }
+
+    #[test]
+    fn is_timeout_error_connection_reset_is_false() {
+        let e = bsql_driver_postgres::DriverError::Io(std::io::Error::new(
+            ErrorKind::ConnectionReset,
+            "reset",
+        ));
+        assert!(!is_timeout_error(&e));
+    }
+
+    #[test]
+    fn is_timeout_error_non_io_is_false() {
+        let e = bsql_driver_postgres::DriverError::Protocol("test".into());
+        assert!(!is_timeout_error(&e));
     }
 
     // --- Listener Debug (compile-time only, can't construct without DB) ---

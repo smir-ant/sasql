@@ -31,11 +31,11 @@ const STREAM_CHUNK_SIZE: i32 = 64;
 /// # Usage
 ///
 /// Use [`advance()`](QueryStream::advance) + [`next_row()`](QueryStream::next_row)
-/// for row-by-row async iteration:
+/// for row-by-row iteration:
 ///
 /// ```rust,ignore
-/// let mut stream = pool.query_stream(sql, hash, &[]).await?;
-/// while stream.advance().await? {
+/// let mut stream = pool.query_stream(sql, hash, &[])?;
+/// while stream.advance()? {
 ///     let row = stream.next_row().unwrap();
 ///     let id: i32 = row.get_i32(0).unwrap();
 ///     // decode before next advance() — row borrows from arena
@@ -89,7 +89,7 @@ impl QueryStream {
     ///
     /// Returns `None` when the current chunk is exhausted. Call
     /// [`fetch_next_chunk()`](QueryStream::fetch_next_chunk) to load more rows
-    /// from the server, or use [`try_next()`](QueryStream::try_next) which
+    /// from the server, or use [`advance()`](QueryStream::advance) which
     /// handles chunk management automatically.
     ///
     /// Rows borrow from the arena, which is reset between chunks. Each row
@@ -107,8 +107,8 @@ impl QueryStream {
             }
         }
 
-        // Current chunk exhausted — cannot fetch more synchronously.
-        // The async fetch is done via `fetch_next_chunk()`.
+        // Current chunk exhausted — cannot fetch more synchronously here.
+        // Use `fetch_next_chunk()` to load the next chunk.
         None
     }
 
@@ -118,17 +118,17 @@ impl QueryStream {
     /// fetches the next chunk. Returns `true` if rows are available (call
     /// `next_row()` next), `false` if all rows have been consumed.
     ///
-    /// This is the async complement to `next_row()`. Together they form
+    /// This is the complement to `next_row()`. Together they form
     /// the primary iteration pattern:
     ///
     /// ```rust,ignore
-    /// while stream.advance().await? {
+    /// while stream.advance()? {
     ///     let row = stream.next_row().unwrap();
     ///     let id: i32 = row.get_i32(0).unwrap();
     ///     // decode before next advance() — row borrows from arena
     /// }
     /// ```
-    pub async fn advance(&mut self) -> Result<bool, crate::error::BsqlError> {
+    pub fn advance(&mut self) -> Result<bool, crate::error::BsqlError> {
         // Fast path: current chunk still has rows
         if let Some(ref result) = self.current_result {
             if self.position < result.len() {
@@ -142,7 +142,7 @@ impl QueryStream {
         }
 
         // Fetch the next chunk
-        self.fetch_next_chunk().await?;
+        self.fetch_next_chunk()?;
 
         // Check if the new chunk has rows
         if let Some(ref result) = self.current_result {
@@ -165,7 +165,7 @@ impl QueryStream {
         !self.finished
     }
 
-    /// Fetch the next chunk from the server asynchronously.
+    /// Fetch the next chunk from the server.
     ///
     /// Returns `true` if a new chunk was fetched (call `next_row()` to iterate
     /// it). Returns `false` if all rows have been consumed.
@@ -173,7 +173,7 @@ impl QueryStream {
     /// The arena is reset before fetching the new chunk, invalidating any
     /// previous `Row` references. The generated code always decodes rows into
     /// owned fields before calling this.
-    pub async fn fetch_next_chunk(&mut self) -> Result<bool, crate::error::BsqlError> {
+    pub fn fetch_next_chunk(&mut self) -> Result<bool, crate::error::BsqlError> {
         if self.finished {
             return Ok(false);
         }
@@ -197,7 +197,6 @@ impl QueryStream {
         if self.needs_execute {
             guard
                 .streaming_send_execute(STREAM_CHUNK_SIZE)
-                .await
                 .map_err(crate::error::BsqlError::from_driver_query)?;
         }
 
@@ -215,7 +214,6 @@ impl QueryStream {
 
         let more = guard
             .streaming_next_chunk(arena, &mut col_offsets)
-            .await
             .map_err(crate::error::BsqlError::from_driver_query)?;
 
         if !more {
@@ -263,7 +261,7 @@ impl Drop for QueryStream {
         }
         // If the stream was not fully consumed, the connection is in an
         // indeterminate protocol state (portal open, no ReadyForQuery sent).
-        // We cannot send Close+Sync in Drop (requires async I/O), so we
+        // We cannot send Close+Sync in Drop (requires I/O), so we
         // mark the guard for discard to prevent it from being returned to
         // the pool. The TCP disconnect causes PG to clean up the portal.
         if !self.finished {
@@ -414,34 +412,34 @@ mod tests {
 
     // --- fetch_next_chunk requires guard ---
 
-    #[tokio::test]
-    async fn fetch_next_chunk_without_guard_errors() {
+    #[test]
+    fn fetch_next_chunk_without_guard_errors() {
         let mut stream = make_stream(0, 1, false);
-        let result = stream.fetch_next_chunk().await;
+        let result = stream.fetch_next_chunk();
         assert!(result.is_err(), "should error without guard");
     }
 
-    #[tokio::test]
-    async fn fetch_next_chunk_when_finished_returns_false() {
+    #[test]
+    fn fetch_next_chunk_when_finished_returns_false() {
         let mut stream = make_stream(0, 1, true);
-        let result = stream.fetch_next_chunk().await.unwrap();
+        let result = stream.fetch_next_chunk().unwrap();
         assert!(!result, "finished stream should return false");
     }
 
     // --- advance ---
 
-    #[tokio::test]
-    async fn advance_returns_true_when_rows_available() {
+    #[test]
+    fn advance_returns_true_when_rows_available() {
         let mut stream = make_stream(2, 1, true);
-        let has = stream.advance().await.unwrap();
+        let has = stream.advance().unwrap();
         assert!(has);
     }
 
-    #[tokio::test]
-    async fn advance_returns_false_when_finished_and_exhausted() {
+    #[test]
+    fn advance_returns_false_when_finished_and_exhausted() {
         let mut stream = make_stream(1, 1, true);
         let _ = stream.next_row(); // consume the one row
-        let has = stream.advance().await.unwrap();
+        let has = stream.advance().unwrap();
         assert!(!has);
     }
 
@@ -458,8 +456,8 @@ mod tests {
 
     // --- fetch_next_chunk without arena errors ---
 
-    #[tokio::test]
-    async fn fetch_next_chunk_without_arena_errors() {
+    #[test]
+    fn fetch_next_chunk_without_arena_errors() {
         let columns = sample_columns(1);
         let result = make_result(0, &columns);
         let mut stream = QueryStream {
@@ -471,17 +469,17 @@ mod tests {
             finished: false,
             needs_execute: false,
         };
-        let res = stream.fetch_next_chunk().await;
+        let res = stream.fetch_next_chunk();
         assert!(res.is_err(), "should error without arena");
     }
 
     // --- advance when not finished but fetch fails ---
 
-    #[tokio::test]
-    async fn advance_fetch_fails_propagates_error() {
+    #[test]
+    fn advance_fetch_fails_propagates_error() {
         // Stream with 0 rows, not finished, no guard -> advance triggers fetch -> error
         let mut stream = make_stream(0, 1, false);
-        let res = stream.advance().await;
+        let res = stream.advance();
         assert!(res.is_err(), "advance should propagate fetch error");
     }
 

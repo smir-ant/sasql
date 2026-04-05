@@ -61,17 +61,16 @@ impl Drop for OwnedResult {
 
 /// Execute a prepared query and return rows.
 ///
-/// This trait is sealed — it cannot be implemented outside of bsql-core.
 /// The generated code calls `query_raw`, `query_raw_readonly`, and
 /// `execute_raw` on `&Pool`, `&PoolConnection`, or `&Transaction`.
-pub trait Executor: sealed::Sealed {
+pub trait Executor {
     /// Execute a query and return all rows.
     fn query_raw(
         &self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
-    ) -> impl std::future::Future<Output = BsqlResult<OwnedResult>> + Send;
+    ) -> BsqlResult<OwnedResult>;
 
     /// Execute a read-only query. May route to replicas in the future.
     fn query_raw_readonly(
@@ -79,7 +78,7 @@ pub trait Executor: sealed::Sealed {
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
-    ) -> impl std::future::Future<Output = BsqlResult<OwnedResult>> + Send;
+    ) -> BsqlResult<OwnedResult>;
 
     /// Execute a query and return the number of affected rows.
     fn execute_raw(
@@ -87,33 +86,25 @@ pub trait Executor: sealed::Sealed {
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
-    ) -> impl std::future::Future<Output = BsqlResult<u64>> + Send;
-}
-
-mod sealed {
-    pub trait Sealed {}
-    impl Sealed for super::Pool {}
-    impl Sealed for super::PoolConnection {}
-    impl Sealed for super::Transaction {}
+    ) -> BsqlResult<u64>;
 }
 
 impl Executor for Pool {
-    async fn query_raw(
+    fn query_raw(
         &self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<OwnedResult> {
-        let mut guard = self.inner.acquire().await.map_err(BsqlError::from)?;
+        let mut guard = self.inner.acquire().map_err(BsqlError::from)?;
         let mut arena = acquire_arena();
         let result = guard
             .query(sql, sql_hash, params, &mut arena)
-            .await
             .map_err(BsqlError::from_driver_query)?;
         Ok(OwnedResult::new(result, arena))
     }
 
-    async fn query_raw_readonly(
+    fn query_raw_readonly(
         &self,
         sql: &str,
         sql_hash: u64,
@@ -121,94 +112,90 @@ impl Executor for Pool {
     ) -> BsqlResult<OwnedResult> {
         // Route to replica pool when configured; fall back to primary otherwise.
         let pool = self.read_pool.as_ref().unwrap_or(&self.inner);
-        let mut guard = pool.acquire().await.map_err(BsqlError::from)?;
+        let mut guard = pool.acquire().map_err(BsqlError::from)?;
         let mut arena = acquire_arena();
         let result = guard
             .query(sql, sql_hash, params, &mut arena)
-            .await
             .map_err(BsqlError::from_driver_query)?;
         Ok(OwnedResult::new(result, arena))
     }
 
-    async fn execute_raw(
+    fn execute_raw(
         &self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<u64> {
-        let mut guard = self.inner.acquire().await.map_err(BsqlError::from)?;
+        let mut guard = self.inner.acquire().map_err(BsqlError::from)?;
         guard
             .execute(sql, sql_hash, params)
-            .await
             .map_err(BsqlError::from_driver_query)
     }
 }
 
 impl Executor for PoolConnection {
-    async fn query_raw(
+    fn query_raw(
         &self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<OwnedResult> {
-        let mut guard = self.inner.lock().await;
+        let mut guard = self.inner.lock().unwrap();
         let mut arena = acquire_arena();
         let result = guard
             .query(sql, sql_hash, params, &mut arena)
-            .await
             .map_err(BsqlError::from_driver_query)?;
         Ok(OwnedResult::new(result, arena))
     }
 
-    async fn query_raw_readonly(
+    fn query_raw_readonly(
         &self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<OwnedResult> {
-        self.query_raw(sql, sql_hash, params).await
+        self.query_raw(sql, sql_hash, params)
     }
 
-    async fn execute_raw(
+    fn execute_raw(
         &self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<u64> {
-        let mut guard = self.inner.lock().await;
+        let mut guard = self.inner.lock().unwrap();
         guard
             .execute(sql, sql_hash, params)
-            .await
             .map_err(BsqlError::from_driver_query)
     }
 }
 
 impl Executor for Transaction {
-    async fn query_raw(
+    fn query_raw(
         &self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<OwnedResult> {
-        self.query_inner(sql, sql_hash, params).await
+        self.query_inner(sql, sql_hash, params)
     }
 
-    async fn query_raw_readonly(
+    fn query_raw_readonly(
         &self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<OwnedResult> {
-        self.query_raw(sql, sql_hash, params).await
+        self.query_raw(sql, sql_hash, params)
     }
 
-    async fn execute_raw(
+    fn execute_raw(
         &self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<u64> {
-        self.execute_inner(sql, sql_hash, params).await
+        self.execute_inner(sql, sql_hash, params)
     }
 }
 
