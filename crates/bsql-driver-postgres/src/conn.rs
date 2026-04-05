@@ -26,6 +26,33 @@ use crate::types::{
     StartupAction,
 };
 
+// --- Thread-local response buffer pool ---
+//
+// Recycling `Vec<u8>` response buffers avoids per-query malloc/free.
+// Each query takes a buffer (already capacity-sized from previous query),
+// fills it with DataRow payloads, and moves it into QueryResult.data_buf.
+// When OwnedResult drops, the buffer is returned here for reuse.
+
+use std::cell::RefCell;
+
+thread_local! {
+    static RESP_BUF_POOL: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+}
+
+fn acquire_resp_buf() -> Vec<u8> {
+    RESP_BUF_POOL.with(|pool| pool.borrow_mut().pop()).unwrap_or_default()
+}
+
+/// Return a response buffer to the thread-local pool for reuse.
+pub fn release_resp_buf(buf: Vec<u8>) {
+    RESP_BUF_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < 4 {
+            pool.push(buf);
+        }
+    });
+}
+
 // --- Connection ---
 
 /// A PostgreSQL connection over TCP, TLS, or Unix domain socket.
@@ -467,7 +494,8 @@ impl Connection {
         // payloads arrive. No upfront 64KB malloc — actual allocation matches
         // the result size. For 100 rows (~8KB), Vec grows to ~16KB capacity.
         // For 1 row (~80B), Vec grows to ~128B. Right-sized for the workload.
-        let mut resp_buf: Vec<u8> = Vec::new();
+        let mut resp_buf = acquire_resp_buf();
+        resp_buf.clear();
 
         // Inline response parsing: BindComplete + DataRow* + CommandComplete + ReadyForQuery.
         'outer: loop {

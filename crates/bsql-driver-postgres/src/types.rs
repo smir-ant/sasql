@@ -404,6 +404,11 @@ impl QueryResult {
         std::mem::take(&mut self.all_col_offsets)
     }
 
+    /// Take the data buffer for recycling. Returns None if no data_buf.
+    pub fn take_data_buf(&mut self) -> Option<Vec<u8>> {
+        self.data_buf.take()
+    }
+
     /// Iterate over rows.
     pub fn rows<'a>(&'a self, arena: &'a Arena) -> impl Iterator<Item = Row<'a>> {
         let num_cols = self.num_cols;

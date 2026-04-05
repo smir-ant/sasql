@@ -69,10 +69,13 @@ impl OwnedResult {
 
 impl Drop for OwnedResult {
     fn drop(&mut self) {
-        // Swap out the arena to return it to the thread-local pool.
-        // Arena implements Default, so take() avoids the explicit Arena::new().
+        // Return arena to thread-local pool.
         let arena = std::mem::take(&mut self.arena);
         release_arena(arena);
+        // Return data buffer to thread-local pool for reuse by next query.
+        if let Some(buf) = self.result.take_data_buf() {
+            bsql_driver_postgres::release_resp_buf(buf);
+        }
     }
 }
 
