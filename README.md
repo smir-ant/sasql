@@ -19,7 +19,7 @@ let id = 42i32;
 // or `id` isn't an i32 -- this won't compile.
 let users = bsql::query!(
     "SELECT id, login, active FROM users WHERE id = $id: i32"
-).fetch(&pool)?;
+).fetch(&pool).await?;
 let user = &users[0];
 
 // user.id: i32, user.login: String, user.active: bool
@@ -42,7 +42,7 @@ let user = &users[0];
 
 ```toml
 [dependencies]
-bsql = { version = "0.17", features = ["time", "uuid"] }
+bsql = { version = "0.18", features = ["time", "uuid"] }
 ```
 
 **Set the database URL** (used by `query!` at compile time):
@@ -56,13 +56,14 @@ export BSQL_DATABASE_URL="postgres://user:pass@localhost/mydb"
 ```rust
 use bsql::Pool;
 
-fn main() -> Result<(), bsql::BsqlError> {
-    let pool = Pool::connect("postgres://user:pass@localhost/mydb")?;
+#[tokio::main]
+async fn main() -> Result<(), bsql::BsqlError> {
+    let pool = Pool::connect("postgres://user:pass@localhost/mydb").await?;
 
     let id = 1i32;
     let users = bsql::query!(
         "SELECT id, login, first_name FROM users WHERE id = $id: i32"
-    ).fetch(&pool)?;
+    ).fetch(&pool).await?;
     let user = &users[0];
 
     println!("{} ({})", user.first_name, user.login);
@@ -78,7 +79,7 @@ fn main() -> Result<(), bsql::BsqlError> {
 
 ```toml
 [dependencies]
-bsql = { version = "0.17", features = ["sqlite"] }
+bsql = { version = "0.18", features = ["sqlite"] }
 ```
 
 **Set the database URL** (used by `query!` at compile time):
@@ -94,13 +95,14 @@ If you commit the `.bsql/` cache directory to your repo, teammates and CI can co
 ```rust
 use bsql::SqlitePool;
 
-fn main() -> Result<(), bsql::BsqlError> {
-    let pool = SqlitePool::open("./myapp.db")?;
+#[tokio::main]
+async fn main() -> Result<(), bsql::BsqlError> {
+    let pool = SqlitePool::open("./myapp.db").await?;
 
     let id = 1i64;
     let users = bsql::query!(
         "SELECT id, login, active FROM users WHERE id = $id: i64"
-    ).fetch(&pool)?;
+    ).fetch(&pool).await?;
     let user = &users[0];
 
     println!("{}: active={}", user.login, user.active);
@@ -159,7 +161,7 @@ When a pure-Rust SQLite engine like [Limbo](https://github.com/penberg/limbo) re
 Out of the box, bsql works with basic types: integers, floats, booleans, strings, byte arrays. Enable features for specialized types:
 
 ```toml
-bsql = { version = "0.17", features = ["time", "uuid", "decimal"] }
+bsql = { version = "0.18", features = ["time", "uuid", "decimal"] }
 ```
 
 | Feature     | PostgreSQL types                   | Rust types                                   |
@@ -183,7 +185,7 @@ let tickets = bsql::query!(
     "SELECT id, title FROM tickets WHERE deleted_at IS NULL
      [AND department_id = $dept: Option<i64>]
      [AND assignee_id = $assignee: Option<i64>]"
-).fetch(&pool)?;
+).fetch(&pool).await?;
 ```
 
 No string concatenation. No runtime SQL assembly. 2 optional clauses = 4 variants, all validated at compile time.
@@ -195,9 +197,9 @@ No string concatenation. No runtime SQL assembly. 2 optional clauses = 4 variant
 
 | Method            | Returns      | Use                    |
 | ----------------- | ------------ | ---------------------- |
-| `.fetch(&pool)` | `Vec<Row>` | SELECT queries         |
-| `.run(&pool)`   | `u64`      | INSERT, UPDATE, DELETE |
-| `.defer(&tx)`   | `()`       | Buffer in transaction  |
+| `.fetch(&pool).await` | `Vec<Row>` | SELECT queries         |
+| `.run(&pool).await`   | `u64`      | INSERT, UPDATE, DELETE |
+| `.defer(&tx).await`   | `()`       | Buffer in transaction  |
 
 Power users: `fetch_one`, `fetch_optional`, `fetch_stream`, `for_each` also available.
 
@@ -207,16 +209,16 @@ Power users: `fetch_one`, `fetch_optional`, `fetch_stream`, `for_each` also avai
 <summary>Transactions and batching</summary>
 
 ```rust
-let tx = pool.begin()?;
+let tx = pool.begin().await?;
 
 // .defer() buffers writes -- nothing hits the network yet
 bsql::query!("INSERT INTO audit_log (msg) VALUES ($msg: &str)")
-    .defer(&tx)?;
+    .defer(&tx).await?;
 bsql::query!("UPDATE accounts SET balance = balance - $amt: i32 WHERE id = $id: i32")
-    .defer(&tx)?;
+    .defer(&tx).await?;
 
 // commit() flushes all deferred operations in a single pipeline, then commits
-tx.commit()?;
+tx.commit().await?;
 ```
 
 Savepoints are also supported: `tx.savepoint("sp1")`, `tx.rollback_to("sp1")`.
@@ -231,7 +233,7 @@ If the transaction is dropped without calling `commit()`, it automatically rolls
 ```rust
 let mut stream = bsql::query!(
     "SELECT id, login FROM users"
-).fetch_stream(&pool)?;
+).fetch_stream(&pool).await?;
 
 while stream.advance()? {
     let row = stream.next_row().unwrap();
@@ -264,7 +266,7 @@ Real-time notifications for cache invalidation, job queues, live updates.
 <summary>Compile-time EXPLAIN plans</summary>
 
 ```toml
-bsql = { version = "0.17", features = ["explain"] }
+bsql = { version = "0.18", features = ["explain"] }
 ```
 
 Runs `EXPLAIN` on every query during compilation and embeds the plan as a doc comment. Hover over any query result type in your IDE to see the query plan. Development-only -- disable in CI and release builds.
@@ -294,7 +296,7 @@ Type-safe mapping between Rust enums and PostgreSQL enum types.
 ```rust
 let tickets = bsql::query!(
     "SELECT id, title FROM tickets ORDER BY $[sort: TicketSort] LIMIT $limit: i64"
-).fetch(&pool)?;
+).fetch(&pool).await?;
 ```
 
 Each sort variant's SQL is validated at compile time. The enum is exhaustive -- no default case, no fallback.

@@ -102,7 +102,7 @@ impl Transaction {
     /// Commit the transaction and return the connection to the pool.
     ///
     /// Consumes `self` — the transaction cannot be used after commit.
-    pub fn commit(mut self) -> BsqlResult<()> {
+    pub async fn commit(mut self) -> BsqlResult<()> {
         self.finished = true;
         let tx = self
             .inner
@@ -116,7 +116,7 @@ impl Transaction {
     /// Explicitly roll back the transaction and return the connection to the pool.
     ///
     /// Consumes `self` — the transaction cannot be used after rollback.
-    pub fn rollback(mut self) -> BsqlResult<()> {
+    pub async fn rollback(mut self) -> BsqlResult<()> {
         self.finished = true;
         let tx = self
             .inner
@@ -131,7 +131,7 @@ impl Transaction {
     ///
     /// The `name` must be a valid SQL identifier: ASCII alphanumeric and
     /// underscores only, starting with a letter or underscore. Maximum 63 characters.
-    pub fn savepoint(&self, name: &str) -> BsqlResult<()> {
+    pub async fn savepoint(&self, name: &str) -> BsqlResult<()> {
         validate_savepoint_name(name)?;
         let sql = format!("SAVEPOINT {name}");
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -142,7 +142,7 @@ impl Transaction {
     /// Release (destroy) a savepoint, keeping its effects.
     ///
     /// The `name` must match a previously created savepoint.
-    pub fn release_savepoint(&self, name: &str) -> BsqlResult<()> {
+    pub async fn release_savepoint(&self, name: &str) -> BsqlResult<()> {
         validate_savepoint_name(name)?;
         let sql = format!("RELEASE SAVEPOINT {name}");
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -153,7 +153,7 @@ impl Transaction {
     /// Roll back to a savepoint, undoing changes made after it was created.
     ///
     /// The savepoint remains valid after this call (can be rolled back to again).
-    pub fn rollback_to(&self, name: &str) -> BsqlResult<()> {
+    pub async fn rollback_to(&self, name: &str) -> BsqlResult<()> {
         validate_savepoint_name(name)?;
         let sql = format!("ROLLBACK TO SAVEPOINT {name}");
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -166,7 +166,7 @@ impl Transaction {
     /// Must be called before the first query in the transaction (immediately
     /// after `begin()`). PostgreSQL rejects `SET TRANSACTION` after any
     /// data-modifying statement.
-    pub fn set_isolation(&self, level: IsolationLevel) -> BsqlResult<()> {
+    pub async fn set_isolation(&self, level: IsolationLevel) -> BsqlResult<()> {
         let sql = format!("SET TRANSACTION ISOLATION LEVEL {}", level.as_sql());
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
@@ -206,7 +206,7 @@ impl Transaction {
     /// Sends all N Bind+Execute messages + one Sync. One round-trip for
     /// N operations within the transaction. Returns the affected row count
     /// for each parameter set.
-    pub fn execute_pipeline(
+    pub async fn execute_pipeline(
         &self,
         sql: &str,
         sql_hash: u64,
@@ -235,7 +235,7 @@ impl Transaction {
     /// automatically flushes deferred operations first to ensure
     /// read-your-writes consistency.
     #[doc(hidden)]
-    pub fn defer_execute(
+    pub async fn defer_execute(
         &self,
         sql: &str,
         sql_hash: u64,
@@ -252,7 +252,7 @@ impl Transaction {
     /// Sends all buffered Bind+Execute messages + one Sync in a single TCP write.
     /// Returns the affected row count for each deferred operation.
     #[doc(hidden)]
-    pub fn flush_deferred(&self) -> BsqlResult<Vec<u64>> {
+    pub async fn flush_deferred(&self) -> BsqlResult<Vec<u64>> {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let tx = guard.as_mut().ok_or_else(Self::consumed_error)?;
         tx.flush_deferred().map_err(BsqlError::from_driver_query)
@@ -276,7 +276,7 @@ impl Transaction {
     ///
     /// Zero arena allocation — the closure receives a `PgDataRow` that reads
     /// columns directly from the DataRow message bytes.
-    pub fn for_each_raw<F>(
+    pub async fn for_each_raw<F>(
         &self,
         sql: &str,
         sql_hash: u64,
@@ -309,7 +309,7 @@ impl Transaction {
     /// Like `for_each_raw` but passes the raw `&[u8]` DataRow payload directly
     /// to the closure — no `PgDataRow` construction, no SmallVec pre-scan.
     #[doc(hidden)]
-    pub fn __for_each_raw_bytes<F>(
+    pub async fn __for_each_raw_bytes<F>(
         &self,
         sql: &str,
         sql_hash: u64,

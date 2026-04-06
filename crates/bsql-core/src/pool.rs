@@ -176,7 +176,7 @@ impl PoolBuilder {
         self
     }
 
-    pub fn build(self) -> BsqlResult<Pool> {
+    pub async fn build(self) -> BsqlResult<Pool> {
         let url = self.url.ok_or_else(|| {
             BsqlError::from(bsql_driver_postgres::DriverError::Pool(
                 "pool builder requires a URL".into(),
@@ -222,8 +222,11 @@ impl PoolBuilder {
 impl Pool {
     /// Connect to PostgreSQL using a connection URL.
     ///
+    /// Creates the pool (parses URL, allocates pool structures). Actual TCP/UDS
+    /// connections are established lazily on first `acquire()`.
+    ///
     /// Format: `postgres://user:password@host:port/dbname`
-    pub fn connect(url: &str) -> BsqlResult<Self> {
+    pub async fn connect(url: &str) -> BsqlResult<Self> {
         let inner = bsql_driver_postgres::Pool::connect(url).map_err(BsqlError::from)?;
         Ok(Pool {
             inner,
@@ -248,7 +251,7 @@ impl Pool {
     ///
     /// **Fail-fast**: returns `BsqlError::Pool` immediately if no connections
     /// are available (unless `acquire_timeout` is configured).
-    pub fn acquire(&self) -> BsqlResult<PoolConnection> {
+    pub async fn acquire(&self) -> BsqlResult<PoolConnection> {
         let guard = self.inner.acquire().map_err(BsqlError::from)?;
         Ok(PoolConnection {
             inner: Mutex::new(guard),
@@ -258,7 +261,7 @@ impl Pool {
     /// Begin a new transaction.
     ///
     /// Acquires a connection and sends BEGIN immediately.
-    pub fn begin(&self) -> BsqlResult<Transaction> {
+    pub async fn begin(&self) -> BsqlResult<Transaction> {
         let tx = self.inner.begin().map_err(BsqlError::from)?;
         Ok(Transaction::from_driver(tx))
     }
@@ -271,7 +274,7 @@ impl Pool {
     /// Uses true PG-level streaming via `Execute(max_rows=64)`. Only 64 rows
     /// are in memory at a time. The stream fetches additional chunks on demand
     /// via the `PortalSuspended` / re-`Execute` protocol.
-    pub fn query_stream(
+    pub async fn query_stream(
         &self,
         sql: &str,
         sql_hash: u64,
@@ -323,7 +326,7 @@ impl Pool {
     ///
     /// Use for DDL, ad-hoc queries, migrations, or the rare dynamic SQL that
     /// cannot be expressed via `query!`. For type-safe queries, use `query!`.
-    pub fn raw_query(&self, sql: &str) -> BsqlResult<Vec<RawRow>> {
+    pub async fn raw_query(&self, sql: &str) -> BsqlResult<Vec<RawRow>> {
         let mut guard = self.inner.acquire().map_err(BsqlError::from)?;
         let rows = guard
             .simple_query_rows(sql)
@@ -335,7 +338,7 @@ impl Pool {
     ///
     /// Uses PostgreSQL's simple query protocol. Useful for DDL (CREATE TABLE,
     /// ALTER, DROP), SET commands, or any statement where you don't need results.
-    pub fn raw_execute(&self, sql: &str) -> BsqlResult<()> {
+    pub async fn raw_execute(&self, sql: &str) -> BsqlResult<()> {
         let mut guard = self.inner.acquire().map_err(BsqlError::from)?;
         guard
             .simple_query(sql)
@@ -395,7 +398,7 @@ impl Pool {
     ///
     /// When `readonly` is true and a replica pool is configured, routes
     /// to the replica pool; otherwise uses the primary.
-    pub fn for_each_raw<F>(
+    pub async fn for_each_raw<F>(
         &self,
         sql: &str,
         sql_hash: u64,
@@ -439,7 +442,7 @@ impl Pool {
     /// The generated macro code decodes columns inline by advancing a position
     /// cursor through the bytes.
     #[doc(hidden)]
-    pub fn __for_each_raw_bytes<F>(
+    pub async fn __for_each_raw_bytes<F>(
         &self,
         sql: &str,
         sql_hash: u64,
@@ -623,30 +626,38 @@ mod tests {
         assert_eq!(b.replica_max_size, Some(20));
     }
 
-    #[test]
-    fn pool_connect_has_no_replica() {
-        let pool = Pool::connect("postgres://user:pass@localhost/db").unwrap();
+    #[tokio::test]
+    async fn pool_connect_has_no_replica() {
+        let pool = Pool::connect("postgres://user:pass@localhost/db")
+            .await
+            .unwrap();
         assert!(!pool.has_replica());
     }
 
     // --- Auto-UDS sync connection tests ---
 
-    #[test]
-    fn pool_is_uds_false_for_tcp() {
-        let pool = Pool::connect("postgres://user:pass@localhost/db").unwrap();
+    #[tokio::test]
+    async fn pool_is_uds_false_for_tcp() {
+        let pool = Pool::connect("postgres://user:pass@localhost/db")
+            .await
+            .unwrap();
         assert!(!pool.is_uds());
     }
 
     #[cfg(unix)]
-    #[test]
-    fn pool_is_uds_true_for_unix_socket() {
-        let pool = Pool::connect("postgres://user@localhost/db?host=/tmp").unwrap();
+    #[tokio::test]
+    async fn pool_is_uds_true_for_unix_socket() {
+        let pool = Pool::connect("postgres://user@localhost/db?host=/tmp")
+            .await
+            .unwrap();
         assert!(pool.is_uds());
     }
 
-    #[test]
-    fn pool_is_uds_false_for_ip() {
-        let pool = Pool::connect("postgres://user:pass@127.0.0.1/db").unwrap();
+    #[tokio::test]
+    async fn pool_is_uds_false_for_ip() {
+        let pool = Pool::connect("postgres://user:pass@127.0.0.1/db")
+            .await
+            .unwrap();
         assert!(!pool.is_uds());
     }
 
@@ -689,18 +700,22 @@ mod tests {
 
     // --- Pool Debug ---
 
-    #[test]
-    fn pool_debug() {
-        let pool = Pool::connect("postgres://user:pass@localhost/db").unwrap();
+    #[tokio::test]
+    async fn pool_debug() {
+        let pool = Pool::connect("postgres://user:pass@localhost/db")
+            .await
+            .unwrap();
         let dbg = format!("{pool:?}");
         assert!(dbg.contains("Pool"), "Debug should show Pool: {dbg}");
     }
 
     // --- Pool Clone ---
 
-    #[test]
-    fn pool_clone_is_cheap() {
-        let pool = Pool::connect("postgres://user:pass@localhost/db").unwrap();
+    #[tokio::test]
+    async fn pool_clone_is_cheap() {
+        let pool = Pool::connect("postgres://user:pass@localhost/db")
+            .await
+            .unwrap();
         let pool2 = pool.clone();
         assert_eq!(pool.status().max_size, pool2.status().max_size);
         assert!(!pool.has_replica());
@@ -732,9 +747,9 @@ mod tests {
 
     // --- Builder without URL ---
 
-    #[test]
-    fn builder_build_without_url_errors() {
-        let result = Pool::builder().build();
+    #[tokio::test]
+    async fn builder_build_without_url_errors() {
+        let result = Pool::builder().build().await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("URL"), "error should mention URL: {err}");

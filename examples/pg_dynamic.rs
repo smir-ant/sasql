@@ -44,8 +44,9 @@ enum TicketSort {
     Priority,
 }
 
-fn main() -> Result<(), BsqlError> {
-    let pool = Pool::connect("postgres://user:pass@localhost/mydb")?;
+#[tokio::main]
+async fn main() -> Result<(), BsqlError> {
+    let pool = Pool::connect("postgres://user:pass@localhost/mydb").await?;
 
     // ---------------------------------------------------------------
     // Optional WHERE clauses
@@ -64,7 +65,7 @@ fn main() -> Result<(), BsqlError> {
          ORDER BY created_at DESC
          LIMIT 50"
     )
-    .fetch(&pool)?;
+    .fetch(&pool).await?;
 
     // With dept=Some(3), assignee=None, bsql runs:
     //   SELECT ... WHERE deleted_at IS NULL AND department_id = $1 ...
@@ -85,7 +86,7 @@ fn main() -> Result<(), BsqlError> {
          ORDER BY $[sort: TicketSort]
          LIMIT $limit: i64"
     )
-    .fetch(&pool)?;
+    .fetch(&pool).await?;
 
     println!("\nTop {} tickets by priority:", limit);
     for t in &sorted {
@@ -110,7 +111,7 @@ fn main() -> Result<(), BsqlError> {
          ORDER BY $[sort: TicketSort]
          LIMIT $limit: i64 OFFSET $offset: i64"
     )
-    .fetch(&pool)?;
+    .fetch(&pool).await?;
 
     println!("\nPage of high-priority tickets: {}", page.len());
 

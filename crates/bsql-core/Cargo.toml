@@ -10,6 +10,7 @@ description = "Runtime support for bsql — compile-time safe SQL for Rust"
 
 [features]
 default = []
+async = ["dep:tokio"]
 time = ["dep:time", "bsql-driver-postgres/time"]
 chrono = ["dep:chrono", "bsql-driver-postgres/chrono"]
 uuid = ["dep:uuid", "bsql-driver-postgres/uuid"]
@@ -28,6 +29,9 @@ smallvec = { workspace = true }
 # SQLite (optional)
 bsql-driver-sqlite = { workspace = true, optional = true }
 
+# Async runtime (optional)
+tokio = { workspace = true, features = ["rt"], optional = true }
+
 # Feature-gated type crates (optional)
 time = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
@@ -35,3 +39,4 @@ uuid = { workspace = true, optional = true }
 rust_decimal = { workspace = true, optional = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

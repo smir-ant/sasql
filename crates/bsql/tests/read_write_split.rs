@@ -8,26 +8,28 @@
 
 use bsql::Pool;
 
-fn pool() -> Pool {
+async fn pool() -> Pool {
     Pool::connect("postgres://bsql:bsql@localhost/bsql_test")
+        .await
         .expect("Failed to connect to test database. Is PostgreSQL running?")
 }
 
 /// SELECT queries work on a primary-only pool.
-#[test]
-fn select_works_without_replicas() {
-    let pool = pool();
+#[tokio::test]
+async fn select_works_without_replicas() {
+    let pool = pool().await;
 
     let users = bsql::query!("SELECT id, login FROM users ORDER BY id")
         .fetch_all(&pool)
+        .await
         .unwrap();
     assert!(users.len() >= 2);
 }
 
 /// INSERT works on a primary-only pool.
-#[test]
-fn insert_uses_primary() {
-    let pool = pool();
+#[tokio::test]
+async fn insert_uses_primary() {
+    let pool = pool().await;
     let title = "rw-split-test";
     let uid = 1i32;
     let ticket = bsql::query!(
@@ -36,6 +38,7 @@ fn insert_uses_primary() {
          RETURNING id"
     )
     .fetch_one(&pool)
+    .await
     .unwrap();
     assert!(ticket.id > 0);
 
@@ -43,25 +46,27 @@ fn insert_uses_primary() {
     let ticket_id = ticket.id;
     bsql::query!("DELETE FROM tickets WHERE id = $ticket_id: i32")
         .execute(&pool)
+        .await
         .unwrap();
 }
 
 /// UPDATE works on primary.
-#[test]
-fn update_uses_primary() {
-    let pool = pool();
+#[tokio::test]
+async fn update_uses_primary() {
+    let pool = pool().await;
     let desc = "rw-split-update";
     let id = 1i32;
     let affected = bsql::query!("UPDATE tickets SET description = $desc: &str WHERE id = $id: i32")
         .execute(&pool)
+        .await
         .unwrap();
     assert_eq!(affected, 1);
 }
 
 /// DELETE works on primary.
-#[test]
-fn delete_uses_primary() {
-    let pool = pool();
+#[tokio::test]
+async fn delete_uses_primary() {
+    let pool = pool().await;
     let title = "rw-split-delete";
     let uid = 1i32;
     let ticket = bsql::query!(
@@ -70,46 +75,50 @@ fn delete_uses_primary() {
          RETURNING id"
     )
     .fetch_one(&pool)
+    .await
     .unwrap();
 
     let ticket_id = ticket.id;
     let affected = bsql::query!("DELETE FROM tickets WHERE id = $ticket_id: i32")
         .execute(&pool)
+        .await
         .unwrap();
     assert_eq!(affected, 1);
 }
 
 /// Transaction queries work.
-#[test]
-fn transaction_uses_primary() {
-    let pool = pool();
+#[tokio::test]
+async fn transaction_uses_primary() {
+    let pool = pool().await;
 
-    let txn = pool.begin().unwrap();
+    let txn = pool.begin().await.unwrap();
 
     let users = bsql::query!("SELECT id, login FROM users ORDER BY id")
         .fetch_all(&txn)
+        .await
         .unwrap();
     assert!(users.len() >= 2);
 
-    txn.rollback().unwrap();
+    txn.rollback().await.unwrap();
 }
 
 /// PoolConnection queries work.
-#[test]
-fn pool_connection_uses_primary() {
-    let pool = pool();
-    let conn = pool.acquire().unwrap();
+#[tokio::test]
+async fn pool_connection_uses_primary() {
+    let pool = pool().await;
+    let conn = pool.acquire().await.unwrap();
 
     let users = bsql::query!("SELECT id, login FROM users ORDER BY id")
         .fetch_all(&conn)
+        .await
         .unwrap();
     assert!(users.len() >= 2);
 }
 
 /// Pool status reflects connection counts.
-#[test]
-fn pool_status_reports_metrics() {
-    let pool = pool();
+#[tokio::test]
+async fn pool_status_reports_metrics() {
+    let pool = pool().await;
     let status = pool.status();
     assert!(status.max_size > 0, "max_size should be positive");
 }

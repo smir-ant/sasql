@@ -5,25 +5,27 @@
 //! **If it compiles, the SQL is correct.**
 //!
 //! bsql validates every SQL query against a real database at compile time.
-//! No runtime, no async — just safe, fast, synchronous SQL.
+//! Async by default — all user-facing methods are `async fn`.
 //!
 //! ## Quick Start
 //!
 //! ```toml
 //! [dependencies]
-//! bsql = "0.17"
+//! bsql = "0.18"
+//! tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 //! ```
 //!
 //! ```rust,ignore
 //! use bsql::Pool;
 //!
-//! fn main() -> Result<(), bsql::BsqlError> {
-//!     let pool = Pool::connect("postgres://user:pass@localhost/mydb")?;
+//! #[tokio::main]
+//! async fn main() -> Result<(), bsql::BsqlError> {
+//!     let pool = Pool::connect("postgres://user:pass@localhost/mydb").await?;
 //!
 //!     let id = 1i32;
 //!     let users = bsql::query!(
 //!         "SELECT id, login, active FROM users WHERE id = $id: i32"
-//!     ).fetch(&pool)?;
+//!     ).fetch(&pool).await?;
 //!
 //!     let user = &users[0];
 //!     // user.id: i32, user.login: String, user.active: bool
@@ -36,8 +38,8 @@
 //!
 //! | Method | Returns | Use |
 //! |--------|---------|-----|
-//! | `.fetch(&pool)` | `Vec<Row>` | SELECT queries |
-//! | `.run(&pool)` | `u64` | INSERT, UPDATE, DELETE |
+//! | `.fetch(&pool).await` | `Vec<Row>` | SELECT queries |
+//! | `.run(&pool).await` | `u64` | INSERT, UPDATE, DELETE |
 //!
 //! Also: `fetch_one`, `fetch_optional`, `fetch_stream`, `for_each`, `defer` (for transactions).
 //!
@@ -46,8 +48,8 @@
 //! For rare cases requiring dynamic SQL (dynamic table names, pivots, DDL):
 //!
 //! ```rust,ignore
-//! let rows = pool.raw_query("SELECT * FROM pg_tables LIMIT 5")?;
-//! pool.raw_execute("CREATE INDEX CONCURRENTLY idx ON users (email)")?;
+//! let rows = pool.raw_query("SELECT * FROM pg_tables LIMIT 5").await?;
+//! pool.raw_execute("CREATE INDEX CONCURRENTLY idx ON users (email)").await?;
 //! ```
 //!
 //! `raw_query` / `raw_execute` bypass compile-time validation entirely.

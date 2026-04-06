@@ -6,8 +6,9 @@
 
 use bsql::Pool;
 
-fn pool() -> Pool {
+async fn pool() -> Pool {
     Pool::connect("postgres://bsql:bsql@localhost/bsql_test")
+        .await
         .expect("Failed to connect to test database. Is PostgreSQL running?")
 }
 
@@ -27,13 +28,14 @@ pub enum TicketStatus {
     Closed,
 }
 
-#[test]
-fn pg_enum_select_as_text() {
+#[tokio::test]
+async fn pg_enum_select_as_text() {
     // PG enum columns require ::text cast (EnumString was removed).
-    let pool = pool();
+    let pool = pool().await;
     let id = 1i32;
     let ticket = bsql::query!("SELECT id, status::text AS status FROM tickets WHERE id = $id: i32")
         .fetch_one(&pool)
+        .await
         .unwrap();
 
     let r = ticket.get().unwrap();
@@ -42,22 +44,22 @@ fn pg_enum_select_as_text() {
     assert_eq!(r.status, Some("new"));
 }
 
-#[test]
-fn pg_enum_display() {
+#[tokio::test]
+async fn pg_enum_display() {
     assert_eq!(format!("{}", TicketStatus::New), "new");
     assert_eq!(format!("{}", TicketStatus::InProgress), "in_progress");
     assert_eq!(format!("{}", TicketStatus::Resolved), "resolved");
     assert_eq!(format!("{}", TicketStatus::Closed), "closed");
 }
 
-#[test]
-fn pg_enum_equality() {
+#[tokio::test]
+async fn pg_enum_equality() {
     assert_eq!(TicketStatus::New, TicketStatus::New);
     assert_ne!(TicketStatus::New, TicketStatus::Closed);
 }
 
-#[test]
-fn pg_enum_clone_copy() {
+#[tokio::test]
+async fn pg_enum_clone_copy() {
     // Prove Copy: use after move
     let status = TicketStatus::InProgress;
     let copied = status;
@@ -71,8 +73,8 @@ fn pg_enum_clone_copy() {
     assert_eq!(status, cloned);
 }
 
-#[test]
-fn pg_enum_debug() {
+#[tokio::test]
+async fn pg_enum_debug() {
     assert_eq!(format!("{:?}", TicketStatus::Resolved), "Resolved");
 }
 
@@ -84,12 +86,13 @@ fn pg_enum_debug() {
 mod uuid_tests {
     use super::*;
 
-    #[test]
-    fn select_uuid_column() {
-        let pool = pool();
+    #[tokio::test]
+    async fn select_uuid_column() {
+        let pool = pool().await;
         let id = 1i32;
         let ticket = bsql::query!("SELECT id, ticket_uuid FROM tickets WHERE id = $id: i32")
             .fetch_one(&pool)
+            .await
             .unwrap();
 
         let r = ticket.get().unwrap();
@@ -98,9 +101,9 @@ mod uuid_tests {
         let _uuid: uuid::Uuid = r.ticket_uuid;
     }
 
-    #[test]
-    fn uuid_round_trip() {
-        let pool = pool();
+    #[tokio::test]
+    async fn uuid_round_trip() {
+        let pool = pool().await;
         let test_uuid = uuid::Uuid::new_v4();
         let title = "UUID round-trip test";
         let uid = 1i32;
@@ -112,6 +115,7 @@ mod uuid_tests {
              RETURNING id, ticket_uuid"
         )
         .fetch_one(&pool)
+        .await
         .unwrap();
 
         assert_eq!(ticket.ticket_uuid, test_uuid);
@@ -120,17 +124,19 @@ mod uuid_tests {
         let inserted_id = ticket.id;
         bsql::query!("DELETE FROM tickets WHERE id = $inserted_id: i32")
             .execute(&pool)
+            .await
             .unwrap();
     }
 
-    #[test]
-    fn uuid_param_filter() {
-        let pool = pool();
+    #[tokio::test]
+    async fn uuid_param_filter() {
+        let pool = pool().await;
         let id = 1i32;
 
         // First get the UUID of ticket 1
         let ticket = bsql::query!("SELECT id, ticket_uuid FROM tickets WHERE id = $id: i32")
             .fetch_one(&pool)
+            .await
             .unwrap();
 
         let r = ticket.get().unwrap();
@@ -140,6 +146,7 @@ mod uuid_tests {
         let found =
             bsql::query!("SELECT id FROM tickets WHERE ticket_uuid = $target_uuid: uuid::Uuid")
                 .fetch_one(&pool)
+                .await
                 .unwrap();
 
         let r2 = found.get().unwrap();
@@ -155,22 +162,23 @@ mod uuid_tests {
 mod time_tests {
     use super::*;
 
-    #[test]
-    fn select_nullable_timestamptz() {
+    #[tokio::test]
+    async fn select_nullable_timestamptz() {
         // deadline is nullable TIMESTAMPTZ -- find a ticket where it's NULL
-        let pool = pool();
+        let pool = pool().await;
         let ticket =
             bsql::query!("SELECT id, deadline FROM tickets WHERE deadline IS NULL LIMIT 1")
                 .fetch_one(&pool)
+                .await
                 .unwrap();
 
         let r = ticket.get().unwrap();
         assert!(r.deadline.is_none());
     }
 
-    #[test]
-    fn timestamptz_round_trip() {
-        let pool = pool();
+    #[tokio::test]
+    async fn timestamptz_round_trip() {
+        let pool = pool().await;
         let now = time::OffsetDateTime::now_utc();
         let id = 1i32;
 
@@ -179,11 +187,13 @@ mod time_tests {
             "UPDATE tickets SET deadline = $now: time::OffsetDateTime WHERE id = $id: i32"
         )
         .execute(&pool)
+        .await
         .unwrap();
 
         // Read it back
         let ticket = bsql::query!("SELECT id, deadline FROM tickets WHERE id = $id: i32")
             .fetch_one(&pool)
+            .await
             .unwrap();
 
         let r = ticket.get().unwrap();
@@ -195,15 +205,17 @@ mod time_tests {
         // Clean up -- set back to NULL
         bsql::query!("UPDATE tickets SET deadline = NULL WHERE id = $id: i32")
             .execute(&pool)
+            .await
             .unwrap();
     }
 
-    #[test]
-    fn select_date_column() {
-        let pool = pool();
+    #[tokio::test]
+    async fn select_date_column() {
+        let pool = pool().await;
         let id = 1i32;
         let ticket = bsql::query!("SELECT id, created_date FROM tickets WHERE id = $id: i32")
             .fetch_one(&pool)
+            .await
             .unwrap();
 
         let r = ticket.get().unwrap();
@@ -212,9 +224,9 @@ mod time_tests {
         let _date: time::Date = r.created_date;
     }
 
-    #[test]
-    fn select_nullable_time_column() {
-        let pool = pool();
+    #[tokio::test]
+    async fn select_nullable_time_column() {
+        let pool = pool().await;
         // Insert a fresh ticket with no start_time (NULL by default)
         let title = "nullable_time_test";
         let uid = 1i32;
@@ -224,6 +236,7 @@ mod time_tests {
              RETURNING id, start_time"
         )
         .fetch_one(&pool)
+        .await
         .unwrap();
 
         assert!(ticket.id > 0);
@@ -231,9 +244,9 @@ mod time_tests {
         assert!(ticket.start_time.is_none());
     }
 
-    #[test]
-    fn time_round_trip() {
-        let pool = pool();
+    #[tokio::test]
+    async fn time_round_trip() {
+        let pool = pool().await;
         let t = time::Time::from_hms(14, 30, 0).expect("valid time");
 
         // Create own ticket to avoid interfering with other tests
@@ -245,6 +258,7 @@ mod time_tests {
              RETURNING id, start_time"
         )
         .fetch_one(&pool)
+        .await
         .unwrap();
 
         let start_time = ticket.start_time.expect("start_time should be set");
@@ -255,17 +269,19 @@ mod time_tests {
         let ticket_id = ticket.id;
         bsql::query!("DELETE FROM tickets WHERE id = $ticket_id: i32")
             .execute(&pool)
+            .await
             .unwrap();
     }
 
-    #[test]
-    fn date_param() {
-        let pool = pool();
+    #[tokio::test]
+    async fn date_param() {
+        let pool = pool().await;
         let today = time::OffsetDateTime::now_utc().date();
         // Query tickets created today
         let tickets =
             bsql::query!("SELECT id FROM tickets WHERE created_date = $today: time::Date")
                 .fetch_all(&pool)
+                .await
                 .unwrap();
 
         // All seed tickets were created today
@@ -277,12 +293,13 @@ mod time_tests {
 // Enum column as text (requires ::text cast)
 // ---------------------------------------------------------------------------
 
-#[test]
-fn enum_column_cast_to_text() {
-    let pool = pool();
+#[tokio::test]
+async fn enum_column_cast_to_text() {
+    let pool = pool().await;
     let id = 1i32;
     let ticket = bsql::query!("SELECT id, status::text AS status FROM tickets WHERE id = $id: i32")
         .fetch_one(&pool)
+        .await
         .unwrap();
 
     let r = ticket.get().unwrap();
@@ -290,10 +307,10 @@ fn enum_column_cast_to_text() {
     assert_eq!(r.status, Some("new"));
 }
 
-#[test]
-fn insert_with_enum_literal() {
+#[tokio::test]
+async fn insert_with_enum_literal() {
     // PG accepts text literals for enum types
-    let pool = pool();
+    let pool = pool().await;
     let title = "Enum literal test";
     let uid = 1i32;
     let ticket = bsql::query!(
@@ -302,6 +319,7 @@ fn insert_with_enum_literal() {
          RETURNING id, status::text AS status"
     )
     .fetch_one(&pool)
+    .await
     .unwrap();
 
     assert_eq!(ticket.status.as_deref(), Some("resolved"));
@@ -310,6 +328,7 @@ fn insert_with_enum_literal() {
     let del_id = ticket.id;
     bsql::query!("DELETE FROM tickets WHERE id = $del_id: i32")
         .execute(&pool)
+        .await
         .unwrap();
 }
 
@@ -317,13 +336,14 @@ fn insert_with_enum_literal() {
 // Enum string parameter tests
 // ---------------------------------------------------------------------------
 
-#[test]
-fn enum_string_as_param() {
-    let pool = pool();
+#[tokio::test]
+async fn enum_string_as_param() {
+    let pool = pool().await;
     let status = "new";
     // Cast the enum column to text so &str param is accepted by PG.
     let tickets = bsql::query!("SELECT id FROM tickets WHERE status::text = $status: &str")
         .fetch_all(&pool)
+        .await
         .unwrap();
     assert!(!tickets.is_empty());
 }
@@ -336,9 +356,9 @@ fn enum_string_as_param() {
 mod chrono_tests {
     use super::*;
 
-    #[test]
-    fn chrono_timestamptz_round_trip() {
-        let pool = pool();
+    #[tokio::test]
+    async fn chrono_timestamptz_round_trip() {
+        let pool = pool().await;
         let now = chrono::Utc::now();
         let id = 1i32;
 
@@ -347,11 +367,13 @@ mod chrono_tests {
             "UPDATE tickets SET deadline = $now: chrono::DateTime<chrono::Utc> WHERE id = $id: i32"
         )
         .execute(&pool)
+        .await
         .unwrap();
 
         // Read it back
         let ticket = bsql::query!("SELECT id, deadline FROM tickets WHERE id = $id: i32")
             .fetch_one(&pool)
+            .await
             .unwrap();
 
         let r = ticket.get().unwrap();
@@ -362,6 +384,7 @@ mod chrono_tests {
         // Clean up
         bsql::query!("UPDATE tickets SET deadline = NULL WHERE id = $id: i32")
             .execute(&pool)
+            .await
             .unwrap();
     }
 }
@@ -374,9 +397,9 @@ mod chrono_tests {
 mod decimal_tests {
     use super::*;
 
-    #[test]
-    fn decimal_round_trip() {
-        let pool = pool();
+    #[tokio::test]
+    async fn decimal_round_trip() {
+        let pool = pool().await;
         let budget = rust_decimal::Decimal::new(12345, 2); // 123.45
         let id = 1i32;
 
@@ -385,11 +408,13 @@ mod decimal_tests {
             "UPDATE tickets SET budget = $budget: rust_decimal::Decimal WHERE id = $id: i32"
         )
         .execute(&pool)
+        .await
         .unwrap();
 
         // Read it back
         let ticket = bsql::query!("SELECT id, budget FROM tickets WHERE id = $id: i32")
             .fetch_one(&pool)
+            .await
             .unwrap();
 
         let r = ticket.get().unwrap();
@@ -400,6 +425,7 @@ mod decimal_tests {
         // Clean up -- set back to NULL
         bsql::query!("UPDATE tickets SET budget = NULL WHERE id = $id: i32")
             .execute(&pool)
+            .await
             .unwrap();
     }
 }

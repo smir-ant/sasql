@@ -26,43 +26,48 @@
 
 use bsql::{BsqlError, Listener};
 
-fn main() -> Result<(), BsqlError> {
+#[tokio::main]
+async fn main() -> Result<(), BsqlError> {
     let url = "postgres://user:pass@localhost/mydb";
 
     // ---------------------------------------------------------------
     // Set up a listener on a dedicated connection
     // ---------------------------------------------------------------
-    let mut listener = Listener::connect(url)?;
+    let mut listener = Listener::connect(url).await?;
 
     // Subscribe to one or more channels.
-    listener.listen("cache_invalidation")?;
-    listener.listen("job_complete")?;
+    listener.listen("cache_invalidation").await?;
+    listener.listen("job_complete").await?;
     println!("Listening on: cache_invalidation, job_complete");
 
     // ---------------------------------------------------------------
-    // Send notifications from a background thread
+    // Send notifications from a background task
     // ---------------------------------------------------------------
     // In production, notifications come from other processes or DB triggers.
-    // Here we spawn a thread to demonstrate the full round-trip.
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    // Here we spawn a task to demonstrate the full round-trip.
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Each Listener::connect() opens a separate connection.
         let notifier = Listener::connect("postgres://user:pass@localhost/mydb")
+            .await
             .expect("connect for notify");
 
         // notify() sends a payload on a channel.
         notifier
             .notify("cache_invalidation", "users:42")
+            .await
             .expect("notify");
         notifier
             .notify("job_complete", r#"{"job_id": 7, "status": "ok"}"#)
+            .await
             .expect("notify");
         println!("Sent 2 notifications.");
 
         // Signal the listener to stop (for this example only).
         notifier
             .notify("cache_invalidation", "STOP")
+            .await
             .expect("notify stop");
     });
 
@@ -70,7 +75,7 @@ fn main() -> Result<(), BsqlError> {
     // Receive notifications — recv() blocks until one arrives
     // ---------------------------------------------------------------
     loop {
-        let notification = listener.recv()?;
+        let notification = listener.recv().await?;
         println!(
             "Received on '{}': {}",
             notification.channel(),
@@ -85,7 +90,7 @@ fn main() -> Result<(), BsqlError> {
     }
 
     // Clean up all subscriptions.
-    listener.unlisten_all()?;
+    listener.unlisten_all().await?;
 
     Ok(())
 }

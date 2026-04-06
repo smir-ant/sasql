@@ -128,7 +128,7 @@ impl QueryStream {
     ///     // decode before next advance() — row borrows from arena
     /// }
     /// ```
-    pub fn advance(&mut self) -> Result<bool, crate::error::BsqlError> {
+    pub async fn advance(&mut self) -> Result<bool, crate::error::BsqlError> {
         // Fast path: current chunk still has rows
         if let Some(ref result) = self.current_result {
             if self.position < result.len() {
@@ -142,7 +142,7 @@ impl QueryStream {
         }
 
         // Fetch the next chunk
-        self.fetch_next_chunk()?;
+        self.fetch_next_chunk().await?;
 
         // Check if the new chunk has rows
         if let Some(ref result) = self.current_result {
@@ -173,7 +173,7 @@ impl QueryStream {
     /// The arena is reset before fetching the new chunk, invalidating any
     /// previous `Row` references. The generated code always decodes rows into
     /// owned fields before calling this.
-    pub fn fetch_next_chunk(&mut self) -> Result<bool, crate::error::BsqlError> {
+    pub async fn fetch_next_chunk(&mut self) -> Result<bool, crate::error::BsqlError> {
         if self.finished {
             return Ok(false);
         }
@@ -412,34 +412,34 @@ mod tests {
 
     // --- fetch_next_chunk requires guard ---
 
-    #[test]
-    fn fetch_next_chunk_without_guard_errors() {
+    #[tokio::test]
+    async fn fetch_next_chunk_without_guard_errors() {
         let mut stream = make_stream(0, 1, false);
-        let result = stream.fetch_next_chunk();
+        let result = stream.fetch_next_chunk().await;
         assert!(result.is_err(), "should error without guard");
     }
 
-    #[test]
-    fn fetch_next_chunk_when_finished_returns_false() {
+    #[tokio::test]
+    async fn fetch_next_chunk_when_finished_returns_false() {
         let mut stream = make_stream(0, 1, true);
-        let result = stream.fetch_next_chunk().unwrap();
+        let result = stream.fetch_next_chunk().await.unwrap();
         assert!(!result, "finished stream should return false");
     }
 
     // --- advance ---
 
-    #[test]
-    fn advance_returns_true_when_rows_available() {
+    #[tokio::test]
+    async fn advance_returns_true_when_rows_available() {
         let mut stream = make_stream(2, 1, true);
-        let has = stream.advance().unwrap();
+        let has = stream.advance().await.unwrap();
         assert!(has);
     }
 
-    #[test]
-    fn advance_returns_false_when_finished_and_exhausted() {
+    #[tokio::test]
+    async fn advance_returns_false_when_finished_and_exhausted() {
         let mut stream = make_stream(1, 1, true);
         let _ = stream.next_row(); // consume the one row
-        let has = stream.advance().unwrap();
+        let has = stream.advance().await.unwrap();
         assert!(!has);
     }
 
@@ -456,8 +456,8 @@ mod tests {
 
     // --- fetch_next_chunk without arena errors ---
 
-    #[test]
-    fn fetch_next_chunk_without_arena_errors() {
+    #[tokio::test]
+    async fn fetch_next_chunk_without_arena_errors() {
         let columns = sample_columns(1);
         let result = make_result(0, &columns);
         let mut stream = QueryStream {
@@ -469,17 +469,17 @@ mod tests {
             finished: false,
             needs_execute: false,
         };
-        let res = stream.fetch_next_chunk();
+        let res = stream.fetch_next_chunk().await;
         assert!(res.is_err(), "should error without arena");
     }
 
     // --- advance when not finished but fetch fails ---
 
-    #[test]
-    fn advance_fetch_fails_propagates_error() {
+    #[tokio::test]
+    async fn advance_fetch_fails_propagates_error() {
         // Stream with 0 rows, not finished, no guard -> advance triggers fetch -> error
         let mut stream = make_stream(0, 1, false);
-        let res = stream.advance();
+        let res = stream.advance().await;
         assert!(res.is_err(), "advance should propagate fetch error");
     }
 
@@ -609,10 +609,10 @@ mod tests {
 
     // --- advance with rows already available ---
 
-    #[test]
-    fn advance_does_not_consume_row() {
+    #[tokio::test]
+    async fn advance_does_not_consume_row() {
         let mut stream = make_stream(2, 1, true);
-        assert!(stream.advance().unwrap());
+        assert!(stream.advance().await.unwrap());
         // advance should not advance position, just check availability
         assert_eq!(stream.remaining(), 2);
         // next_row consumes

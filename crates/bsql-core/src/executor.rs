@@ -78,6 +78,11 @@ impl Drop for OwnedResult {
 ///
 /// The generated code calls `query_raw`, `query_raw_readonly`, and
 /// `execute_raw` on `&Pool`, `&PoolConnection`, or `&Transaction`.
+///
+/// All methods are `async fn` returning futures that complete immediately
+/// (sync under the hood). The internal connection I/O is microsecond-level
+/// on UDS and fast on TCP; the `async` signature exists for ergonomic
+/// compatibility with async runtimes (tokio, etc.).
 pub trait Executor {
     /// Execute a query and return all rows.
     fn query_raw(

@@ -139,7 +139,7 @@ impl Listener {
     /// Connect to PostgreSQL and start the background notification reader.
     ///
     /// Opens a dedicated connection (not from any pool).
-    pub fn connect(url: &str) -> BsqlResult<Self> {
+    pub async fn connect(url: &str) -> BsqlResult<Self> {
         let config = bsql_driver_postgres::Config::from_url(url)
             .map_err(|e| ConnectError::create(format!("listener connect failed: {e}")))?;
 
@@ -176,7 +176,7 @@ impl Listener {
     ///
     /// The channel name is properly quoted as a PostgreSQL identifier to
     /// prevent SQL injection.
-    pub fn listen(&self, channel: &str) -> BsqlResult<()> {
+    pub async fn listen(&self, channel: &str) -> BsqlResult<()> {
         if channel.is_empty() {
             return Err(ConnectError::create(
                 "LISTEN channel name must not be empty",
@@ -188,7 +188,7 @@ impl Listener {
     }
 
     /// Unsubscribe from a named notification channel.
-    pub fn unlisten(&self, channel: &str) -> BsqlResult<()> {
+    pub async fn unlisten(&self, channel: &str) -> BsqlResult<()> {
         if channel.is_empty() {
             return Err(ConnectError::create(
                 "UNLISTEN channel name must not be empty",
@@ -200,7 +200,7 @@ impl Listener {
     }
 
     /// Unsubscribe from all channels.
-    pub fn unlisten_all(&self) -> BsqlResult<()> {
+    pub async fn unlisten_all(&self) -> BsqlResult<()> {
         // Clear the tracked set
         self.channels
             .lock()
@@ -221,7 +221,7 @@ impl Listener {
     ///
     /// Blocks until a notification arrives, or returns an error if the
     /// connection has been closed.
-    pub fn recv(&mut self) -> BsqlResult<Notification> {
+    pub async fn recv(&mut self) -> BsqlResult<Notification> {
         self.rx
             .recv()
             .map_err(|_| ConnectError::create("listener connection closed"))
@@ -231,7 +231,7 @@ impl Listener {
     /// available right now (as opposed to `recv()` which blocks).
     ///
     /// Returns `Err` only if the listener connection has been closed.
-    pub fn try_recv(&mut self) -> BsqlResult<Option<Notification>> {
+    pub async fn try_recv(&mut self) -> BsqlResult<Option<Notification>> {
         match self.rx.try_recv() {
             Ok(notif) => Ok(Some(notif)),
             Err(mpsc::TryRecvError::Empty) => Ok(None),
@@ -244,7 +244,7 @@ impl Listener {
     /// Send a NOTIFY on a channel with a payload.
     ///
     /// The payload must not exceed 7999 bytes (PostgreSQL's limit).
-    pub fn notify(&self, channel: &str, payload: &str) -> BsqlResult<()> {
+    pub async fn notify(&self, channel: &str, payload: &str) -> BsqlResult<()> {
         if channel.is_empty() {
             return Err(ConnectError::create(
                 "NOTIFY channel name must not be empty",

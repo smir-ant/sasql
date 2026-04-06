@@ -34,8 +34,9 @@
 
 use bsql::{BsqlError, Pool};
 
-fn main() -> Result<(), BsqlError> {
-    let pool = Pool::connect("postgres://user:pass@localhost/mydb")?;
+#[tokio::main]
+async fn main() -> Result<(), BsqlError> {
+    let pool = Pool::connect("postgres://user:pass@localhost/mydb").await?;
 
     // ---------------------------------------------------------------
     // Stream all rows — constant memory regardless of table size
@@ -45,11 +46,10 @@ fn main() -> Result<(), BsqlError> {
     let mut stream = bsql::query!(
         "SELECT id, kind, payload FROM events ORDER BY id"
     )
-    .fetch_stream(&pool)?;
+    .fetch_stream(&pool).await?;
 
     let mut count = 0u64;
-    while stream.advance()? {
-        let event = stream.next_row()?;
+    while let Some(event) = stream.next().await? {
         count += 1;
 
         // Process each row without accumulating. In a real app, you
@@ -70,11 +70,10 @@ fn main() -> Result<(), BsqlError> {
     let mut stream = bsql::query!(
         "SELECT id, kind, payload FROM events WHERE kind = $kind: &str ORDER BY id"
     )
-    .fetch_stream(&pool)?;
+    .fetch_stream(&pool).await?;
 
     let mut signup_count = 0u64;
-    while stream.advance()? {
-        let event = stream.next_row()?;
+    while let Some(event) = stream.next().await? {
         signup_count += 1;
 
         if signup_count <= 3 {

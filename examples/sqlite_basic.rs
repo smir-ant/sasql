@@ -26,10 +26,11 @@
 
 use bsql::{BsqlError, SqlitePool};
 
-fn main() -> Result<(), BsqlError> {
+#[tokio::main]
+async fn main() -> Result<(), BsqlError> {
     // SqlitePool::open() opens a pool with 1 writer + 4 reader connections.
     // WAL mode, mmap, and page cache are configured automatically.
-    let pool = SqlitePool::open("./myapp.db")?;
+    let pool = SqlitePool::open("./myapp.db").await?;
 
     // ---------------------------------------------------------------
     // INSERT — .run() returns affected row count, same as PostgreSQL
