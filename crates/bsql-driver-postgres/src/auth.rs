@@ -1,8 +1,10 @@
-//! PostgreSQL authentication — MD5 and SCRAM-SHA-256.
+//! PostgreSQL authentication — MD5 and SCRAM-SHA-256 / SCRAM-SHA-256-PLUS.
 //!
 //! MD5 is simple: `"md5" + hex(md5(hex(md5(password + user)) + salt))`.
 //!
-//! SCRAM-SHA-256 implements RFC 5802 with channel binding disabled (`n,,`).
+//! SCRAM-SHA-256 implements RFC 5802. When a TLS server certificate hash is
+//! available, SCRAM-SHA-256-PLUS with `tls-server-end-point` channel binding
+//! (RFC 5929) is preferred.
 
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use hmac::{Hmac, Mac};
@@ -42,12 +44,27 @@ pub fn md5_password(user: &str, password: &str, salt: &[u8; 4]) -> [u8; 36] {
     result
 }
 
-// --- SCRAM-SHA-256 ---
+// --- SCRAM-SHA-256 / SCRAM-SHA-256-PLUS ---
+
+/// Channel binding mode for SCRAM authentication.
+///
+/// When the connection is over TLS and we can extract the server certificate
+/// hash, we use `tls-server-end-point` binding (RFC 5929). Otherwise we fall
+/// back to no channel binding (`n,,`).
+enum ChannelBinding {
+    /// No TLS, or TLS without certificate hash — GS2 header `n,,`.
+    None,
+    /// TLS with certificate hash — GS2 header `p=tls-server-end-point,,`.
+    TlsServerEndPoint([u8; 32]),
+}
 
 /// SCRAM-SHA-256 client state machine.
 ///
+/// Supports both plain SCRAM-SHA-256 (`n,,`) and SCRAM-SHA-256-PLUS with
+/// `tls-server-end-point` channel binding (`p=tls-server-end-point,,`).
+///
 /// Usage:
-/// 1. Create with `ScramClient::new(user, password)`.
+/// 1. Create with `ScramClient::new(user, password, cert_hash)`.
 /// 2. Call `client_first_message()` to get the initial message bytes.
 /// 3. Feed the server-first message via `process_server_first()`.
 /// 4. Call `client_final_message()` to get the response.
@@ -59,11 +76,23 @@ pub struct ScramClient {
     server_first: String,
     salted_password: [u8; 32],
     auth_message: String,
+    channel_binding: ChannelBinding,
 }
 
 impl ScramClient {
     /// Create a new SCRAM client for the given credentials.
-    pub fn new(user: &str, password: &str) -> Result<Self, DriverError> {
+    ///
+    /// If `cert_hash` is `Some`, SCRAM-SHA-256-PLUS with `tls-server-end-point`
+    /// channel binding will be used. Pass `None` for plain SCRAM-SHA-256.
+    pub fn new(
+        user: &str,
+        password: &str,
+        cert_hash: Option<&[u8; 32]>,
+    ) -> Result<Self, DriverError> {
+        let channel_binding = match cert_hash {
+            Some(hash) => ChannelBinding::TlsServerEndPoint(*hash),
+            None => ChannelBinding::None,
+        };
         let nonce = generate_nonce()?;
         let client_first_bare = format!("n={user},r={nonce}");
 
@@ -74,14 +103,20 @@ impl ScramClient {
             server_first: String::new(),
             salted_password: [0u8; 32],
             auth_message: String::new(),
+            channel_binding,
         })
     }
 
-    /// Generate the client-first message: `n,,n=user,r=nonce`.
+    /// Generate the client-first message.
     ///
-    /// The `n,,` prefix indicates no channel binding.
+    /// - No channel binding: `n,,n=user,r=nonce`
+    /// - With channel binding: `p=tls-server-end-point,,n=user,r=nonce`
     pub fn client_first_message(&self) -> Vec<u8> {
-        format!("n,,{}", self.client_first_bare).into_bytes()
+        let gs2_header = match self.channel_binding {
+            ChannelBinding::None => "n,,",
+            ChannelBinding::TlsServerEndPoint(_) => "p=tls-server-end-point,,",
+        };
+        format!("{gs2_header}{}", self.client_first_bare).into_bytes()
     }
 
     /// Process the server-first message and compute the salted password.
@@ -140,8 +175,18 @@ impl ScramClient {
         self.password.clear();
         self.password.shrink_to(0);
 
-        // Build auth message for proof computation
-        let client_final_without_proof = format!("c=biws,r={server_nonce}");
+        // Build auth message for proof computation.
+        // The `c=` field is base64 of (GS2 header + channel binding data).
+        let cb_data = match &self.channel_binding {
+            ChannelBinding::None => b"n,,".to_vec(),
+            ChannelBinding::TlsServerEndPoint(hash) => {
+                let mut data = b"p=tls-server-end-point,,".to_vec();
+                data.extend_from_slice(hash);
+                data
+            }
+        };
+        let cb_b64 = B64.encode(&cb_data);
+        let client_final_without_proof = format!("c={cb_b64},r={server_nonce}");
         self.auth_message = format!(
             "{},{},{}",
             self.client_first_bare, self.server_first, client_final_without_proof
@@ -152,7 +197,7 @@ impl ScramClient {
 
     /// Generate the client-final message with proof.
     ///
-    /// Returns `c=biws,r=combined_nonce,p=base64_proof`.
+    /// Returns `c=<channel_binding_b64>,r=combined_nonce,p=base64_proof`.
     pub fn client_final_message(&self) -> Result<Vec<u8>, DriverError> {
         // ClientKey = HMAC(SaltedPassword, "Client Key")
         let client_key = hmac_sha256(&self.salted_password, b"Client Key")?;
@@ -178,7 +223,18 @@ impl ScramClient {
             .find_map(|p| p.strip_prefix("r="))
             .ok_or_else(|| DriverError::Auth("missing nonce for final message".into()))?;
 
-        let msg = format!("c=biws,r={server_nonce},p={proof_b64}");
+        // The `c=` field is base64 of (GS2 header + channel binding data).
+        let cb_data = match &self.channel_binding {
+            ChannelBinding::None => b"n,,".to_vec(),
+            ChannelBinding::TlsServerEndPoint(hash) => {
+                let mut data = b"p=tls-server-end-point,,".to_vec();
+                data.extend_from_slice(hash);
+                data
+            }
+        };
+        let cb_b64 = B64.encode(&cb_data);
+
+        let msg = format!("c={cb_b64},r={server_nonce},p={proof_b64}");
         Ok(msg.into_bytes())
     }
 
@@ -324,7 +380,7 @@ mod tests {
 
     #[test]
     fn scram_client_first_message_format() {
-        let client = ScramClient::new("testuser", "testpass").unwrap();
+        let client = ScramClient::new("testuser", "testpass", None).unwrap();
         let msg = client.client_first_message();
         let s = std::str::from_utf8(&msg).unwrap();
         assert!(s.starts_with("n,,n=testuser,r="));
@@ -367,7 +423,7 @@ mod tests {
     #[test]
     fn scram_roundtrip() {
         // Simulate a SCRAM exchange with known values
-        let mut client = ScramClient::new("user", "pencil").unwrap();
+        let mut client = ScramClient::new("user", "pencil", None).unwrap();
         let _first = client.client_first_message();
 
         // Construct a fake server-first with the client's nonce prefix
@@ -386,7 +442,7 @@ mod tests {
 
     #[test]
     fn scram_rejects_bad_nonce() {
-        let mut client = ScramClient::new("user", "pass").unwrap();
+        let mut client = ScramClient::new("user", "pass", None).unwrap();
         let _first = client.client_first_message();
         let result = client.process_server_first(b"r=wrongnonce,s=c2FsdA==,i=4096");
         assert!(result.is_err());
@@ -418,7 +474,7 @@ mod tests {
     // #47: SCRAM missing salt in server_first
     #[test]
     fn scram_missing_salt_error() {
-        let mut client = ScramClient::new("user", "pass").unwrap();
+        let mut client = ScramClient::new("user", "pass", None).unwrap();
         let _first = client.client_first_message();
         let server_nonce = format!("{}serverpart", client.nonce);
         let server_first = format!("r={server_nonce},i=4096"); // missing s=
@@ -431,7 +487,7 @@ mod tests {
     // #48: SCRAM missing iteration count
     #[test]
     fn scram_missing_iterations_error() {
-        let mut client = ScramClient::new("user", "pass").unwrap();
+        let mut client = ScramClient::new("user", "pass", None).unwrap();
         let _first = client.client_first_message();
         let server_nonce = format!("{}serverpart", client.nonce);
         let salt = B64.encode(b"salt1234");
@@ -448,7 +504,7 @@ mod tests {
     // #49: SCRAM non-numeric iteration count
     #[test]
     fn scram_non_numeric_iterations_error() {
-        let mut client = ScramClient::new("user", "pass").unwrap();
+        let mut client = ScramClient::new("user", "pass", None).unwrap();
         let _first = client.client_first_message();
         let server_nonce = format!("{}serverpart", client.nonce);
         let salt = B64.encode(b"salt1234");
@@ -460,7 +516,7 @@ mod tests {
     // #50: SCRAM invalid base64 salt
     #[test]
     fn scram_invalid_base64_salt_error() {
-        let mut client = ScramClient::new("user", "pass").unwrap();
+        let mut client = ScramClient::new("user", "pass", None).unwrap();
         let _first = client.client_first_message();
         let server_nonce = format!("{}serverpart", client.nonce);
         let server_first = format!("r={server_nonce},s=!@#$not_base64,i=4096");
@@ -476,7 +532,7 @@ mod tests {
     // #51: SCRAM verify_server_final signature mismatch
     #[test]
     fn scram_verify_server_final_mismatch() {
-        let mut client = ScramClient::new("user", "pencil").unwrap();
+        let mut client = ScramClient::new("user", "pencil", None).unwrap();
         let _first = client.client_first_message();
         let server_nonce = format!("{}serverpart", client.nonce);
         let salt = B64.encode(b"salt1234salt5678");
@@ -498,7 +554,7 @@ mod tests {
     // #52: SCRAM verify_server_final missing v= prefix
     #[test]
     fn scram_verify_server_final_missing_prefix() {
-        let mut client = ScramClient::new("user", "pencil").unwrap();
+        let mut client = ScramClient::new("user", "pencil", None).unwrap();
         let _first = client.client_first_message();
         let server_nonce = format!("{}serverpart", client.nonce);
         let salt = B64.encode(b"salt1234salt5678");
@@ -537,6 +593,99 @@ mod tests {
         let mechs = parse_sasl_mechanisms(data);
         assert_eq!(mechs.len(), 2);
         assert!(!mechs.contains(&"SCRAM-SHA-256"));
+    }
+
+    // --- Channel binding tests ---
+
+    #[test]
+    fn scram_channel_binding_none_prefix() {
+        let scram = ScramClient::new("user", "pass", None).unwrap();
+        let msg = scram.client_first_message();
+        assert!(msg.starts_with(b"n,,"), "no-binding must start with n,,");
+    }
+
+    #[test]
+    fn scram_channel_binding_plus_prefix() {
+        let hash = [0xAA; 32];
+        let scram = ScramClient::new("user", "pass", Some(&hash)).unwrap();
+        let msg = scram.client_first_message();
+        assert!(
+            msg.starts_with(b"p=tls-server-end-point,,"),
+            "PLUS must start with p=tls-server-end-point,,"
+        );
+    }
+
+    #[test]
+    fn scram_channel_binding_none_final_uses_biws() {
+        // `biws` is base64("n,,") — the standard no-binding value
+        let mut client = ScramClient::new("user", "pencil", None).unwrap();
+        let _first = client.client_first_message();
+        let server_nonce = format!("{}serverpart", client.nonce);
+        let salt = B64.encode(b"salt1234salt5678");
+        let server_first = format!("r={server_nonce},s={salt},i=4096");
+        client
+            .process_server_first(server_first.as_bytes())
+            .unwrap();
+        let final_msg = client.client_final_message().unwrap();
+        let s = std::str::from_utf8(&final_msg).unwrap();
+        assert!(s.starts_with("c=biws,"), "no-binding final must use c=biws");
+    }
+
+    #[test]
+    fn scram_channel_binding_plus_final_encodes_hash() {
+        let hash = [0xBB; 32];
+        let mut client = ScramClient::new("user", "pencil", Some(&hash)).unwrap();
+        let _first = client.client_first_message();
+        let server_nonce = format!("{}serverpart", client.nonce);
+        let salt = B64.encode(b"salt1234salt5678");
+        let server_first = format!("r={server_nonce},s={salt},i=4096");
+        client
+            .process_server_first(server_first.as_bytes())
+            .unwrap();
+        let final_msg = client.client_final_message().unwrap();
+        let s = std::str::from_utf8(&final_msg).unwrap();
+
+        // Extract the c= value and decode it
+        let c_val = s.strip_prefix("c=").unwrap().split(',').next().unwrap();
+        let decoded = B64.decode(c_val).unwrap();
+        assert!(
+            decoded.starts_with(b"p=tls-server-end-point,,"),
+            "PLUS final c= must start with tls-server-end-point header"
+        );
+        // The remaining bytes must be the 32-byte hash
+        let cb_header = b"p=tls-server-end-point,,";
+        assert_eq!(
+            &decoded[cb_header.len()..],
+            &hash,
+            "c= value must contain the certificate hash after the GS2 header"
+        );
+    }
+
+    #[test]
+    fn scram_roundtrip_with_channel_binding() {
+        // Verify a full SCRAM-PLUS roundtrip produces valid messages
+        let hash = [0x42; 32];
+        let mut client = ScramClient::new("user", "pencil", Some(&hash)).unwrap();
+        let first = client.client_first_message();
+        let first_str = std::str::from_utf8(&first).unwrap();
+        assert!(first_str.starts_with("p=tls-server-end-point,,n=user,r="));
+
+        let server_nonce = format!("{}serverpart", client.nonce);
+        let salt = B64.encode(b"salt1234salt5678");
+        let server_first = format!("r={server_nonce},s={salt},i=4096");
+        client
+            .process_server_first(server_first.as_bytes())
+            .unwrap();
+
+        let final_msg = client.client_final_message().unwrap();
+        let final_str = std::str::from_utf8(&final_msg).unwrap();
+        assert!(final_str.starts_with("c="));
+        assert!(final_str.contains(",p="));
+        // Must NOT use biws (that's for no-binding)
+        assert!(
+            !final_str.starts_with("c=biws,"),
+            "PLUS must not use c=biws"
+        );
     }
 
     mod proptest_fuzz {

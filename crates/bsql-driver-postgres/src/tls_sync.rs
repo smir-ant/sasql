@@ -24,11 +24,25 @@ static TLS_CONFIG: LazyLock<Arc<rustls::ClientConfig>> = LazyLock::new(|| {
     )
 });
 
+/// Result of a successful TLS upgrade, carrying both the encrypted stream
+/// and the SHA-256 hash of the server's end-entity certificate (for SCRAM
+/// channel binding via `tls-server-end-point`).
+pub struct TlsUpgradeResult {
+    pub stream: rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+    /// SHA-256 hash of the server's end-entity certificate.
+    /// `None` if the certificate could not be extracted (should not happen
+    /// in practice, but we degrade gracefully to no channel binding).
+    pub server_cert_hash: Option<[u8; 32]>,
+}
+
 /// Attempt synchronous TLS upgrade on a TCP connection.
 ///
 /// 1. Send SSLRequest (8 bytes).
 /// 2. Read server response: 'S' (accept) or 'N' (reject).
 /// 3. If 'S', perform TLS handshake with rustls.
+///
+/// On success, also extracts the server certificate SHA-256 hash for
+/// SCRAM-SHA-256-PLUS channel binding (`tls-server-end-point`).
 ///
 /// If `required` is true and server responds 'N', returns an error.
 /// If `required` is false and server responds 'N', returns an error that the
@@ -37,7 +51,7 @@ pub fn try_upgrade(
     mut tcp: TcpStream,
     host: &str,
     required: bool,
-) -> Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>, DriverError> {
+) -> Result<TlsUpgradeResult, DriverError> {
     // Send SSLRequest
     let mut buf = Vec::with_capacity(8);
     proto::write_ssl_request(&mut buf);
@@ -59,7 +73,27 @@ pub fn try_upgrade(
             let tls_conn = rustls::ClientConnection::new(TLS_CONFIG.clone(), server_name)
                 .map_err(|e| DriverError::Io(std::io::Error::other(e)))?;
 
-            Ok(rustls::StreamOwned::new(tls_conn, tcp))
+            let stream = rustls::StreamOwned::new(tls_conn, tcp);
+
+            // Extract server certificate hash for SCRAM channel binding.
+            // RFC 5929 `tls-server-end-point`: SHA-256 of the DER-encoded
+            // end-entity certificate.
+            let server_cert_hash = stream
+                .conn
+                .peer_certificates()
+                .and_then(|certs| certs.first())
+                .map(|cert| {
+                    use sha2::{Digest, Sha256};
+                    let mut hasher = Sha256::new();
+                    hasher.update(cert.as_ref());
+                    let hash: [u8; 32] = hasher.finalize().into();
+                    hash
+                });
+
+            Ok(TlsUpgradeResult {
+                stream,
+                server_cert_hash,
+            })
         }
         b'N' => {
             if required {

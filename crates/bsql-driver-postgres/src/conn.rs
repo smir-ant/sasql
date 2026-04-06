@@ -104,6 +104,9 @@ pub struct Connection {
     /// The config used to connect — stored for cancel() which needs host:port.
     /// Wrapped in Arc to avoid cloning 5 Strings per connection open.
     connect_config: Arc<Config>,
+    /// SHA-256 hash of the TLS server certificate (for SCRAM-SHA-256-PLUS
+    /// channel binding). `None` when not using TLS or cert unavailable.
+    tls_server_cert_hash: Option<[u8; 32]>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -138,6 +141,11 @@ impl Connection {
     /// new connections without 5 String clones per open.
     pub fn connect_arc(config: Arc<Config>) -> Result<Self, DriverError> {
         config.validate()?;
+
+        // Will be set if TLS upgrade succeeds and we can extract the cert hash.
+        // Only mutated when the `tls` feature is enabled.
+        #[allow(unused_mut)]
+        let mut tls_cert_hash: Option<[u8; 32]> = None;
 
         let stream = if config.host_is_uds() {
             // UDS path
@@ -174,8 +182,9 @@ impl Connection {
                             &config.host,
                             config.ssl == SslMode::Require,
                         ) {
-                            Ok(tls_stream) => {
-                                let stream = Stream::Tls(Box::new(tls_stream));
+                            Ok(result) => {
+                                tls_cert_hash = result.server_cert_hash;
+                                let stream = Stream::Tls(Box::new(result.stream));
                                 stream.set_nodelay()?;
                                 stream.set_keepalive()?;
                                 stream
@@ -230,6 +239,7 @@ impl Connection {
             max_stmt_cache_size: 256,
             query_counter: 0,
             connect_config: config.clone(),
+            tls_server_cert_hash: tls_cert_hash,
         };
 
         conn.startup(&config)?;
@@ -326,18 +336,33 @@ impl Connection {
 
     fn handle_scram(&mut self, config: &Config, mechanisms_data: &[u8]) -> Result<(), DriverError> {
         let mechs = auth::parse_sasl_mechanisms(mechanisms_data);
-        if !mechs.contains(&"SCRAM-SHA-256") {
+
+        // Prefer SCRAM-SHA-256-PLUS (channel binding) when we have a TLS cert hash
+        // and the server advertises support for it.
+        let use_plus = self.tls_server_cert_hash.is_some() && mechs.contains(&"SCRAM-SHA-256-PLUS");
+        let mechanism = if use_plus {
+            "SCRAM-SHA-256-PLUS"
+        } else {
+            "SCRAM-SHA-256"
+        };
+
+        if !mechs.contains(&mechanism) && !mechs.contains(&"SCRAM-SHA-256") {
             return Err(DriverError::Auth(format!(
                 "server requires unsupported SASL mechanism(s): {mechs:?}"
             )));
         }
 
-        let mut scram = auth::ScramClient::new(&config.user, &config.password)?;
+        let cert_hash = if use_plus {
+            self.tls_server_cert_hash.as_ref()
+        } else {
+            None
+        };
+        let mut scram = auth::ScramClient::new(&config.user, &config.password, cert_hash)?;
 
         // SASLInitialResponse
         let client_first = scram.client_first_message();
         self.write_buf.clear();
-        proto::write_sasl_initial(&mut self.write_buf, "SCRAM-SHA-256", &client_first);
+        proto::write_sasl_initial(&mut self.write_buf, mechanism, &client_first);
         self.flush_write()?;
 
         // SASLContinue
