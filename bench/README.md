@@ -167,7 +167,7 @@ INSERT benchmarks grow the database over time. Re-run `setup/pg_setup.sql` or `s
 - **diesel** uses `sql_query` with raw SQL for an apples-to-apples comparison, avoiding diesel's DSL overhead. diesel is fundamentally synchronous; benchmarks run without `to_async()`.
 - **C (libpq)** uses `PQexecPrepared` with prepared statements. Every benchmark reads every column via `PQgetvalue`. Insert batch uses 100 separate `PQexecPrepared` calls in a transaction (no pipelining -- libpq doesn't have built-in pipeline for this pattern).
 
-**Note on batch INSERT**: bsql uses pipeline batching (N Bind+Execute messages in one round-trip). The C benchmark uses sequential `PQexecPrepared` calls in a transaction (no pipelining). libpq supports pipelining since PG 14 (`PQpipelineSync`), which would narrow the gap. The batch INSERT comparison reflects the most common C usage pattern, not the theoretical best.
+**Note on batch INSERT**: bsql uses pipeline batching (N Bind+Execute messages in one round-trip). The C benchmark includes both sequential (1.90 ms) and pipelined (876 us) variants. bsql (751 us) is faster than even pipelined C by 14%. The sequential C number represents the most common C usage pattern.
 - **C (sqlite3)** uses `sqlite3_prepare_v2` with statement reuse. WAL mode enabled. Type-dispatched `sqlite3_column_*` reads every column.
 - **Go (pgx)** uses a direct `pgx.Conn` (not a pool). Queries are automatically prepared on first use.
 - **Go (go-sqlite3)** uses `database/sql` with prepared statements. WAL mode enabled.

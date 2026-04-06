@@ -141,22 +141,19 @@ The query lives where it is used. In the function that calls it. Not in a `.sql`
 
 ---
 
-### 12. Sync-first. Async when you need it.
+### 12. Async by default. Sync when you need speed.
 
-The core API is synchronous. Every method returns directly --- no `.await`, no runtime dependency. This gives maximum performance (no async state machine overhead) and maximum portability (works from `fn main()`, threads, tokio, async-std, anywhere).
+The public API is async --- `.fetch(&pool).await?`. This integrates naturally with tokio, actix-web, axum, and the Rust async ecosystem.
 
-For async web servers: wrap bsql calls in `spawn_blocking` or use the planned `feature = "async"` wrapper. The synchronous core is *faster* than async for the common case (UDS, low-latency local PG), and equally fast for TCP.
+Under the hood, all database I/O is synchronous (blocking). The async wrapper resolves instantly --- zero async overhead. This gives the best of both worlds: async ergonomics for web servers, sync performance for the wire protocol.
 
-**Why sync beats async for database drivers:**
-- PostgreSQL wire protocol is request-response. One query per connection at a time. Async adds overhead (future state machines, waker polling) without enabling concurrency on a single connection.
-- Concurrency comes from the connection pool, not from async. 10 pool connections = 10 concurrent queries, whether sync or async.
-- sync eliminates tokio as a dependency. Smaller binary, faster compile, fewer version conflicts.
+For CLI tools, batch jobs, or latency-critical code paths: `bsql = { default-features = false, features = ["sync"] }` removes tokio entirely. Same `query!` macro, same zero-copy fetch, just `fn` instead of `async fn`.
 
-**In practice (v0.17):**
-- All methods are `fn`, not `async fn`. No tokio dependency. No `.await`.
-- Connection pool with LIFO ordering, `Condvar`-based wait, `std::thread` for background tasks.
-- Pipeline batching: N operations in one round-trip via `defer()` + `commit()`.
-- Works from any context: `fn main()`, `std::thread::spawn`, tokio `spawn_blocking`, actix-web, etc.
+**In practice (v0.18):**
+- Default: `#[tokio::main]` + `.await` on all methods
+- `feature = "sync"`: `fn main()`, no tokio, no `.await`
+- Internal Connection: always sync (proven faster than async I/O for PG wire protocol)
+- Pool: LIFO ordering, Condvar-based wait, std::thread for background tasks
 
 ---
 

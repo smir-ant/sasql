@@ -537,6 +537,7 @@ impl SqlitePool {
 pub struct SqlitePoolBuilder {
     path: Option<String>,
     reader_count: usize,
+    busy_timeout_ms: u32,
 }
 
 impl SqlitePoolBuilder {
@@ -544,6 +545,7 @@ impl SqlitePoolBuilder {
         Self {
             path: None,
             reader_count: 4,
+            busy_timeout_ms: 0,
         }
     }
 
@@ -556,6 +558,16 @@ impl SqlitePoolBuilder {
     /// Set the number of reader connections. Default: 4.
     pub fn reader_count(mut self, count: usize) -> Self {
         self.reader_count = count;
+        self
+    }
+
+    /// Set the SQLite `busy_timeout` in milliseconds. Default: 0 (fail-fast).
+    ///
+    /// When set to 0, SQLite returns `SQLITE_BUSY` immediately if the database
+    /// is locked. With a positive value, SQLite will wait up to that many
+    /// milliseconds before returning `SQLITE_BUSY`.
+    pub fn busy_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.busy_timeout_ms = timeout.as_millis() as u32;
         self
     }
 
@@ -574,6 +586,11 @@ impl SqlitePoolBuilder {
         // Open writer first (creates the database if needed, sets WAL mode)
         let writer = SqliteConnection::open(&path)?;
 
+        // Apply configured busy_timeout (overrides the default 0 set in open())
+        if self.busy_timeout_ms > 0 {
+            writer.exec(&format!("PRAGMA busy_timeout = {}", self.busy_timeout_ms))?;
+        }
+
         // Force WAL initialization: on some system SQLite builds (e.g. macOS 3.51+),
         // read-only connections cannot open a WAL database until the WAL/SHM files
         // are materialized on disk. Executing a trivial write-then-rollback forces
@@ -583,7 +600,11 @@ impl SqlitePoolBuilder {
         // Open readers
         let mut readers = Vec::with_capacity(reader_count);
         for _ in 0..reader_count {
-            readers.push(Mutex::new(SqliteConnection::open_readonly(&path)?));
+            let reader = SqliteConnection::open_readonly(&path)?;
+            if self.busy_timeout_ms > 0 {
+                reader.exec(&format!("PRAGMA busy_timeout = {}", self.busy_timeout_ms))?;
+            }
+            readers.push(Mutex::new(reader));
         }
 
         Ok(SqlitePool {
@@ -731,6 +752,43 @@ mod tests {
             let (result, arena) = pool.query_readonly(sql, hash, SmallVec::new()).unwrap();
             assert_eq!(result.get_i64(0, 0, &arena), Some(1));
         }
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pool_builder_busy_timeout_configurable() {
+        let path = temp_db_path();
+        let pool = SqlitePoolBuilder::new()
+            .path(&path)
+            .busy_timeout(std::time::Duration::from_millis(5000))
+            .build()
+            .unwrap();
+
+        // Verify the writer has the configured busy_timeout
+        let sql = "PRAGMA busy_timeout";
+        let hash = hash_sql(sql);
+        let (result, arena) = pool.query_readwrite(sql, hash, SmallVec::new()).unwrap();
+        assert_eq!(result.get_i64(0, 0, &arena), Some(5000));
+
+        // Verify readers also have the configured busy_timeout
+        let (result, arena) = pool.query_readonly(sql, hash, SmallVec::new()).unwrap();
+        assert_eq!(result.get_i64(0, 0, &arena), Some(5000));
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pool_builder_busy_timeout_default_zero() {
+        let path = temp_db_path();
+        let pool = SqlitePoolBuilder::new().path(&path).build().unwrap();
+
+        let sql = "PRAGMA busy_timeout";
+        let hash = hash_sql(sql);
+        let (result, arena) = pool.query_readwrite(sql, hash, SmallVec::new()).unwrap();
+        assert_eq!(result.get_i64(0, 0, &arena), Some(0));
+
         drop(pool);
         let _ = std::fs::remove_file(&path);
     }

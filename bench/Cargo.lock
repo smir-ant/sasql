@@ -106,16 +106,17 @@ dependencies = [
 
 [[package]]
 name = "bsql"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "bsql-core",
  "bsql-driver-sqlite",
  "bsql-macros",
+ "tokio",
 ]
 
 [[package]]
 name = "bsql-arena"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "simdutf8",
 ]
@@ -136,7 +137,7 @@ dependencies = [
 
 [[package]]
 name = "bsql-core"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "bsql-arena",
  "bsql-driver-postgres",
@@ -144,12 +145,13 @@ dependencies = [
  "rapidhash",
  "smallvec",
  "time",
+ "tokio",
  "uuid",
 ]
 
 [[package]]
 name = "bsql-driver-postgres"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "base64",
  "bsql-arena",
@@ -169,7 +171,7 @@ dependencies = [
 
 [[package]]
 name = "bsql-driver-sqlite"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "bsql-arena",
  "libsqlite3-sys",
@@ -179,7 +181,7 @@ dependencies = [
 
 [[package]]
 name = "bsql-macros"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "bitcode",
  "bsql-core",
