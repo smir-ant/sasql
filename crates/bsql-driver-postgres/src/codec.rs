@@ -709,10 +709,11 @@ impl Encode for rust_decimal::Decimal {
 
         let ndigits = pg_digits.len() as i16;
 
-        // for large scales, cast to i16 only at the end with saturation.
+        // For large scales, cast to i16 only at the end with saturation.
+        // Both branches clamp to i16 range since PG weight is i16 on the wire.
         let weight: i16 = if int_len > 0 {
-            let w = (int_len + int_pad) / 4 - 1;
-            w as i16
+            let w = ((int_len + int_pad) / 4 - 1) as i32;
+            w.clamp(i16::MIN as i32, i16::MAX as i32) as i16
         } else {
             // Pure fractional: weight is negative
             // E.g., 0.0001 has weight -1 (first group is 10^-4)
@@ -1266,6 +1267,15 @@ fn decode_array_elements(data: &[u8]) -> Result<Vec<&[u8]>, DriverError> {
         ));
     }
     let n_elements = n_elements_raw as usize;
+    // Guard against malicious or corrupt messages that claim millions of elements.
+    // 10M elements is well beyond any reasonable PostgreSQL array; a larger count
+    // almost certainly indicates a corrupt message and would cause OOM on allocation.
+    const MAX_ARRAY_ELEMENTS: usize = 10_000_000;
+    if n_elements > MAX_ARRAY_ELEMENTS {
+        return Err(DriverError::Protocol(format!(
+            "array element count {n_elements} exceeds limit of {MAX_ARRAY_ELEMENTS}"
+        )));
+    }
     // lower_bound at [16..20]
     let mut pos = 20;
     let mut elements = Vec::with_capacity(n_elements);

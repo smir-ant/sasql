@@ -113,6 +113,8 @@ impl Drop for Listener {
     fn drop(&mut self) {
         // Drop the command sender to signal the background thread to exit.
         // The thread will see cmd_rx.try_recv() return Disconnected and break.
+        // Shutdown latency is at most 100ms (the read timeout on the connection),
+        // since the thread checks try_recv() after every notification read attempt.
         // We don't join the thread in drop to avoid blocking.
     }
 }

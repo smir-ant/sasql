@@ -1950,7 +1950,12 @@ impl Connection {
             }
         }
 
-        // Send CopyData for each row
+        // Send CopyData for each row.
+        //
+        // NOTE: If flush_write() fails during row streaming, the TCP connection
+        // is broken and cannot be recovered (we cannot send CopyFail on a dead
+        // socket). The pool guard's Drop will detect the broken connection and
+        // discard it rather than returning it to the pool.
         for row in rows {
             self.write_buf.clear();
             // Each row must end with \n for COPY text format
@@ -3038,6 +3043,11 @@ fn parse_data_row_into_buf(
 
     // Bulk append: copy the entire column section into buf in ONE memcpy,
     // then walk column boundaries. ONE extend_from_slice per DataRow.
+    //
+    // Safety of `base + pos`: both `base` (buf.len() before append) and `pos`
+    // (bounded by col_data.len()) are limited by MAX_MESSAGE_LEN (128 MB).
+    // On 64-bit platforms, 128 MB + 128 MB << usize::MAX, so overflow is
+    // impossible. On 32-bit this is still safe: 256 MB < 4 GB.
     let col_data = &data[2..];
     let base = buf.len();
     buf.extend_from_slice(col_data);

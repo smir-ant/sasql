@@ -22,6 +22,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use crate::error::BsqlError;
 
@@ -152,16 +153,26 @@ impl Singleflight {
 
     /// Wait for a flight result as a follower.
     ///
-    /// Blocks until the leader calls `complete()` or is dropped. Returns
-    /// `None` if the leader was dropped without completing (e.g., panic).
+    /// Blocks until the leader calls `complete()`, is dropped, or the 30-second
+    /// timeout expires. Returns `None` if the leader was dropped without
+    /// completing (e.g., panic) or if the wait timed out.
     pub fn wait_for_result(state: &FlightState) -> Option<SharedResult> {
+        const SINGLEFLIGHT_TIMEOUT: Duration = Duration::from_secs(30);
         let mut guard = state.result.lock().unwrap_or_else(|e| e.into_inner());
         while guard.is_none() {
             // Check if leader dropped without completing (panic, error, etc.)
             if state.cancelled.load(std::sync::atomic::Ordering::Acquire) {
                 return None;
             }
-            guard = state.condvar.wait(guard).unwrap_or_else(|e| e.into_inner());
+            let (new_guard, wait_result) = state
+                .condvar
+                .wait_timeout(guard, SINGLEFLIGHT_TIMEOUT)
+                .unwrap_or_else(|e| e.into_inner());
+            guard = new_guard;
+            // If the wait timed out and there's still no result, give up.
+            if wait_result.timed_out() && guard.is_none() {
+                return None;
+            }
         }
         guard.clone()
     }

@@ -479,8 +479,9 @@ fn maintain_min_idle(inner: Arc<PoolInner>) {
             }
         }
 
-        // Check every 5 seconds
-        std::thread::sleep(Duration::from_secs(5));
+        // Check every 1 second. Shorter interval ensures the thread exits promptly
+        // when pool.closed is set (worst-case 1s delay instead of 5s).
+        std::thread::sleep(Duration::from_secs(1));
     }
 }
 
