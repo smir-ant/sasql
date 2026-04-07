@@ -10,6 +10,7 @@ Compile-time safe SQL for Rust. PostgreSQL and SQLite.
 - **C-level performance** -- matches raw C (libpq) on single-row queries, 10-20% faster on multi-row fetches, 2.5x faster on batch INSERT via pipelining. See [benchmarks](https://github.com/smir-ant/bsql/blob/main/bench/README.md).
 - **Minimal footprint** -- 1.59 MB peak memory (RSS) — 4–9x less than C (libpq), sqlx, diesel, and Go. See [memory benchmarks](https://github.com/smir-ant/bsql/blob/main/bench/README.md#memory-peak-rss).
 - **PostgreSQL and SQLite** -- same `query!` macro, same compile-time safety, both databases. SQLite is not a second-class citizen.
+- **Things nobody else does** -- [automatic N+1 detection](#n1-query-detection), [compile-time query plan analysis](#compile-time-query-plan-analysis), [migration safety checking](#migration-safety-check), [request coalescing](#singleflight-request-coalescing). Details below.
 
 ```rust
 let id = 42i32;
@@ -271,7 +272,7 @@ Real-time notifications for cache invalidation, job queues, live updates.
 bsql = { version = "0.20", features = ["explain"] }
 ```
 
-Runs `EXPLAIN` on every query during compilation and embeds the plan as a doc comment. Hover over any query result type in your IDE to see the query plan. Development-only -- disable in CI and release builds.
+Runs `EXPLAIN` on every query during compilation. The plan is embedded as a doc comment (hover in your IDE to see it), and bsql actively warns about sequential scans and missing indexes. See [compile-time query plan analysis](#compile-time-query-plan-analysis) for details. Development-only -- disable in CI and release builds.
 
 </details>
 
@@ -454,7 +455,7 @@ The pool uses a single writer + N reader connections (default 4) behind `Mutex`,
 - **Not an ORM.** You write SQL, not method chains.
 - **Not a query builder.** No `.filter()`, `.select()`, `.join()`.
 - **Not database-agnostic.** PostgreSQL and SQLite only. No MySQL, no MSSQL.
-- **Not a migration tool.** Use dbmate, sqitch, refinery, or whatever you prefer.
+- **Not a migration tool.** Use dbmate, sqitch, refinery, or whatever you prefer. bsql can [validate your migrations](#migration-safety-check) before you deploy them, but it does not write or apply them.
 
 </details>
 
@@ -472,6 +473,57 @@ Supported authentication: cleartext password, MD5, SCRAM-SHA-256, SCRAM-SHA-256-
 Supported transports: TCP, Unix domain sockets, TLS (via rustls).
 
 </details>
+
+---
+
+## One more thing
+
+These are features that no other Rust SQL library offers. They exist because bsql sees every query at compile time and every query execution at runtime -- that visibility makes things possible that are architecturally impossible in other libraries.
+
+### N+1 query detection
+
+The most common database performance bug: your code fetches a list, then queries once per item. 100 users = 100 queries instead of 1. Frameworks like Rails have third-party gems to detect this. bsql detects it at the driver level -- no middleware, no configuration, no code changes.
+
+```toml
+bsql = { version = "0.20", features = ["detect-n-plus-one"] }
+```
+
+When the same query fires more than 10 times in a row on a single connection, bsql logs a warning with the query hash. The threshold is configurable via `Pool::builder().n_plus_one_threshold(5)`. When the feature is disabled, zero code exists in the binary -- full compile-time exclusion.
+
+### Compile-time query plan analysis
+
+When you enable the `explain` feature, bsql runs `EXPLAIN` on every query during `cargo build` and analyzes the result. If PostgreSQL would use a sequential scan on a table with more than 1,000 rows, you get a compile-time warning:
+
+```
+warning: [bsql] Seq Scan on "orders" (est. 50000 rows) — consider adding an index
+```
+
+This catches missing indexes before your code reaches production. The threshold is configurable via the `BSQL_EXPLAIN_THRESHOLD` environment variable. When the `explain` feature is disabled, this analysis does not run.
+
+### Migration safety check
+
+You write a migration. Will it break any of your existing queries? Find out before deploying:
+
+```bash
+bsql migrate --check add_column.sql
+```
+
+bsql reads every validated query from its compile-time cache, creates a temporary copy of your schema, applies the migration, and tests each query against the new schema. If any query would break, it tells you which ones and why -- before the migration touches production.
+
+This works because bsql's offline cache (`.bsql/queries/`) contains every SQL statement your application uses. No other library has this cache, so no other library can offer this check.
+
+### Singleflight (request coalescing)
+
+When 100 requests hit the same endpoint at the same time and each one runs the same query with the same parameters, bsql can execute it once and share the result. The other 99 requests wait (not poll) and receive a shared copy.
+
+```rust
+let pool = Pool::builder()
+    .url("postgres://localhost/mydb")
+    .singleflight(true)
+    .build()?;
+```
+
+Only read queries are coalesced. Writes always execute independently. The deduplication key is the query hash combined with the encoded parameter bytes -- same query + same parameters = one database round-trip.
 
 ---
 
