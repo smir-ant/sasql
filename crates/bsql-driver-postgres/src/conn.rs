@@ -2072,7 +2072,7 @@ impl Connection {
             let msg = self.read_one_message()?;
             match msg {
                 BackendMessage::CopyData { data } => {
-                    writer.write_all(&data).map_err(DriverError::Io)?;
+                    writer.write_all(data).map_err(DriverError::Io)?;
                 }
                 BackendMessage::CopyDone => break,
                 BackendMessage::ErrorResponse { data } => {

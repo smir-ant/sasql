@@ -57,8 +57,8 @@ fn main() {
     );
 
     // Run the migration check.
-    let result = migrate::check_migration(&database_url, &migration_sql, &queries)
-        .unwrap_or_else(|e| {
+    let result =
+        migrate::check_migration(&database_url, &migration_sql, &queries).unwrap_or_else(|e| {
             eprintln!("error: {}", e);
             std::process::exit(1);
         });
@@ -84,9 +84,7 @@ fn main() {
 
 /// Parse a `--flag value` pair from the argument list.
 pub fn parse_flag(args: &[String], flag: &str) -> Option<String> {
-    args.windows(2)
-        .find(|w| w[0] == flag)
-        .map(|w| w[1].clone())
+    args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
 }
 
 /// Walk up from the current working directory looking for `.bsql/queries/`.
@@ -150,10 +148,7 @@ mod tests {
             parse_flag(&args, "--database-url"),
             Some("postgres://host/db".into())
         );
-        assert_eq!(
-            parse_flag(&args, "--cache-dir"),
-            Some("/tmp/cache".into())
-        );
+        assert_eq!(parse_flag(&args, "--cache-dir"), Some("/tmp/cache".into()));
     }
 
     #[test]

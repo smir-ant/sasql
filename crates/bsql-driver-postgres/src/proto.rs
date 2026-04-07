@@ -439,9 +439,7 @@ pub fn parse_backend_message(
         b'W' => Err(DriverError::Protocol(
             "COPY BOTH protocol not supported: server sent CopyBothResponse ('W')".into(),
         )),
-        b'd' => Ok(BackendMessage::CopyData {
-            data: payload,
-        }),
+        b'd' => Ok(BackendMessage::CopyData { data: payload }),
         b'c' => Ok(BackendMessage::CopyDone),
         _ => Err(DriverError::Protocol(format!(
             "unknown backend message type: '{}' (0x{:02x})",

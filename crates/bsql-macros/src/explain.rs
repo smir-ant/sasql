@@ -92,8 +92,7 @@ fn check_sort_without_index(line: &str, full_plan: &str) -> Option<ExplainWarnin
     }
 
     // Check if there is ANY index scan in the full plan
-    let has_index_scan = full_plan.contains("Index Scan")
-        || full_plan.contains("Index Only Scan");
+    let has_index_scan = full_plan.contains("Index Scan") || full_plan.contains("Index Only Scan");
 
     if !has_index_scan {
         Some(ExplainWarning {
@@ -173,15 +172,15 @@ mod tests {
 
     #[test]
     fn index_scan_no_warning() {
-        let plan =
-            "Index Scan using users_pkey on users  (cost=0.00..8.27 rows=1 width=36)";
+        let plan = "Index Scan using users_pkey on users  (cost=0.00..8.27 rows=1 width=36)";
         let warnings = analyze_plan(plan, 1000);
         assert!(warnings.is_empty());
     }
 
     #[test]
     fn index_only_scan_no_warning() {
-        let plan = "Index Only Scan using idx_users_email on users  (cost=0.00..1.05 rows=1 width=36)";
+        let plan =
+            "Index Only Scan using idx_users_email on users  (cost=0.00..1.05 rows=1 width=36)";
         let warnings = analyze_plan(plan, 1000);
         assert!(warnings.is_empty());
     }
@@ -273,10 +272,7 @@ Seq Scan on products  (cost=0.00..100.00 rows=5000 width=36)
 
     #[test]
     fn table_name_parsing() {
-        assert_eq!(
-            parse_table_name("Seq Scan on users  (cost="),
-            Some("users")
-        );
+        assert_eq!(parse_table_name("Seq Scan on users  (cost="), Some("users"));
         assert_eq!(
             parse_table_name("Seq Scan on my_schema.users  (cost="),
             Some("my_schema.users")

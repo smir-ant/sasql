@@ -2533,14 +2533,14 @@ fn copy_in_basic() {
     conn.simple_query("CREATE TEMP TABLE copy_test (id serial, name text, email text)")
         .unwrap();
 
-    let rows = vec![
+    let rows = [
         "alice\talice@example.com",
         "bob\tbob@example.com",
         "charlie\tcharlie@example.com",
     ];
 
     let count = conn
-        .copy_in("copy_test", &["name", "email"], rows.iter().map(|s| *s))
+        .copy_in("copy_test", &["name", "email"], rows.iter().copied())
         .unwrap();
     assert_eq!(count, 3);
 
@@ -2620,7 +2620,7 @@ fn copy_in_bad_table() {
     let result = conn.copy_in(
         "nonexistent_table_12345",
         &["col1"],
-        vec!["value"].iter().map(|s| *s),
+        ["value"].iter().copied(),
     );
     assert!(result.is_err());
     // Connection should still be usable after error
@@ -2640,7 +2640,7 @@ fn copy_in_bad_column() {
     let result = conn.copy_in(
         "copy_badcol_test",
         &["nonexistent_column"],
-        vec!["value"].iter().map(|s| *s),
+        ["value"].iter().copied(),
     );
     assert!(result.is_err());
     conn.simple_query("SELECT 1").unwrap();
@@ -2672,11 +2672,7 @@ fn copy_in_special_chars_in_identifiers() {
         .unwrap();
 
     let count = conn
-        .copy_in(
-            r#"copy"test"#,
-            &[r#"col"name"#],
-            vec!["hello"].iter().map(|s| *s),
-        )
+        .copy_in(r#"copy"test"#, &[r#"col"name"#], ["hello"].iter().copied())
         .unwrap();
     assert_eq!(count, 1);
 
@@ -2697,9 +2693,9 @@ fn copy_roundtrip() {
         .unwrap();
 
     // Copy in
-    let in_rows = vec!["alice\t30", "bob\t25"];
+    let in_rows = ["alice\t30", "bob\t25"];
     let in_count = conn
-        .copy_in("copy_rt", &["name", "age"], in_rows.iter().map(|s| *s))
+        .copy_in("copy_rt", &["name", "age"], in_rows.iter().copied())
         .unwrap();
     assert_eq!(in_count, 2);
 
@@ -2726,9 +2722,9 @@ fn copy_in_via_pool() {
     conn.simple_query("CREATE TEMP TABLE copy_pool_test (name text, val text)")
         .unwrap();
 
-    let rows = vec!["a\t1", "b\t2"];
+    let rows = ["a\t1", "b\t2"];
     let count = conn
-        .copy_in("copy_pool_test", &["name", "val"], rows.iter().map(|s| *s))
+        .copy_in("copy_pool_test", &["name", "val"], rows.iter().copied())
         .unwrap();
     assert_eq!(count, 2);
 }

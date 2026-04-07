@@ -83,8 +83,7 @@ pub fn read_cache_dir(path: &Path) -> Result<Vec<CachedQuery>, String> {
 
 /// Read and decode a single `.bitcode` cache file.
 pub fn read_cache_file(path: &Path) -> Result<CachedQuery, String> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
 
     let envelope: CacheEnvelope = bitcode::decode(&bytes).map_err(|e| {
         format!(
@@ -109,12 +108,8 @@ pub fn read_cache_file(path: &Path) -> Result<CachedQuery, String> {
             bsql_version: String::new(),
         })
     } else if envelope.version == CACHE_FORMAT_VERSION {
-        bitcode::decode(&envelope.data).map_err(|e| {
-            format!(
-                "failed to decode cached query in {}: {e}",
-                path.display()
-            )
-        })
+        bitcode::decode(&envelope.data)
+            .map_err(|e| format!("failed to decode cached query in {}: {e}", path.display()))
     } else {
         Err(format!(
             "unsupported cache format version {} in {} (expected {})",
@@ -191,7 +186,11 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
         let result = read_cache_file(&path);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("unsupported cache format version 99"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("unsupported cache format version 99")
+        );
     }
 
     #[test]
@@ -278,7 +277,11 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
         let result = read_cache_file(&path);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("failed to decode cached query"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("failed to decode cached query")
+        );
     }
 
     #[test]
@@ -293,7 +296,11 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
         let result = read_cache_file(&path);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("failed to decode v1 cached query"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("failed to decode v1 cached query")
+        );
     }
 
     #[test]
@@ -315,11 +322,7 @@ mod tests {
             version: CACHE_FORMAT_VERSION,
             data: inner_bytes,
         };
-        std::fs::write(
-            dir.path().join("valid.bitcode"),
-            bitcode::encode(&envelope),
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("valid.bitcode"), bitcode::encode(&envelope)).unwrap();
 
         // Corrupt file
         std::fs::write(dir.path().join("corrupt.bitcode"), b"garbage").unwrap();
@@ -341,7 +344,10 @@ mod tests {
             .join("queries");
         if cache_dir.exists() {
             let queries = read_cache_dir(&cache_dir).unwrap();
-            assert!(!queries.is_empty(), "expected cached queries in .bsql/queries/");
+            assert!(
+                !queries.is_empty(),
+                "expected cached queries in .bsql/queries/"
+            );
             for q in &queries {
                 assert!(!q.normalized_sql.is_empty());
                 assert_ne!(q.sql_hash, 0);

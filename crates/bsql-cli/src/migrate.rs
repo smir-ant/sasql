@@ -12,7 +12,6 @@ pub struct MigrationCheckResult {
 #[derive(Debug)]
 pub struct FailedQuery {
     pub sql: String,
-    #[allow(dead_code)]
     pub sql_hash: u64,
     pub error: String,
 }
@@ -26,10 +25,9 @@ pub fn check_migration(
     migration_sql: &str,
     cached_queries: &[CachedQuery],
 ) -> Result<MigrationCheckResult, String> {
-    let config = Config::from_url(database_url)
-        .map_err(|e| format!("invalid database URL: {e}"))?;
-    let mut conn = Connection::connect(&config)
-        .map_err(|e| format!("connection failed: {e}"))?;
+    let config =
+        Config::from_url(database_url).map_err(|e| format!("invalid database URL: {e}"))?;
+    let mut conn = Connection::connect(&config).map_err(|e| format!("connection failed: {e}"))?;
 
     // 1. Drop any leftover shadow schema from a previous failed run.
     conn.simple_query("DROP SCHEMA IF EXISTS __bsql_shadow CASCADE")
@@ -174,8 +172,7 @@ mod tests {
 
     #[test]
     fn check_unreachable_host() {
-        let result =
-            check_migration("postgres://user:pass@192.0.2.1:5432/db", "", &[]);
+        let result = check_migration("postgres://user:pass@192.0.2.1:5432/db", "", &[]);
         assert!(result.is_err());
     }
 
@@ -222,8 +219,10 @@ mod tests {
             check_migration(&url, "DROP TABLE IF EXISTS __bsql_test_tbl", &queries).unwrap();
         assert_eq!(result.total_queries, 1);
         assert_eq!(result.failed.len(), 1);
-        assert!(result.failed[0].error.contains("does not exist")
-            || result.failed[0].error.contains("relation"));
+        assert!(
+            result.failed[0].error.contains("does not exist")
+                || result.failed[0].error.contains("relation")
+        );
 
         // Cleanup
         let _ = conn.simple_query("DROP TABLE IF EXISTS __bsql_test_tbl");
