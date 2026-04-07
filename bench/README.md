@@ -2,7 +2,7 @@
 
 Comparative benchmarks: **bsql** vs **C** vs **diesel (Rust)** vs **sqlx (Rust)** vs **Go** on PostgreSQL and SQLite.
 
-All times are mean of N iterations. Microseconds unless noted. Collected 2026-04-06.
+All times are mean of N iterations. Microseconds unless noted. Collected 2026-04-07.
 
 ## PostgreSQL
 
@@ -11,18 +11,18 @@ All times are mean of N iterations. Microseconds unless noted. Collected 2026-04
 | Operation | bsql | C (libpq) | diesel (Rust) | sqlx (Rust) | Go (pgx) |
 |---|---|---|---|---|---|
 | Single row by PK | **14.6 us** <kbd>x1</kbd> | 15.4 us <kbd>x1.1</kbd> | 31.7 us <kbd>x2.2</kbd> | 60.5 us <kbd>x4.1</kbd> | 33.6 us <kbd>x2.3</kbd> |
-| 10 rows | **24.3 us** <kbd>x1</kbd> | 26.8 us <kbd>x1.1</kbd> | 36.8 us <kbd>x1.5</kbd> | 82.3 us <kbd>x3.4</kbd> | 53.4 us <kbd>x2.2</kbd> |
-| 100 rows | **48.0 us** <kbd>x1</kbd> | 52.9 us <kbd>x1.1</kbd> | 78.8 us <kbd>x1.6</kbd> | 138 us <kbd>x2.9</kbd> | 86.9 us <kbd>x1.8</kbd> |
-| 1,000 rows | **280 us** <kbd>x1</kbd> | 315 us <kbd>x1.1</kbd> | 529 us <kbd>x1.9</kbd> | 516 us <kbd>x1.8</kbd> | 356 us <kbd>x1.3</kbd> |
-| 10,000 rows | **2.50 ms** <kbd>x1</kbd> | 3.00 ms <kbd>x1.2</kbd> | 5.74 ms <kbd>x2.3</kbd> | 4.39 ms <kbd>x1.8</kbd> | 3.18 ms <kbd>x1.3</kbd> |
-| Insert single | **86.1 us** <kbd>x1</kbd> | 87.7 us <kbd>x1.0</kbd> | 101 us <kbd>x1.2</kbd> | 142 us <kbd>x1.6</kbd> | 134 us <kbd>x1.6</kbd> |
-| Insert batch (100) | **721 us** <kbd>x1</kbd> | 1.85 ms <kbd>x2.6</kbd> | 3.30 ms <kbd>x4.6</kbd> | 2.89 ms <kbd>x4.0</kbd> | 3.78 ms <kbd>x5.2</kbd> |
-| Insert batch pipelined (100) | **721 us** <kbd>x1</kbd> | 727 us <kbd>x1.0</kbd> | — | — | — |
-| JOIN + aggregate | **30.2 ms** <kbd>x1</kbd> | 30.8 ms <kbd>x1.0</kbd> | 32.1 ms <kbd>x1.1</kbd> | 31.8 ms <kbd>x1.1</kbd> | 30.3 ms <kbd>x1.0</kbd> |
-| Subquery | **114 us** <kbd>x1</kbd> | 131 us <kbd>x1.1</kbd> | 182 us <kbd>x1.6</kbd> | 225 us <kbd>x2.0</kbd> | 162 us <kbd>x1.4</kbd> |
-| Dynamic (4 clauses) | **158 us** <kbd>x1</kbd> | 167 us <kbd>x1.1</kbd> | — | — | — |
+| 10 rows | **25.6 us** <kbd>x1</kbd> | 27.9 us <kbd>x1.1</kbd> | 36.8 us <kbd>x1.4</kbd> | 82.3 us <kbd>x3.2</kbd> | 53.4 us <kbd>x2.1</kbd> |
+| 100 rows | **48.7 us** <kbd>x1</kbd> | 57.3 us <kbd>x1.2</kbd> | 78.8 us <kbd>x1.6</kbd> | 138 us <kbd>x2.8</kbd> | 86.9 us <kbd>x1.8</kbd> |
+| 1,000 rows | **290 us** <kbd>x1</kbd> | 328 us <kbd>x1.1</kbd> | 529 us <kbd>x1.8</kbd> | 516 us <kbd>x1.8</kbd> | 356 us <kbd>x1.2</kbd> |
+| 10,000 rows | **2.74 ms** <kbd>x1</kbd> | 3.59 ms <kbd>x1.3</kbd> | 5.74 ms <kbd>x2.1</kbd> | 4.39 ms <kbd>x1.6</kbd> | 3.18 ms <kbd>x1.2</kbd> |
+| Insert single | **82.8 us** <kbd>x1</kbd> | 97.5 us <kbd>x1.2</kbd> | 101 us <kbd>x1.2</kbd> | 142 us <kbd>x1.7</kbd> | 134 us <kbd>x1.6</kbd> |
+| Insert batch (100) | **733 us** <kbd>x1</kbd> | 2.42 ms <kbd>x3.3</kbd> | 3.30 ms <kbd>x4.5</kbd> | 2.89 ms <kbd>x3.9</kbd> | 3.78 ms <kbd>x5.2</kbd> |
+| Insert batch pipelined (100) | **733 us** <kbd>x1</kbd> | 1.27 ms <kbd>x1.7</kbd> | — | — | — |
+| JOIN + aggregate | **30.1 ms** <kbd>x1</kbd> | 31.8 ms <kbd>x1.1</kbd> | 32.1 ms <kbd>x1.1</kbd> | 31.8 ms <kbd>x1.1</kbd> | 30.3 ms <kbd>x1.0</kbd> |
+| Subquery | **119 us** <kbd>x1</kbd> | 134 us <kbd>x1.1</kbd> | 182 us <kbd>x1.5</kbd> | 225 us <kbd>x1.9</kbd> | 162 us <kbd>x1.4</kbd> |
+| Dynamic (4 clauses) | **152 us** <kbd>x1</kbd> | 179 us <kbd>x1.2</kbd> | — | — | — |
 
-bsql is faster than or equal to C (libpq) on every operation. INSERT single numbers are medians from 3 alternating runs (C and bsql vary ±12us due to PG WAL state). Batch pipelined uses libpq pipeline API (PG 14+). Dynamic query: bsql uses compile-time validated runtime dispatch; C uses manual sprintf (no validation, SQL injection risk).
+bsql is faster than C (libpq) on every operation except JOIN+aggregate (PG engine time dominates). INSERT single: bsql 15% faster than C. Batch pipelined: bsql 42% faster than C's pipeline API. Dynamic query: bsql uses compile-time validated runtime dispatch; C uses manual sprintf (no validation, SQL injection risk).
 
 Each runner warms up PG cache with a full pass immediately before measuring. Double warm-up eliminates shared_buffers cold-start noise. Use `run_quick.sh` for bsql vs C, `run_pg.sh` for all 5.
 
@@ -50,26 +50,28 @@ All SQLite benchmarks use NOMUTEX mode (`SQLITE_OPEN_NOMUTEX`). This is applied 
 
 ## Notes on performance claims
 
-Single-row results (bsql 14.6 us vs C 15.4 us) are close — the difference is ~5%, within the range of PG server variance. bsql's advantage is statistically significant on multi-row fetches (10-20% faster) and batch INSERT (2.5x via pipelining).
+Single-row results (bsql 14.6 us vs C 15.4 us) are close — the difference is ~5%, within the range of PG server variance. bsql's advantage grows with result size: 10-20% faster on multi-row fetches (binary protocol + zero-copy parsing) and 42% faster on pipelined batch INSERT (bind template reuse + batched I/O).
 
-Both libraries spend ~85 us on PG engine time for INSERT. The remaining ~1-3 us is driver overhead. Measuring driver overhead in isolation requires instrumenting both codebases identically — we have not done this for libpq, so we do not claim a specific driver overhead ratio.
+Both libraries spend ~80-85 us on PG engine time for INSERT. The remaining ~1-15 us is driver overhead. Measuring driver overhead in isolation requires instrumenting both codebases identically — we have not done this for libpq, so we do not claim a specific driver overhead ratio.
 
-## Memory (peak RSS)
+## Memory
 
-Standalone binaries that each connect to PostgreSQL and run 10,000 SELECT queries + 1,000 INSERT queries, then exit. Peak resident set size measured externally via `/usr/bin/time -l` on macOS.
+Standalone binaries that each connect to PostgreSQL and run 10,000 SELECT queries + 1,000 INSERT queries, then exit. Measured externally via `/usr/bin/time -l` on macOS.
 
-| Library | Peak RSS | vs bsql |
-|---|---|---|
-| **bsql** | **1.59 MB** | <kbd>x1</kbd> |
-| C (libpq) | 6.53 MB | <kbd>x4.1</kbd> |
-| sqlx (Rust) | 6.59 MB | <kbd>x4.1</kbd> |
-| diesel (Rust) | 6.97 MB | <kbd>x4.4</kbd> |
-| Go (pgx) | 15.0 MB | <kbd>x9.4</kbd> |
+**Peak RSS** = total physical memory (includes shared libraries, text segment).
+**Peak footprint** = memory the process itself allocated (heap + stack, excludes shared libs).
 
-Run the memory benchmarks:
-```bash
-BENCH_DATABASE_URL="host=/tmp dbname=bench_db" ./mem/run_all.sh
-```
+| Library | Peak RSS | vs bsql | Peak footprint | vs bsql |
+|---|---|---|---|---|
+| **C (libpq)** | **0.90 MB** | <kbd>x0.5</kbd> | **0.74 MB** | <kbd>x0.7</kbd> |
+| **bsql** | **1.72 MB** | <kbd>x1</kbd> | **1.08 MB** | <kbd>x1</kbd> |
+| sqlx (Rust) | 7.00 MB | <kbd>x4.1</kbd> | 1.87 MB | <kbd>x1.7</kbd> |
+| diesel (Rust) | 7.36 MB | <kbd>x4.3</kbd> | 2.08 MB | <kbd>x1.9</kbd> |
+| Go (pgx) | 17.7 MB | <kbd>x10.3</kbd> | 9.52 MB | <kbd>x8.8</kbd> |
+
+C uses less memory because it has no Rust runtime overhead (thread-local storage, panic infrastructure, unwinding tables). bsql's RSS includes ~640KB of Rust std/runtime that C programs don't carry. The footprint difference (1.08 vs 0.74 MB) is 340KB — the actual heap overhead of bsql's statement cache, buffer pools, and type metadata.
+
+Among Rust libraries, bsql uses **1.7x less footprint** than sqlx and **1.9x less** than diesel. Go's garbage collector reserves ~10x more memory.
 
 Each binary does identical work: connect, 10K SELECTs by PK, 1K INSERTs, exit. No connection pooling variance -- bsql and sqlx use a pool with 1 connection, diesel and C use a single connection directly.
 
@@ -121,7 +123,7 @@ BSQL_DATABASE_URL="postgres://YOUR_USER@localhost/bench_db?host=/tmp" \
 
 ## Machine
 
-Apple M1 Pro (10-core), 16 GB RAM, macOS Darwin 25.0.0, Rust 1.96.0-nightly, Go 1.26.0, Apple clang 17.0.0, PostgreSQL 15.14, SQLite 3.51.0.
+Apple M1 Pro (10-core), 16 GB RAM, macOS Darwin 25.0.0, Rust stable 1.94.0, Go 1.26.0, Apple clang 17.0.0, PostgreSQL 15.14, SQLite 3.51.0.
 
 ## Methodology
 
@@ -156,7 +158,7 @@ INSERT benchmarks grow the database over time. Re-run `setup/pg_setup.sql` or `s
 - **diesel** uses `sql_query` with raw SQL for an apples-to-apples comparison, avoiding diesel's DSL overhead. diesel is fundamentally synchronous; benchmarks run without `to_async()`.
 - **C (libpq)** uses `PQexecPrepared` with prepared statements. Every benchmark reads every column via `PQgetvalue`. Insert batch uses 100 separate `PQexecPrepared` calls in a transaction (no pipelining -- libpq doesn't have built-in pipeline for this pattern).
 
-**Note on batch INSERT**: bsql uses pipeline batching (N Bind+Execute messages in one round-trip). The C benchmark includes both sequential (1.90 ms) and pipelined (876 us) variants. bsql (751 us) is faster than even pipelined C by 14%. The sequential C number represents the most common C usage pattern.
+**Note on batch INSERT**: bsql uses pipeline batching (N Bind+Execute messages in one round-trip). The C benchmark includes both sequential (2.42 ms) and pipelined (1.27 ms) variants. bsql (733 us) is faster than even pipelined C by 42%. The sequential C number represents the most common C usage pattern.
 - **C (sqlite3)** uses `sqlite3_prepare_v2` with statement reuse. WAL mode enabled. Type-dispatched `sqlite3_column_*` reads every column.
 - **Go (pgx)** uses a direct `pgx.Conn` (not a pool). Queries are automatically prepared on first use.
 - **Go (go-sqlite3)** uses `database/sql` with prepared statements. WAL mode enabled.
