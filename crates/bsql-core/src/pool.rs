@@ -94,6 +94,10 @@ pub struct PoolBuilder {
     replica_url: Option<String>,
     /// Max pool size for the replica pool. Defaults to same as `max_size`.
     replica_max_size: Option<usize>,
+    /// Maximum idle duration before a connection is considered stale.
+    stale_timeout: Option<Duration>,
+    /// Maximum number of cached prepared statements per connection.
+    max_stmt_cache_size: Option<usize>,
 }
 
 impl PoolBuilder {
@@ -176,6 +180,22 @@ impl PoolBuilder {
         self
     }
 
+    /// Set the maximum idle duration before a connection is considered stale.
+    /// Default: 30 seconds. Connections idle longer than this are dropped on
+    /// acquire instead of being reused.
+    pub fn stale_timeout(mut self, timeout: Duration) -> Self {
+        self.stale_timeout = Some(timeout);
+        self
+    }
+
+    /// Set the maximum number of cached prepared statements per connection.
+    /// Default: 256. When the cache exceeds this size, the least recently
+    /// used statement is evicted.
+    pub fn max_stmt_cache_size(mut self, size: usize) -> Self {
+        self.max_stmt_cache_size = Some(size);
+        self
+    }
+
     pub async fn build(self) -> BsqlResult<Pool> {
         let url = self.url.ok_or_else(|| {
             BsqlError::from(bsql_driver_postgres::DriverError::Pool(
@@ -194,6 +214,12 @@ impl PoolBuilder {
         }
         if let Some(mi) = self.min_idle {
             builder = builder.min_idle(mi);
+        }
+        if let Some(st) = self.stale_timeout {
+            builder = builder.stale_timeout(st);
+        }
+        if let Some(msc) = self.max_stmt_cache_size {
+            builder = builder.max_stmt_cache_size(msc);
         }
 
         let inner = builder.build().map_err(BsqlError::from)?;
@@ -244,6 +270,8 @@ impl Pool {
             min_idle: None,
             replica_url: None,
             replica_max_size: None,
+            stale_timeout: None,
+            max_stmt_cache_size: None,
         }
     }
 

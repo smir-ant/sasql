@@ -745,7 +745,7 @@ impl AsyncConnection {
 
         self.write_buf.clear();
 
-        let columns = if let Some(info) = self.stmts.get_mut(&sql_hash) {
+        let columns = if let Some(info) = self.stmts.get_mut(&sql_hash, sql) {
             // Cache hit
             self.query_counter += 1;
             info.last_used = self.query_counter;
@@ -831,6 +831,7 @@ impl AsyncConnection {
                 sql_hash,
                 StmtInfo {
                     name,
+                    sql: sql.into(),
                     columns: columns.clone(),
                     last_used: self.query_counter,
                     bind_template: None,
@@ -871,7 +872,9 @@ impl AsyncConnection {
     // --- Internal helpers ---
 
     fn cache_stmt(&mut self, sql_hash: u64, info: StmtInfo) {
-        if self.stmts.len() >= self.max_stmt_cache_size && !self.stmts.contains_key(&sql_hash) {
+        if self.stmts.len() >= self.max_stmt_cache_size
+            && !self.stmts.contains_key(&sql_hash, &info.sql)
+        {
             if let Some((_lru_hash, evicted)) = self.stmts.evict_lru() {
                 proto::write_close(&mut self.write_buf, b'S', evicted.name_str());
             }

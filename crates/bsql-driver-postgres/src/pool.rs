@@ -77,6 +77,9 @@ struct PoolInner {
     warmup_sqls: std::sync::Mutex<Arc<Vec<Box<str>>>>,
     /// Maximum number of cached prepared statements per connection.
     max_stmt_cache_size: usize,
+    /// Maximum idle duration before a connection is considered stale and discarded.
+    /// Connections idle longer than this are dropped on acquire. Default: 30 seconds.
+    stale_timeout: Duration,
 }
 
 impl Pool {
@@ -171,10 +174,14 @@ impl Pool {
     }
 
     /// Try to pop a valid idle connection from the stack.
+    ///
+    /// Performs lifetime and stale checks. For connections idle > 5 seconds
+    /// (but within the stale timeout), sends an empty query as a health check
+    /// to verify the connection is still alive before returning it.
     #[inline]
     fn try_pop_idle(&self) -> Result<Option<PoolGuard>, DriverError> {
         let mut stack = self.inner.stack.lock().unwrap_or_else(|e| e.into_inner());
-        while let Some(slot) = stack.pop() {
+        while let Some(mut slot) = stack.pop() {
             let (created_at, idle_dur) = match &slot {
                 PoolSlot::Sync(conn) => (conn.created_at(), conn.idle_duration()),
                 #[cfg(feature = "async")]
@@ -186,15 +193,30 @@ impl Pool {
                     continue;
                 }
             }
-            if idle_dur < Duration::from_secs(30) {
-                return Ok(Some(PoolGuard {
-                    conn: Some(slot),
-                    pool: self.inner.clone(),
-                    discard: false,
-                }));
+            if idle_dur >= self.inner.stale_timeout {
+                // Stale connection — drop it, free the slot
+                self.inner.open_count.fetch_sub(1, Ordering::AcqRel);
+                continue;
             }
-            // Stale connection — drop it, free the slot
-            self.inner.open_count.fetch_sub(1, Ordering::AcqRel);
+            // Health check: verify connection is still alive if idle > 5 seconds.
+            // Sends an empty query — PG returns EmptyQueryResponse + ReadyForQuery.
+            // Fast: one round-trip, ~15us on UDS. Skip for hot connections.
+            if idle_dur > Duration::from_secs(5) {
+                let alive = match &mut slot {
+                    PoolSlot::Sync(conn) => conn.simple_query("").is_ok(),
+                    #[cfg(feature = "async")]
+                    PoolSlot::Async(_) => true, // async connections are checked at I/O time
+                };
+                if !alive {
+                    self.inner.open_count.fetch_sub(1, Ordering::AcqRel);
+                    continue;
+                }
+            }
+            return Ok(Some(PoolGuard {
+                conn: Some(slot),
+                pool: self.inner.clone(),
+                discard: false,
+            }));
         }
         Ok(None)
     }
@@ -473,6 +495,8 @@ pub struct PoolBuilder {
     min_idle: usize,
     /// Maximum number of cached prepared statements per connection.
     max_stmt_cache_size: usize,
+    /// Maximum idle duration before a connection is considered stale.
+    stale_timeout: Duration,
 }
 
 impl PoolBuilder {
@@ -484,6 +508,7 @@ impl PoolBuilder {
             acquire_timeout: Some(Duration::from_secs(5)), // 5s default (matches common pool defaults)
             min_idle: 0,                                   // no minimum by default
             max_stmt_cache_size: 256,                      // LRU eviction at 256 stmts
+            stale_timeout: Duration::from_secs(30),        // 30s default
         }
     }
 
@@ -530,6 +555,14 @@ impl PoolBuilder {
         self
     }
 
+    /// Set the maximum idle duration before a connection is considered stale.
+    /// Default: 30 seconds. Connections idle longer than this are dropped on
+    /// acquire instead of being reused.
+    pub fn stale_timeout(mut self, timeout: Duration) -> Self {
+        self.stale_timeout = timeout;
+        self
+    }
+
     /// Build the pool. Validates the URL but does not open connections.
     pub fn build(self) -> Result<Pool, DriverError> {
         let url = self
@@ -551,6 +584,7 @@ impl PoolBuilder {
                 min_idle: self.min_idle,
                 warmup_sqls: std::sync::Mutex::new(Arc::new(Vec::new())),
                 max_stmt_cache_size: self.max_stmt_cache_size,
+                stale_timeout: self.stale_timeout,
             }),
         };
 
@@ -902,6 +936,7 @@ impl PoolGuard {
     /// Write Bind+Execute bytes for a prepared statement into an external buffer.
     pub(crate) fn write_deferred_bind_execute(
         &self,
+        sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
         buf: &mut Vec<u8>,
@@ -909,7 +944,7 @@ impl PoolGuard {
         let conn = self
             .sync_conn()
             .expect("sync_conn failed in write_deferred");
-        conn.write_deferred_bind_execute(sql_hash, params, buf);
+        conn.write_deferred_bind_execute(sql, sql_hash, params, buf);
     }
 
     /// Flush a buffer of deferred Bind+Execute messages as a single pipeline.
@@ -1156,7 +1191,7 @@ impl Transaction {
 
         // Buffer the Bind+Execute bytes — no I/O
         self.guard
-            .write_deferred_bind_execute(sql_hash, params, &mut self.deferred_buf);
+            .write_deferred_bind_execute(sql, sql_hash, params, &mut self.deferred_buf);
         self.deferred_count += 1;
         Ok(())
     }

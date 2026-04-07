@@ -136,9 +136,9 @@ pub fn fetch_column_names(
         ("public", table_name)
     };
 
-    // Use simple_query with string interpolation. Schema and table names are
-    // from PG error messages (not user input), so SQL injection is not a concern.
-    // We still single-quote-escape them for correctness.
+    // Schema and table names are extracted from PG error messages, which may
+    // contain attacker-influenced data (e.g., user-created table names).
+    // Escape single quotes to prevent SQL injection via crafted identifiers.
     let safe_schema = schema.replace('\'', "''");
     let safe_table = table.replace('\'', "''");
     let query = format!(

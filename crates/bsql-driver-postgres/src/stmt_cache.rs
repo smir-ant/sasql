@@ -31,30 +31,40 @@ impl Default for StmtCache {
 }
 
 impl StmtCache {
+    /// Look up a cached statement by hash AND verify the SQL text matches.
+    ///
+    /// On hash collision (same hash, different SQL), returns `None` — the
+    /// caller will re-prepare, which produces the correct statement.
     #[inline]
-    pub(crate) fn get_mut(&mut self, hash: &u64) -> Option<&mut StmtInfo> {
+    pub(crate) fn get_mut(&mut self, hash: &u64, sql: &str) -> Option<&mut StmtInfo> {
         self.entries
             .iter_mut()
-            .find(|(h, _)| h == hash)
+            .find(|(h, info)| h == hash && &*info.sql == sql)
             .map(|(_, info)| info)
     }
 
     #[inline]
-    pub(crate) fn get(&self, hash: &u64) -> Option<&StmtInfo> {
+    pub(crate) fn get(&self, hash: &u64, sql: &str) -> Option<&StmtInfo> {
         self.entries
             .iter()
-            .find(|(h, _)| h == hash)
+            .find(|(h, info)| h == hash && &*info.sql == sql)
             .map(|(_, info)| info)
     }
 
     #[inline]
-    pub(crate) fn contains_key(&self, hash: &u64) -> bool {
-        self.entries.iter().any(|(h, _)| h == hash)
+    pub(crate) fn contains_key(&self, hash: &u64, sql: &str) -> bool {
+        self.entries
+            .iter()
+            .any(|(h, info)| h == hash && &*info.sql == sql)
     }
 
     #[inline]
     pub(crate) fn insert(&mut self, hash: u64, info: StmtInfo) {
-        if let Some(entry) = self.entries.iter_mut().find(|(h, _)| *h == hash) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|(h, existing)| *h == hash && existing.sql == info.sql)
+        {
             entry.1 = info;
         } else {
             self.entries.push((hash, info));
@@ -120,6 +130,11 @@ pub(crate) fn make_stmt_name(hash: u64) -> [u8; 18] {
 pub(crate) struct StmtInfo {
     /// Statement name: `"s_{hash:016x}"` — fixed stack array, no heap allocation.
     pub(crate) name: [u8; 18],
+    /// The full SQL text — stored for hash collision detection.
+    ///
+    /// Adds ~16 bytes per cached statement (Box<str> = ptr + len). On hash
+    /// collision the SQL mismatch is detected immediately, triggering re-prepare.
+    pub(crate) sql: Box<str>,
     /// Column metadata from RowDescription.
     pub(crate) columns: Arc<[ColumnDesc]>,
     /// Monotonic counter value at last use for LRU eviction.
@@ -261,9 +276,9 @@ mod tests {
     fn stmt_cache_basic_ops() {
         let mut cache = StmtCache::default();
         assert_eq!(cache.len(), 0);
-        assert!(!cache.contains_key(&42));
-        assert!(cache.get(&42).is_none());
-        assert!(cache.get_mut(&42).is_none());
+        assert!(!cache.contains_key(&42, "SELECT 1"));
+        assert!(cache.get(&42, "SELECT 1").is_none());
+        assert!(cache.get_mut(&42, "SELECT 1").is_none());
         assert!(cache.remove(&42).is_none());
     }
 
@@ -272,30 +287,33 @@ mod tests {
         let mut cache = StmtCache::default();
         let info = StmtInfo {
             name: *b"s_test\0\0\0\0\0\0\0\0\0\0\0\0",
+            sql: "SELECT 1".into(),
             columns: Arc::from(Vec::new()),
             last_used: 1,
             bind_template: None,
         };
         cache.insert(42, info);
         assert_eq!(cache.len(), 1);
-        assert!(cache.contains_key(&42));
-        assert!(cache.get(&42).is_some());
-        assert!(cache.get_mut(&42).is_some());
+        assert!(cache.contains_key(&42, "SELECT 1"));
+        assert!(cache.get(&42, "SELECT 1").is_some());
+        assert!(cache.get_mut(&42, "SELECT 1").is_some());
 
         let removed = cache.remove(&42);
         assert!(removed.is_some());
         assert_eq!(cache.len(), 0);
-        assert!(!cache.contains_key(&42));
+        assert!(!cache.contains_key(&42, "SELECT 1"));
     }
 
     #[test]
     fn stmt_cache_evict_lru() {
         let mut cache = StmtCache::default();
+        let sqls = ["SELECT 0", "SELECT 1", "SELECT 2"];
         for i in 0..3u64 {
             cache.insert(
                 i,
                 StmtInfo {
                     name: make_stmt_name(i),
+                    sql: sqls[i as usize].into(),
                     columns: Arc::from(Vec::new()),
                     last_used: i + 1,
                     bind_template: None,
@@ -313,12 +331,14 @@ mod tests {
         let mut cache = StmtCache::default();
         let info1 = StmtInfo {
             name: *b"s_aaaaaaaaaaaaaaaa",
+            sql: "SELECT 1".into(),
             columns: Arc::from(Vec::new()),
             last_used: 1,
             bind_template: None,
         };
         let info2 = StmtInfo {
             name: *b"s_bbbbbbbbbbbbbbbb",
+            sql: "SELECT 1".into(),
             columns: Arc::from(Vec::new()),
             last_used: 2,
             bind_template: None,
@@ -326,7 +346,29 @@ mod tests {
         cache.insert(42, info1);
         cache.insert(42, info2);
         assert_eq!(cache.len(), 1);
-        assert_eq!(cache.get(&42).unwrap().name_str(), "s_bbbbbbbbbbbbbbbb");
+        assert_eq!(
+            cache.get(&42, "SELECT 1").unwrap().name_str(),
+            "s_bbbbbbbbbbbbbbbb"
+        );
+    }
+
+    #[test]
+    fn stmt_cache_hash_collision_different_sql() {
+        let mut cache = StmtCache::default();
+        let info = StmtInfo {
+            name: *b"s_test\0\0\0\0\0\0\0\0\0\0\0\0",
+            sql: "SELECT 1".into(),
+            columns: Arc::from(Vec::new()),
+            last_used: 1,
+            bind_template: None,
+        };
+        cache.insert(42, info);
+        // Same hash, different SQL — should not match
+        assert!(cache.get(&42, "SELECT 2").is_none());
+        assert!(cache.get_mut(&42, "SELECT 2").is_none());
+        assert!(!cache.contains_key(&42, "SELECT 2"));
+        // Original SQL still matches
+        assert!(cache.get(&42, "SELECT 1").is_some());
     }
 
     // ---- make_stmt_name tests ----
@@ -400,6 +442,7 @@ mod tests {
     fn stmt_info_has_last_used_counter() {
         let info = StmtInfo {
             name: *b"s_test\0\0\0\0\0\0\0\0\0\0\0\0",
+            sql: "SELECT 1".into(),
             columns: Arc::from(Vec::new()),
             last_used: 42,
             bind_template: None,

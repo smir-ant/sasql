@@ -107,6 +107,10 @@ pub struct Listener {
     channels: Arc<Mutex<HashSet<String>>>,
     /// Connection config for creating notify connections.
     config: bsql_driver_postgres::Config,
+    /// Cached connection for `notify()` calls. Avoids opening a new connection
+    /// on every NOTIFY. Lazily initialized on first `notify()`, reused on
+    /// subsequent calls. Reconnects automatically on failure.
+    notify_conn: Mutex<Option<bsql_driver_postgres::Connection>>,
 }
 
 impl Drop for Listener {
@@ -171,6 +175,7 @@ impl Listener {
             _thread_handle: Some(handle),
             channels,
             config: config_for_notify,
+            notify_conn: Mutex::new(None),
         })
     }
 
@@ -268,15 +273,34 @@ impl Listener {
         let escaped_payload = payload.replace('\'', "''");
         let sql = format!("NOTIFY {quoted_channel}, '{escaped_payload}'");
 
-        // Send NOTIFY on a SEPARATE short-lived connection to avoid
+        // Send NOTIFY on a SEPARATE cached connection to avoid
         // self-notification race on the listener connection. When NOTIFY
         // is sent on the same connection that LISTENs, the notification
         // arrives during simple_query's response read, creating duplicates.
-        let mut conn = bsql_driver_postgres::Connection::connect(&self.config)
-            .map_err(|e| ConnectError::create(format!("notify connection failed: {e}")))?;
-        conn.simple_query(&sql)
-            .map_err(BsqlError::from_driver_query)?;
-        Ok(())
+        //
+        // The connection is lazily opened on first notify() and reused for
+        // subsequent calls. On failure, reconnects once before returning error.
+        let mut conn_guard = self.notify_conn.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = match conn_guard.as_mut() {
+            Some(c) => c,
+            None => {
+                let c = bsql_driver_postgres::Connection::connect(&self.config)
+                    .map_err(|e| ConnectError::create(format!("notify connection failed: {e}")))?;
+                conn_guard.insert(c)
+            }
+        };
+        match conn.simple_query(&sql) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                // Connection broken — reconnect and retry once
+                *conn_guard = None;
+                let c = bsql_driver_postgres::Connection::connect(&self.config)
+                    .map_err(|e| ConnectError::create(format!("notify reconnect failed: {e}")))?;
+                let conn = conn_guard.insert(c);
+                conn.simple_query(&sql)
+                    .map_err(BsqlError::from_driver_query)
+            }
+        }
     }
 
     /// The set of currently subscribed channels.

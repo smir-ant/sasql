@@ -79,10 +79,10 @@ impl Drop for OwnedResult {
 /// The generated code calls `query_raw`, `query_raw_readonly`, and
 /// `execute_raw` on `&Pool`, `&PoolConnection`, or `&Transaction`.
 ///
-/// All methods are `async fn` returning futures that complete immediately
-/// (sync under the hood). The internal connection I/O is microsecond-level
-/// on UDS and fast on TCP; the `async` signature exists for ergonomic
-/// compatibility with async runtimes (tokio, etc.).
+/// When the `async` feature is enabled and the pool connects via TCP,
+/// `acquire_async()` returns true async connections that use tokio I/O
+/// instead of blocking the worker thread. UDS connections remain sync
+/// (sub-millisecond, acceptable for tokio).
 pub trait Executor {
     /// Execute a query and return all rows.
     fn query_raw(
@@ -109,6 +109,74 @@ pub trait Executor {
     ) -> BsqlResult<u64>;
 }
 
+/// When async feature is enabled, use `acquire_async()` which auto-detects
+/// UDS vs TCP: UDS gets sync Connection (fast, sub-ms), TCP gets AsyncConnection
+/// (true async I/O via tokio, doesn't block the worker thread).
+///
+/// The `query_async` / `execute_async` methods on PoolGuard dispatch to the
+/// correct backend: sync I/O for UDS connections, async I/O for TCP.
+/// Since we need `.await` inside a sync trait method, we use
+/// `tokio::task::block_in_place` which allows blocking the current worker
+/// while letting other tokio tasks make progress.
+#[cfg(feature = "async")]
+impl Executor for Pool {
+    #[inline]
+    fn query_raw(
+        &self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+    ) -> BsqlResult<OwnedResult> {
+        let mut guard = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.inner.acquire_async())
+        })
+        .map_err(BsqlError::from)?;
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(guard.query_async(sql, sql_hash, params))
+        })
+        .map_err(BsqlError::from_driver_query)?;
+        Ok(OwnedResult::without_arena(result))
+    }
+
+    #[inline]
+    fn query_raw_readonly(
+        &self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+    ) -> BsqlResult<OwnedResult> {
+        let pool = self.read_pool.as_ref().unwrap_or(&self.inner);
+        let mut guard = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(pool.acquire_async())
+        })
+        .map_err(BsqlError::from)?;
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(guard.query_async(sql, sql_hash, params))
+        })
+        .map_err(BsqlError::from_driver_query)?;
+        Ok(OwnedResult::without_arena(result))
+    }
+
+    #[inline]
+    fn execute_raw(
+        &self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+    ) -> BsqlResult<u64> {
+        let mut guard = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.inner.acquire_async())
+        })
+        .map_err(BsqlError::from)?;
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(guard.execute_async(sql, sql_hash, params))
+        })
+        .map_err(BsqlError::from_driver_query)
+    }
+}
+
+/// When async feature is NOT enabled, use plain sync `acquire()` + `query()`.
+#[cfg(not(feature = "async"))]
 impl Executor for Pool {
     #[inline]
     fn query_raw(

@@ -460,7 +460,7 @@ impl Connection {
     ///
     /// If the statement is already cached, this is a no-op.
     pub fn prepare_only(&mut self, sql: &str, sql_hash: u64) -> Result<(), DriverError> {
-        if self.stmts.contains_key(&sql_hash) {
+        if self.stmts.contains_key(&sql_hash, sql) {
             return Ok(());
         }
         let name = make_stmt_name(sql_hash);
@@ -480,6 +480,7 @@ impl Connection {
             sql_hash,
             StmtInfo {
                 name,
+                sql: sql.into(),
                 columns,
                 last_used: self.query_counter,
                 bind_template: None,
@@ -653,7 +654,7 @@ impl Connection {
         self.write_buf.clear();
 
         // Check statement cache — inline, no function call.
-        let info = match self.stmts.get_mut(&sql_hash) {
+        let info = match self.stmts.get_mut(&sql_hash, sql) {
             Some(info) => {
                 self.query_counter += 1;
                 info.last_used = self.query_counter;
@@ -904,6 +905,7 @@ impl Connection {
             sql_hash,
             StmtInfo {
                 name,
+                sql: sql.into(),
                 columns,
                 last_used: self.query_counter,
                 bind_template: None,
@@ -1043,7 +1045,7 @@ impl Connection {
         self.write_buf.clear();
 
         // Ensure statement is prepared.
-        if !self.stmts.contains_key(&sql_hash) {
+        if !self.stmts.contains_key(&sql_hash, sql) {
             let name = make_stmt_name(sql_hash);
             let name_s: &str = std::str::from_utf8(&name).expect("ASCII");
             let first_params = param_sets[0];
@@ -1070,6 +1072,7 @@ impl Connection {
                 sql_hash,
                 StmtInfo {
                     name,
+                    sql: sql.into(),
                     columns,
                     last_used: self.query_counter,
                     bind_template: None,
@@ -1082,7 +1085,7 @@ impl Connection {
         // Build N x (Bind + Execute) + 1 x Sync
         let stmt_name = self
             .stmts
-            .get(&sql_hash)
+            .get(&sql_hash, sql)
             .expect("BUG: stmt just cached but not found")
             .name_str()
             .to_owned();
@@ -1151,7 +1154,7 @@ impl Connection {
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> Result<[u8; 18], DriverError> {
-        if let Some(info) = self.stmts.get(&sql_hash) {
+        if let Some(info) = self.stmts.get(&sql_hash, sql) {
             return Ok(info.name);
         }
 
@@ -1182,6 +1185,7 @@ impl Connection {
             sql_hash,
             StmtInfo {
                 name,
+                sql: sql.into(),
                 columns,
                 last_used: self.query_counter,
                 bind_template: None,
@@ -1195,13 +1199,14 @@ impl Connection {
     /// external buffer. Does NOT send anything on the wire.
     pub(crate) fn write_deferred_bind_execute(
         &self,
+        sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
         buf: &mut Vec<u8>,
     ) {
         let stmt_name = self
             .stmts
-            .get(&sql_hash)
+            .get(&sql_hash, sql)
             .expect("BUG: stmt just cached but not found")
             .name_str();
         proto::write_bind_params(buf, "", stmt_name, params);
@@ -1398,7 +1403,7 @@ impl Connection {
         self.write_buf.clear();
 
         // Check statement cache — inline, no function call.
-        let info = match self.stmts.get_mut(&sql_hash) {
+        let info = match self.stmts.get_mut(&sql_hash, sql) {
             Some(info) => {
                 self.query_counter += 1;
                 info.last_used = self.query_counter;
@@ -1695,6 +1700,7 @@ impl Connection {
             sql_hash,
             StmtInfo {
                 name,
+                sql: sql.into(),
                 columns,
                 last_used: self.query_counter,
                 bind_template: None,
@@ -2232,7 +2238,7 @@ impl Connection {
     ) -> Result<(Arc<[ColumnDesc]>, bool), DriverError> {
         self.write_buf.clear();
 
-        let columns = if let Some(info) = self.stmts.get_mut(&sql_hash) {
+        let columns = if let Some(info) = self.stmts.get_mut(&sql_hash, sql) {
             // Cache hit: try bind template, fall back to write_bind_params.
             self.query_counter += 1;
             info.last_used = self.query_counter;
@@ -2314,6 +2320,7 @@ impl Connection {
                 sql_hash,
                 StmtInfo {
                     name,
+                    sql: sql.into(),
                     columns: columns.clone(),
                     last_used: self.query_counter,
                     bind_template: None,
@@ -2533,7 +2540,7 @@ impl Connection {
 
         self.write_buf.clear();
 
-        let columns = if let Some(info) = self.stmts.get_mut(&sql_hash) {
+        let columns = if let Some(info) = self.stmts.get_mut(&sql_hash, sql) {
             // Cache hit: try bind template first, fall back to write_bind_params.
             self.query_counter += 1;
             info.last_used = self.query_counter;
@@ -2630,6 +2637,7 @@ impl Connection {
                 sql_hash,
                 StmtInfo {
                     name,
+                    sql: sql.into(),
                     columns: columns.clone(),
                     last_used: self.query_counter,
                     bind_template: None,
@@ -2674,7 +2682,9 @@ impl Connection {
     // --- Internal helpers ---
 
     fn cache_stmt(&mut self, sql_hash: u64, info: StmtInfo) {
-        if self.stmts.len() >= self.max_stmt_cache_size && !self.stmts.contains_key(&sql_hash) {
+        if self.stmts.len() >= self.max_stmt_cache_size
+            && !self.stmts.contains_key(&sql_hash, &info.sql)
+        {
             if let Some((_lru_hash, evicted)) = self.stmts.evict_lru() {
                 proto::write_close(&mut self.write_buf, b'S', evicted.name_str());
             }
