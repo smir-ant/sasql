@@ -1,7 +1,4 @@
-error: PostgreSQL error: relation "tickets" does not exist (at position 24)
-                SQL: SELECT id, budget FROM tickets WHERE id = $1
-                                            ^
-         available tables: bench_orders, bench_users
+error: column "budget": column type is NUMERIC (OID 1700) — enable feature "decimal" in bsql
  --> tests/compile_fail_features/missing_decimal.rs:5:13
   |
 5 |     let _ = bsql::query!("SELECT id, budget FROM tickets WHERE id = $id: i32");

@@ -1,7 +1,4 @@
-error: PostgreSQL error: relation "users" does not exist (at position 16)
-                SQL: SELECT id FROM users WHERE score = $1
-                                    ^
-         available tables: bench_orders, bench_users
+error: type mismatch for parameter `$id`: declared `i32` but PostgreSQL expects `int2` (OID 21) (expected `i16`)
  --> tests/compile_fail/type_mismatch_i32_for_i64.rs:4:13
   |
 4 |       let _ = bsql::query!(

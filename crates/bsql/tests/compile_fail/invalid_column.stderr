@@ -1,7 +1,6 @@
-error: PostgreSQL error: relation "users" does not exist (at position 36)
+error: PostgreSQL error: column "nonexistent_column_xyz" does not exist (at position 8)
                 SQL: SELECT nonexistent_column_xyz FROM users WHERE id = $1
-                                                        ^
-         available tables: bench_orders, bench_users
+                            ^
  --> tests/compile_fail/invalid_column.rs:3:13
   |
 3 |       let _ = bsql::query!(

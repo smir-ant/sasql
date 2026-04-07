@@ -1,7 +1,4 @@
-error: PostgreSQL error: relation "users" does not exist (at position 16)
-                SQL: SELECT id FROM users WHERE login = $1
-                                    ^
-         available tables: bench_orders, bench_users
+error: type mismatch for parameter `$login`: declared `bool` but PostgreSQL expects `text` (OID 25) (expected `String`)
  --> tests/compile_fail/type_mismatch_bool_for_text.rs:4:13
   |
 4 |       let _ = bsql::query!(

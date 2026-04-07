@@ -1,7 +1,4 @@
-error: PostgreSQL error: relation "tickets" does not exist (at position 29)
-                SQL: SELECT id, ticket_uuid FROM tickets WHERE id = $1
-                                                 ^
-         available tables: bench_orders, bench_users
+error: column "ticket_uuid": column type is UUID (OID 2950) — enable feature "uuid" in bsql
  --> tests/compile_fail_features/missing_uuid.rs:5:13
   |
 5 |     let _ = bsql::query!("SELECT id, ticket_uuid FROM tickets WHERE id = $id: i32");
