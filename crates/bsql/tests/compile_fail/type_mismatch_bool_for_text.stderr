@@ -1,5 +1,7 @@
-error: query not found in offline cache (hash 66bc7a716028fa31). The SQL may have changed since the cache was last built. Run `cargo build` with a live PostgreSQL connection to update the cache, then rebuild with BSQL_OFFLINE=true.
-         SQL: select id from users where login = $1
+error: PostgreSQL error: relation "users" does not exist (at position 16)
+                SQL: SELECT id FROM users WHERE login = $1
+                                    ^
+         available tables: bench_orders, bench_users
  --> tests/compile_fail/type_mismatch_bool_for_text.rs:4:13
   |
 4 |       let _ = bsql::query!(
