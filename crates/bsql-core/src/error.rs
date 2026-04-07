@@ -303,7 +303,7 @@ impl From<bsql_driver_postgres::DriverError> for BsqlError {
                 };
                 BsqlError::Query(QueryError {
                     message: msg,
-                    pg_code: Some(code),
+                    pg_code: Some(Box::from(std::str::from_utf8(&code).unwrap_or("?????"))),
                     source: None,
                 })
             }
@@ -515,7 +515,7 @@ mod tests {
     #[test]
     fn server_error_preserves_detail_and_hint() {
         let driver_err = bsql_driver_postgres::DriverError::Server {
-            code: "23505".into(),
+            code: *b"23505",
             message: "duplicate key".into(),
             detail: Some("Key (login)=(alice) already exists.".into()),
             hint: Some("Use ON CONFLICT to handle duplicates.".into()),
@@ -545,7 +545,7 @@ mod tests {
     #[test]
     fn server_error_without_detail_hint() {
         let driver_err = bsql_driver_postgres::DriverError::Server {
-            code: "42P01".into(),
+            code: *b"42P01",
             message: "relation does not exist".into(),
             detail: None,
             hint: None,
@@ -836,7 +836,7 @@ mod tests {
     #[test]
     fn server_error_with_position_display() {
         let driver_err = bsql_driver_postgres::DriverError::Server {
-            code: "42601".into(),
+            code: *b"42601",
             message: "syntax error".into(),
             detail: None,
             hint: None,
@@ -857,7 +857,7 @@ mod tests {
     #[test]
     fn server_error_with_all_fields() {
         let driver_err = bsql_driver_postgres::DriverError::Server {
-            code: "42P01".into(),
+            code: *b"42P01",
             message: "relation does not exist".into(),
             detail: Some("table was dropped".into()),
             hint: Some("recreate the table".into()),
@@ -876,7 +876,7 @@ mod tests {
     #[test]
     fn from_driver_query_server_error_delegates() {
         let e = BsqlError::from_driver_query(bsql_driver_postgres::DriverError::Server {
-            code: "23505".into(),
+            code: *b"23505",
             message: "duplicate key".into(),
             detail: None,
             hint: None,

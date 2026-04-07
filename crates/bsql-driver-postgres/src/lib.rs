@@ -88,7 +88,8 @@ pub use types::{
 ///         DriverError::Auth(msg) => eprintln!("auth failed: {msg}"),
 ///         DriverError::Protocol(msg) => eprintln!("protocol error: {msg}"),
 ///         DriverError::Server { code, message, position, .. } => {
-///             eprintln!("PG error [{code}]: {message} (pos: {position:?})");
+///             let code_str = std::str::from_utf8(&code).unwrap_or("?????");
+///             eprintln!("PG error [{code_str}]: {message} (pos: {position:?})");
 ///         }
 ///         DriverError::Pool(msg) => eprintln!("pool error: {msg}"),
 ///     }
@@ -104,8 +105,8 @@ pub enum DriverError {
     Protocol(String),
     /// Server-reported error (invalid SQL, constraint violation, etc.).
     Server {
-        /// Five-character SQLSTATE code (e.g. "42P01" for undefined table).
-        code: Box<str>,
+        /// Five-byte SQLSTATE code (always ASCII, e.g. `b"42P01"`).
+        code: [u8; 5],
         /// Human-readable error message.
         message: Box<str>,
         /// Optional detail text.
@@ -132,7 +133,11 @@ impl std::fmt::Display for DriverError {
                 hint,
                 position,
             } => {
-                write!(f, "server error [{code}]: {message}")?;
+                write!(
+                    f,
+                    "server error [{}]: {message}",
+                    std::str::from_utf8(code).unwrap_or("?????")
+                )?;
                 if let Some(pos) = position {
                     write!(f, " (at position {pos})")?;
                 }
@@ -193,7 +198,7 @@ mod tests {
     #[test]
     fn driver_error_display_server() {
         let e = DriverError::Server {
-            code: "42P01".into(),
+            code: *b"42P01",
             message: "relation does not exist".into(),
             detail: Some("table was dropped".into()),
             hint: None,
@@ -208,7 +213,7 @@ mod tests {
     #[test]
     fn driver_error_display_server_no_detail() {
         let e = DriverError::Server {
-            code: Box::from("23505"),
+            code: *b"23505",
             message: Box::from("duplicate key"),
             detail: None,
             hint: None,
@@ -220,7 +225,7 @@ mod tests {
     #[test]
     fn driver_error_display_server_with_position() {
         let e = DriverError::Server {
-            code: Box::from("42601"),
+            code: *b"42601",
             message: Box::from("syntax error"),
             detail: None,
             hint: None,
@@ -269,7 +274,7 @@ mod tests {
     #[test]
     fn driver_error_display_server_all_none() {
         let e = DriverError::Server {
-            code: "00000".into(),
+            code: *b"00000",
             message: "successful completion".into(),
             detail: None,
             hint: None,
@@ -286,7 +291,7 @@ mod tests {
     #[test]
     fn driver_error_display_server_detail_only() {
         let e = DriverError::Server {
-            code: "23505".into(),
+            code: *b"23505",
             message: "duplicate key".into(),
             detail: Some("Key (id)=(1) exists.".into()),
             hint: None,
@@ -300,7 +305,7 @@ mod tests {
     #[test]
     fn driver_error_display_server_hint_only() {
         let e = DriverError::Server {
-            code: "42601".into(),
+            code: *b"42601",
             message: "syntax error".into(),
             detail: None,
             hint: Some("check SQL".into()),
@@ -314,7 +319,7 @@ mod tests {
     #[test]
     fn driver_error_display_server_position_only() {
         let e = DriverError::Server {
-            code: "42601".into(),
+            code: *b"42601",
             message: "syntax error".into(),
             detail: None,
             hint: None,
@@ -327,7 +332,7 @@ mod tests {
     #[test]
     fn driver_error_display_server_all_fields() {
         let e = DriverError::Server {
-            code: "42P01".into(),
+            code: *b"42P01",
             message: "relation does not exist".into(),
             detail: Some("table was dropped".into()),
             hint: Some("recreate the table".into()),
@@ -396,7 +401,7 @@ mod tests {
     #[test]
     fn driver_error_source_server_is_none() {
         let e = DriverError::Server {
-            code: "42601".into(),
+            code: *b"42601",
             message: "err".into(),
             detail: None,
             hint: None,
@@ -418,7 +423,7 @@ mod tests {
             DriverError::Auth("auth".into()),
             DriverError::Protocol("proto".into()),
             DriverError::Server {
-                code: "00000".into(),
+                code: *b"00000",
                 message: "ok".into(),
                 detail: None,
                 hint: None,

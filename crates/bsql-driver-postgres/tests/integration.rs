@@ -292,7 +292,7 @@ fn query_invalid_sql() {
 
     match result {
         Err(DriverError::Server { code, message, .. }) => {
-            assert!(!code.is_empty(), "should have a SQLSTATE code");
+            assert!(code != *b"     ", "should have a SQLSTATE code");
             assert!(!message.is_empty(), "should have an error message");
         }
         Err(e) => panic!("expected Server error, got: {e}"),
@@ -702,7 +702,7 @@ fn error_invalid_sql_has_code() {
 
     match result {
         Err(DriverError::Server { code, message, .. }) => {
-            assert_eq!(&*code, "42P01", "should be undefined_table error");
+            assert_eq!(&code, b"42P01", "should be undefined_table error");
             assert!(
                 message.contains("does not exist"),
                 "message should mention nonexistence: {message}"
@@ -729,7 +729,7 @@ fn error_simple_query_reports_server_error() {
 
     match result {
         Err(DriverError::Server { code, .. }) => {
-            assert_eq!(&*code, "42P01");
+            assert_eq!(&code, b"42P01");
         }
         Err(e) => panic!("expected Server error, got: {e}"),
         Ok(_) => panic!("expected error"),

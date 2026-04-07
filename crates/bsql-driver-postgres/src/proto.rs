@@ -801,9 +801,7 @@ pub fn parse_simple_data_row(data: &[u8]) -> Result<Vec<Option<String>>, DriverE
 /// Parsed fields from an ErrorResponse or NoticeResponse.
 #[derive(Debug)]
 pub struct ErrorFields {
-    #[allow(dead_code)]
-    pub severity: Box<str>,
-    pub code: Box<str>,
+    pub code: [u8; 5],
     pub message: String,
     pub detail: Option<String>,
     pub hint: Option<String>,
@@ -814,7 +812,12 @@ pub struct ErrorFields {
 
 impl fmt::Display for ErrorFields {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "[{}] {}", self.code, self.message)?;
+        write!(
+            f,
+            "[{}] {}",
+            std::str::from_utf8(&self.code).unwrap_or("?????"),
+            self.message
+        )?;
         if let Some(pos) = self.position {
             write!(f, " (at position {pos})")?;
         }
@@ -838,8 +841,7 @@ impl fmt::Display for ErrorFields {
 #[cold]
 #[inline(never)]
 pub fn parse_error_response(data: &[u8]) -> ErrorFields {
-    let mut severity: Box<str> = Box::from("");
-    let mut code: Box<str> = Box::from("");
+    let mut code: [u8; 5] = *b"     ";
     let mut message = String::new();
     let mut detail = None;
     let mut hint = None;
@@ -863,8 +865,12 @@ pub fn parse_error_response(data: &[u8]) -> ErrorFields {
         };
 
         match field_type {
-            b'S' => severity = Box::from(value),
-            b'C' => code = Box::from(value),
+            b'S' => {} // severity — not stored
+            b'C' => {
+                let bytes = value.as_bytes();
+                let len = bytes.len().min(5);
+                code[..len].copy_from_slice(&bytes[..len]);
+            }
             b'M' => message = value.to_owned(),
             b'D' => detail = Some(value.to_owned()),
             b'H' => hint = Some(value.to_owned()),
@@ -875,15 +881,17 @@ pub fn parse_error_response(data: &[u8]) -> ErrorFields {
 
     // Truncated or malformed error responses should produce a meaningful error.
     if message.is_empty() {
-        if code.is_empty() {
+        if code == *b"     " {
             message = "(malformed error response: no message or code)".to_owned();
         } else {
-            message = format!("(malformed error response: code={code}, no message)");
+            message = format!(
+                "(malformed error response: code={}, no message)",
+                std::str::from_utf8(&code).unwrap_or("?????")
+            );
         }
     }
 
     ErrorFields {
-        severity,
         code,
         message,
         detail,
@@ -1215,8 +1223,7 @@ mod tests {
         data.push(0);
 
         let fields = parse_error_response(&data);
-        assert_eq!(&*fields.severity, "ERROR");
-        assert_eq!(&*fields.code, "42P01");
+        assert_eq!(&fields.code, b"42P01");
         assert_eq!(fields.message, "relation does not exist");
         assert_eq!(fields.detail.as_deref(), Some("some detail"));
         assert_eq!(fields.hint.as_deref(), Some("some hint"));
@@ -1601,8 +1608,7 @@ mod tests {
     #[test]
     fn error_fields_display_with_detail_and_hint() {
         let fields = ErrorFields {
-            severity: Box::from("ERROR"),
-            code: Box::from("23505"),
+            code: *b"23505",
             message: "duplicate key".to_owned(),
             detail: Some("key already exists".to_owned()),
             hint: Some("use ON CONFLICT".to_owned()),
@@ -1619,8 +1625,7 @@ mod tests {
     #[test]
     fn error_fields_display_without_extras() {
         let fields = ErrorFields {
-            severity: Box::from("ERROR"),
-            code: Box::from("42P01"),
+            code: *b"42P01",
             message: "relation does not exist".to_owned(),
             detail: None,
             hint: None,
@@ -1765,8 +1770,7 @@ mod tests {
     #[test]
     fn error_fields_display_with_position() {
         let fields = ErrorFields {
-            severity: Box::from("ERROR"),
-            code: Box::from("42601"),
+            code: *b"42601",
             message: "syntax error".to_owned(),
             detail: None,
             hint: None,
@@ -1891,11 +1895,10 @@ mod tests {
         data.push(0); // terminator
 
         let fields = parse_error_response(&data);
-        assert_eq!(&*fields.severity, "FATAL");
         // No code or message fields, so message should be synthetic
         assert!(!fields.message.is_empty());
         assert!(fields.message.contains("malformed"));
-        assert_eq!(&*fields.code, "");
+        assert_eq!(&fields.code, b"     ");
         assert!(fields.detail.is_none());
         assert!(fields.hint.is_none());
         assert!(fields.position.is_none());

@@ -681,7 +681,7 @@ mod tests {
     #[test]
     fn format_server_error_basic() {
         let err = DriverError::Server {
-            code: "42P01".into(),
+            code: *b"42P01",
             message: "relation \"users\" does not exist".into(),
             detail: None,
             hint: None,
@@ -695,7 +695,7 @@ mod tests {
     #[test]
     fn format_server_error_with_detail_and_hint() {
         let err = DriverError::Server {
-            code: "42P01".into(),
+            code: *b"42P01",
             message: "something went wrong".into(),
             detail: Some("extra detail here".into()),
             hint: Some("try this instead".into()),
@@ -710,7 +710,7 @@ mod tests {
     #[test]
     fn format_server_error_with_position() {
         let err = DriverError::Server {
-            code: "42601".into(),
+            code: *b"42601",
             message: "syntax error".into(),
             detail: None,
             hint: None,
@@ -733,7 +733,7 @@ mod tests {
     #[test]
     fn format_driver_error_includes_sql() {
         let err = DriverError::Server {
-            code: "42P01".into(),
+            code: *b"42P01",
             message: "relation does not exist".into(),
             detail: None,
             hint: None,
@@ -748,7 +748,7 @@ mod tests {
     #[test]
     fn format_driver_error_includes_position_marker() {
         let err = DriverError::Server {
-            code: "42601".into(),
+            code: *b"42601",
             message: "syntax error".into(),
             detail: None,
             hint: None,

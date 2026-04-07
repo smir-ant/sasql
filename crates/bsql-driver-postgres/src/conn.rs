@@ -2750,7 +2750,7 @@ impl Connection {
     }
 
     fn maybe_invalidate_stmt_cache(&mut self, fields: &proto::ErrorFields, sql_hash: u64) -> bool {
-        if &*fields.code == "26000" {
+        if &fields.code == b"26000" {
             self.stmts.remove(&sql_hash);
             true
         } else {
