@@ -29,12 +29,11 @@ pub fn check_migration(
         Config::from_url(database_url).map_err(|e| format!("invalid database URL: {e}"))?;
     let mut conn = Connection::connect(&config).map_err(|e| format!("connection failed: {e}"))?;
 
-    // 1. Drop any leftover shadow schema from a previous failed run.
+    // 1. Drop any leftover shadow schema, then create fresh.
+    //    Use CREATE OR REPLACE (PG 14+) or DROP+CREATE for older versions.
     conn.simple_query("DROP SCHEMA IF EXISTS __bsql_shadow CASCADE")
         .map_err(|e| format!("failed to drop stale shadow schema: {e}"))?;
-
-    // 2. Create the shadow schema.
-    conn.simple_query("CREATE SCHEMA __bsql_shadow")
+    conn.simple_query("CREATE SCHEMA IF NOT EXISTS __bsql_shadow")
         .map_err(|e| format!("failed to create shadow schema: {e}"))?;
 
     // 3. Clone the current public schema structure into the shadow.
@@ -207,7 +206,9 @@ mod tests {
     #[test]
     fn check_migration_breaks_query() {
         let Some(url) = pg_url() else { return };
-        // Create a table, cache a query against it, then migrate by dropping it.
+        // Create a table, cache a query against it, then migrate by dropping a column.
+        // Note: DROP TABLE doesn't work here because search_path falls back to public.
+        // ALTER TABLE DROP COLUMN works because the shadow copy loses the column.
         let config = Config::from_url(&url).unwrap();
         let mut conn = Connection::connect(&config).unwrap();
 
@@ -225,14 +226,18 @@ mod tests {
             bsql_version: "0.20.1".to_owned(),
         }];
 
-        // Migration drops the table
-        let result =
-            check_migration(&url, "DROP TABLE IF EXISTS __bsql_test_tbl", &queries).unwrap();
+        // Migration drops the column — shadow copy loses 'name', PREPARE fails
+        let result = check_migration(
+            &url,
+            "ALTER TABLE __bsql_test_tbl DROP COLUMN name",
+            &queries,
+        )
+        .unwrap();
         assert_eq!(result.total_queries, 1);
         assert_eq!(result.failed.len(), 1);
         assert!(
             result.failed[0].error.contains("does not exist")
-                || result.failed[0].error.contains("relation")
+                || result.failed[0].error.contains("column")
         );
 
         // Cleanup
