@@ -1,0 +1,17 @@
+[package]
+name = "bsql-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI tools for bsql — compile-time safe SQL for Rust"
+
+[[bin]]
+name = "bsql"
+path = "src/main.rs"
+
+[dependencies]
+bsql-driver-postgres = { path = "../bsql-driver-postgres" }
+bitcode = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

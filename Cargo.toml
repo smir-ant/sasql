@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/bsql", "crates/bsql-arena", "crates/bsql-core", "crates/bsql-driver-postgres", "crates/bsql-driver-sqlite", "crates/bsql-macros"]
+members = ["crates/bsql", "crates/bsql-arena", "crates/bsql-cli", "crates/bsql-core", "crates/bsql-driver-postgres", "crates/bsql-driver-sqlite", "crates/bsql-macros"]
 exclude = ["bench", "examples", "crates/bsql-driver-postgres/fuzz"]
 
 [workspace.package]

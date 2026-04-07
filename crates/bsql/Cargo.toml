@@ -17,6 +17,7 @@ uuid = ["bsql-core/uuid", "bsql-macros/uuid"]
 decimal = ["bsql-core/decimal", "bsql-macros/decimal"]
 explain = ["bsql-macros/explain"]
 tls = ["bsql-core/tls", "bsql-macros/tls"]
+detect-n-plus-one = ["bsql-core/detect-n-plus-one"]
 sqlite = ["bsql-core/sqlite", "bsql-macros/sqlite", "dep:bsql-driver-sqlite"]
 ## Compile SQLite from source (default for sqlite). Convenient, no system dep.
 sqlite-bundled = ["sqlite", "bsql-core/sqlite-bundled", "bsql-macros/sqlite-bundled", "bsql-driver-sqlite/bundled"]

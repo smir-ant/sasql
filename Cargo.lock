@@ -159,6 +159,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bsql-cli"
+version = "0.20.1"
+dependencies = [
+ "bitcode",
+ "bsql-driver-postgres",
+ "tempfile",
+]
+
+[[package]]
 name = "bsql-core"
 version = "0.20.1"
 dependencies = [
@@ -183,6 +192,7 @@ dependencies = [
  "bsql-arena",
  "chrono",
  "hmac",
+ "log",
  "md-5",
  "pbkdf2",
  "proptest",

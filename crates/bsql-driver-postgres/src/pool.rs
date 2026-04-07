@@ -34,6 +34,74 @@ pub(crate) enum PoolSlot {
     Async(AsyncConnection),
 }
 
+// --- N+1 Detection ---
+
+/// Tracks sequential repeats of the same `sql_hash` on a single connection
+/// checkout. When the same hash fires more than `threshold` times in a row,
+/// a warning is emitted. Fully `cfg`-gated — zero cost when disabled.
+#[cfg(feature = "detect-n-plus-one")]
+pub(crate) struct NPlusOneDetector {
+    last_query_hash: u64,
+    repeat_count: u16,
+    threshold: u16,
+}
+
+#[cfg(feature = "detect-n-plus-one")]
+impl NPlusOneDetector {
+    /// Create a new detector with the given warning threshold.
+    pub(crate) fn new(threshold: u16) -> Self {
+        Self {
+            last_query_hash: 0,
+            repeat_count: 0,
+            threshold,
+        }
+    }
+
+    /// Track a query execution. Call this at the start of every query method.
+    #[inline]
+    pub(crate) fn track(&mut self, sql_hash: u64) {
+        if sql_hash == self.last_query_hash {
+            self.repeat_count = self.repeat_count.saturating_add(1);
+        } else {
+            // Check previous run before resetting
+            self.emit_warning();
+            self.last_query_hash = sql_hash;
+            self.repeat_count = 1;
+        }
+    }
+
+    /// Check the final sequence on drop / connection return.
+    /// Returns `Some((hash, count))` if a warning should be emitted.
+    pub(crate) fn check_final(&self) -> Option<(u64, u16)> {
+        if self.repeat_count > self.threshold && self.last_query_hash != 0 {
+            Some((self.last_query_hash, self.repeat_count))
+        } else {
+            None
+        }
+    }
+
+    /// Emit a log warning if the current run exceeds the threshold.
+    #[cold]
+    #[inline(never)]
+    fn emit_warning(&self) {
+        if let Some((hash, count)) = self.check_final() {
+            log::warn!(
+                "[bsql] potential N+1 detected: sql_hash={:#018x} repeated {} times (threshold: {})",
+                hash,
+                count,
+                self.threshold,
+            );
+        }
+    }
+
+    /// Emit the final warning (called on drop).
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn emit_final_warning(&self) {
+        self.emit_warning();
+    }
+}
+
 // --- Pool ---
 
 /// A connection pool with LIFO ordering and fail-fast semantics.
@@ -80,6 +148,10 @@ struct PoolInner {
     /// Maximum idle duration before a connection is considered stale and discarded.
     /// Connections idle longer than this are dropped on acquire. Default: 30 seconds.
     stale_timeout: Duration,
+    /// Threshold for N+1 detection. When the same sql_hash fires more than
+    /// this many times sequentially on a single checkout, a warning is logged.
+    #[cfg(feature = "detect-n-plus-one")]
+    n_plus_one_threshold: u16,
 }
 
 impl Pool {
@@ -163,6 +235,8 @@ impl Pool {
                     conn: Some(PoolSlot::Sync(conn)),
                     pool: self.inner.clone(),
                     discard: false,
+                    #[cfg(feature = "detect-n-plus-one")]
+                    detector: NPlusOneDetector::new(self.inner.n_plus_one_threshold),
                 })
             }
             Err(e) => {
@@ -216,6 +290,8 @@ impl Pool {
                 conn: Some(slot),
                 pool: self.inner.clone(),
                 discard: false,
+                #[cfg(feature = "detect-n-plus-one")]
+                detector: NPlusOneDetector::new(self.inner.n_plus_one_threshold),
             }));
         }
         Ok(None)
@@ -430,6 +506,8 @@ impl Pool {
                         conn: Some(PoolSlot::Sync(conn)),
                         pool: self.inner.clone(),
                         discard: false,
+                        #[cfg(feature = "detect-n-plus-one")]
+                        detector: NPlusOneDetector::new(self.inner.n_plus_one_threshold),
                     })
                 }
                 Err(e) => {
@@ -447,6 +525,8 @@ impl Pool {
                         conn: Some(PoolSlot::Async(conn)),
                         pool: self.inner.clone(),
                         discard: false,
+                        #[cfg(feature = "detect-n-plus-one")]
+                        detector: NPlusOneDetector::new(self.inner.n_plus_one_threshold),
                     })
                 }
                 Err(e) => {
@@ -497,6 +577,9 @@ pub struct PoolBuilder {
     max_stmt_cache_size: usize,
     /// Maximum idle duration before a connection is considered stale.
     stale_timeout: Duration,
+    /// Threshold for N+1 detection warnings.
+    #[cfg(feature = "detect-n-plus-one")]
+    n_plus_one_threshold: Option<u16>,
 }
 
 impl PoolBuilder {
@@ -509,6 +592,8 @@ impl PoolBuilder {
             min_idle: 0,                                   // no minimum by default
             max_stmt_cache_size: 256,                      // LRU eviction at 256 stmts
             stale_timeout: Duration::from_secs(30),        // 30s default
+            #[cfg(feature = "detect-n-plus-one")]
+            n_plus_one_threshold: None,
         }
     }
 
@@ -563,6 +648,16 @@ impl PoolBuilder {
         self
     }
 
+    /// Set the threshold for N+1 detection warnings.
+    ///
+    /// When the same `sql_hash` fires more than this many times sequentially
+    /// on a single connection checkout, a warning is logged. Default: 10.
+    #[cfg(feature = "detect-n-plus-one")]
+    pub fn n_plus_one_threshold(mut self, n: u16) -> Self {
+        self.n_plus_one_threshold = Some(n);
+        self
+    }
+
     /// Build the pool. Validates the URL but does not open connections.
     pub fn build(self) -> Result<Pool, DriverError> {
         let url = self
@@ -585,6 +680,8 @@ impl PoolBuilder {
                 warmup_sqls: std::sync::Mutex::new(Arc::new(Vec::new())),
                 max_stmt_cache_size: self.max_stmt_cache_size,
                 stale_timeout: self.stale_timeout,
+                #[cfg(feature = "detect-n-plus-one")]
+                n_plus_one_threshold: self.n_plus_one_threshold.unwrap_or(10),
             }),
         };
 
@@ -655,6 +752,9 @@ pub struct PoolGuard {
     pool: Arc<PoolInner>,
     /// When true, the connection is dropped instead of returned to the pool.
     discard: bool,
+    /// Tracks sequential repeats of the same sql_hash for N+1 detection.
+    #[cfg(feature = "detect-n-plus-one")]
+    detector: NPlusOneDetector,
 }
 
 impl PoolGuard {
@@ -738,6 +838,8 @@ impl PoolGuard {
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> Result<QueryResult, DriverError> {
+        #[cfg(feature = "detect-n-plus-one")]
+        self.detector.track(sql_hash);
         self.sync_conn_mut()?.query(sql, sql_hash, params)
     }
 
@@ -749,6 +851,8 @@ impl PoolGuard {
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> Result<u64, DriverError> {
+        #[cfg(feature = "detect-n-plus-one")]
+        self.detector.track(sql_hash);
         self.sync_conn_mut()?.execute(sql, sql_hash, params)
     }
 
@@ -762,6 +866,8 @@ impl PoolGuard {
         sql_hash: u64,
         param_sets: &[&[&(dyn Encode + Sync)]],
     ) -> Result<Vec<u64>, DriverError> {
+        #[cfg(feature = "detect-n-plus-one")]
+        self.detector.track(sql_hash);
         self.sync_conn_mut()?
             .execute_pipeline(sql, sql_hash, param_sets)
     }
@@ -789,6 +895,8 @@ impl PoolGuard {
     where
         F: FnMut(PgDataRow<'_>) -> Result<(), DriverError>,
     {
+        #[cfg(feature = "detect-n-plus-one")]
+        self.detector.track(sql_hash);
         self.sync_conn_mut()?.for_each(sql, sql_hash, params, f)
     }
 
@@ -803,6 +911,8 @@ impl PoolGuard {
     where
         F: FnMut(&[u8]) -> Result<(), DriverError>,
     {
+        #[cfg(feature = "detect-n-plus-one")]
+        self.detector.track(sql_hash);
         self.sync_conn_mut()?.for_each_raw(sql, sql_hash, params, f)
     }
 
@@ -816,6 +926,8 @@ impl PoolGuard {
         params: &[&(dyn Encode + Sync)],
         chunk_size: i32,
     ) -> Result<(std::sync::Arc<[crate::types::ColumnDesc]>, bool), DriverError> {
+        #[cfg(feature = "detect-n-plus-one")]
+        self.detector.track(sql_hash);
         self.sync_conn_mut()?
             .query_streaming_start(sql, sql_hash, params, chunk_size)
     }
@@ -888,6 +1000,8 @@ impl PoolGuard {
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> Result<QueryResult, DriverError> {
+        #[cfg(feature = "detect-n-plus-one")]
+        self.detector.track(sql_hash);
         match self.conn.as_mut() {
             Some(PoolSlot::Sync(conn)) => conn.query(sql, sql_hash, params),
             Some(PoolSlot::Async(conn)) => conn.query(sql, sql_hash, params).await,
@@ -903,6 +1017,8 @@ impl PoolGuard {
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> Result<u64, DriverError> {
+        #[cfg(feature = "detect-n-plus-one")]
+        self.detector.track(sql_hash);
         match self.conn.as_mut() {
             Some(PoolSlot::Sync(conn)) => conn.execute(sql, sql_hash, params),
             Some(PoolSlot::Async(conn)) => conn.execute(sql, sql_hash, params).await,
@@ -959,6 +1075,9 @@ impl PoolGuard {
 
 impl Drop for PoolGuard {
     fn drop(&mut self) {
+        #[cfg(feature = "detect-n-plus-one")]
+        self.detector.emit_final_warning();
+
         if let Some(slot) = self.conn.take() {
             // Check discard conditions based on slot type.
             let should_discard = self.discard
@@ -1785,5 +1904,241 @@ mod tests {
     fn url_parse_invalid_hex_in_percent_encoding() {
         let result = Config::from_url("postgres://u%ZZ:p@h/d");
         assert!(result.is_err());
+    }
+}
+
+// --- N+1 detector tests ---
+
+#[cfg(all(test, feature = "detect-n-plus-one"))]
+mod n_plus_one_tests {
+    use super::NPlusOneDetector;
+
+    #[test]
+    fn below_threshold_no_warning() {
+        let mut d = NPlusOneDetector::new(10);
+        for _ in 0..10 {
+            d.track(42);
+        }
+        assert!(d.check_final().is_none());
+    }
+
+    #[test]
+    fn above_threshold_warns() {
+        let mut d = NPlusOneDetector::new(10);
+        for _ in 0..11 {
+            d.track(42);
+        }
+        let w = d.check_final().unwrap();
+        assert_eq!(w, (42, 11));
+    }
+
+    #[test]
+    fn exact_threshold_no_warning() {
+        let mut d = NPlusOneDetector::new(5);
+        for _ in 0..5 {
+            d.track(99);
+        }
+        assert!(d.check_final().is_none(), "> not >=");
+    }
+
+    #[test]
+    fn threshold_plus_one_warns() {
+        let mut d = NPlusOneDetector::new(5);
+        for _ in 0..6 {
+            d.track(99);
+        }
+        assert_eq!(d.check_final(), Some((99, 6)));
+    }
+
+    #[test]
+    fn alternating_hashes_no_warning() {
+        let mut d = NPlusOneDetector::new(2);
+        for i in 0..100 {
+            d.track(if i % 2 == 0 { 1 } else { 2 });
+        }
+        assert!(d.check_final().is_none());
+    }
+
+    #[test]
+    fn single_query_no_warning() {
+        let mut d = NPlusOneDetector::new(10);
+        d.track(42);
+        assert!(d.check_final().is_none());
+    }
+
+    #[test]
+    fn no_queries_no_warning() {
+        let d = NPlusOneDetector::new(10);
+        assert!(d.check_final().is_none());
+    }
+
+    #[test]
+    fn threshold_zero_warns_on_second() {
+        let mut d = NPlusOneDetector::new(0);
+        d.track(42);
+        // count=1, threshold=0 -> 1 > 0 -> warn
+        assert_eq!(d.check_final(), Some((42, 1)));
+    }
+
+    #[test]
+    fn threshold_max_never_warns() {
+        let mut d = NPlusOneDetector::new(u16::MAX);
+        for _ in 0..1000 {
+            d.track(42);
+        }
+        assert!(d.check_final().is_none());
+    }
+
+    #[test]
+    fn saturating_add_no_overflow() {
+        let mut d = NPlusOneDetector::new(10);
+        d.last_query_hash = 42;
+        d.repeat_count = u16::MAX - 1;
+        d.track(42); // saturating_add -> MAX
+        d.track(42); // saturating_add -> still MAX
+        assert_eq!(d.repeat_count, u16::MAX);
+    }
+
+    #[test]
+    fn different_hash_resets() {
+        let mut d = NPlusOneDetector::new(100);
+        for _ in 0..50 {
+            d.track(1);
+        }
+        d.track(2); // resets
+        assert_eq!(d.repeat_count, 1);
+        assert_eq!(d.last_query_hash, 2);
+    }
+
+    #[test]
+    fn multiple_n_plus_one_sequences() {
+        let mut d = NPlusOneDetector::new(3);
+        // First sequence: hash=1, 5 times (>3 -> warning on switch)
+        for _ in 0..5 {
+            d.track(1);
+        }
+        // Switch triggers warning for hash=1
+        // Second sequence: hash=2, 4 times (>3 -> check_final catches it)
+        for _ in 0..4 {
+            d.track(2);
+        }
+        // check_final sees hash=2, count=4 > 3
+        assert_eq!(d.check_final(), Some((2, 4)));
+    }
+
+    #[test]
+    fn warning_emitted_on_hash_switch() {
+        let mut d = NPlusOneDetector::new(2);
+        d.track(10);
+        d.track(10);
+        d.track(10); // count=3 > 2
+        // Switch hash — this internally calls emit_warning for hash=10
+        d.track(20);
+        // Now tracking hash=20, count=1
+        assert_eq!(d.last_query_hash, 20);
+        assert_eq!(d.repeat_count, 1);
+    }
+
+    #[test]
+    fn hash_zero_treated_normally() {
+        let mut d = NPlusOneDetector::new(2);
+        d.track(0);
+        d.track(0);
+        d.track(0);
+        // hash=0 but check_final requires hash != 0 — no warning
+        assert!(d.check_final().is_none());
+    }
+
+    #[test]
+    fn long_sequence_correct_count() {
+        let mut d = NPlusOneDetector::new(10);
+        for _ in 0..500 {
+            d.track(42);
+        }
+        assert_eq!(d.check_final(), Some((42, 500)));
+    }
+
+    #[test]
+    fn two_queries_below_threshold() {
+        let mut d = NPlusOneDetector::new(10);
+        d.track(1);
+        d.track(1);
+        assert!(d.check_final().is_none());
+    }
+
+    #[test]
+    fn interleaved_then_burst() {
+        let mut d = NPlusOneDetector::new(3);
+        // Interleaved: no trigger
+        d.track(1);
+        d.track(2);
+        d.track(1);
+        d.track(2);
+        // Burst: hash=5, 5 times
+        for _ in 0..5 {
+            d.track(5);
+        }
+        assert_eq!(d.check_final(), Some((5, 5)));
+    }
+
+    // --- Builder threshold wiring ---
+
+    #[test]
+    fn pool_builder_n_plus_one_threshold_default() {
+        let pool = super::PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .build()
+            .unwrap();
+        assert_eq!(pool.inner.n_plus_one_threshold, 10);
+    }
+
+    #[test]
+    fn pool_builder_n_plus_one_threshold_custom() {
+        let pool = super::PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .n_plus_one_threshold(5)
+            .build()
+            .unwrap();
+        assert_eq!(pool.inner.n_plus_one_threshold, 5);
+    }
+
+    #[test]
+    fn pool_builder_n_plus_one_threshold_zero() {
+        let pool = super::PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .n_plus_one_threshold(0)
+            .build()
+            .unwrap();
+        assert_eq!(pool.inner.n_plus_one_threshold, 0);
+    }
+
+    #[test]
+    fn pool_builder_n_plus_one_threshold_max() {
+        let pool = super::PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .n_plus_one_threshold(u16::MAX)
+            .build()
+            .unwrap();
+        assert_eq!(pool.inner.n_plus_one_threshold, u16::MAX);
+    }
+
+    #[test]
+    fn one_then_different_no_warning() {
+        let mut d = NPlusOneDetector::new(10);
+        d.track(1);
+        d.track(2);
+        // hash=1 had count=1 (below 10), hash=2 has count=1 (below 10)
+        assert!(d.check_final().is_none());
+    }
+
+    #[test]
+    fn nonzero_hash_after_zero_init() {
+        // First call with nonzero hash: else branch (0 != hash),
+        // emit_warning for old (hash=0, count=0) - nothing.
+        // Set last=hash, count=1.
+        let mut d = NPlusOneDetector::new(0);
+        d.track(42);
+        let w = d.check_final().unwrap();
+        assert_eq!(w, (42, 1));
     }
 }

@@ -144,7 +144,16 @@ fn fetch_explain_plan(conn: &mut Connection, parsed: &ParsedQuery) -> Option<Str
             if lines.is_empty() {
                 None
             } else {
-                Some(lines.join("\n"))
+                let plan_text = lines.join("\n");
+
+                // Analyze plan for performance warnings
+                let threshold = crate::explain::explain_threshold();
+                let warnings = crate::explain::analyze_plan(&plan_text, threshold);
+                for warning in &warnings {
+                    eprintln!("warning: [bsql] {}", warning.message);
+                }
+
+                Some(plan_text)
             }
         }
         Err(_) => None,

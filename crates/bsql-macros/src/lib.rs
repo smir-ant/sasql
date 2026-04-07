@@ -11,6 +11,8 @@ mod codegen;
 mod codegen_sqlite;
 mod connection;
 mod dynamic;
+#[cfg(feature = "explain")]
+mod explain;
 mod offline;
 mod parse;
 mod pg_enum;
