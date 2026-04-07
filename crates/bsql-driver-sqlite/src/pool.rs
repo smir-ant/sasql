@@ -38,6 +38,30 @@ use crate::codec::SqliteEncode;
 use crate::conn::{QueryResult, SqliteConnection, StreamingQuery, hash_sql};
 use crate::ffi::StmtHandle;
 
+/// Validate a savepoint name to prevent SQL injection.
+///
+/// Must be 1-63 chars, start with letter or underscore, contain only
+/// alphanumeric + underscore. This matches the bsql-core validation.
+fn validate_savepoint_name(name: &str) -> Result<(), SqliteError> {
+    if name.is_empty() || name.len() > 63 {
+        return Err(SqliteError::Internal(
+            "savepoint name must be 1-63 characters".into(),
+        ));
+    }
+    let first = name.as_bytes()[0];
+    if !first.is_ascii_alphabetic() && first != b'_' {
+        return Err(SqliteError::Internal(
+            "savepoint name must start with letter or underscore".into(),
+        ));
+    }
+    if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return Err(SqliteError::Internal(
+            "savepoint name must contain only alphanumeric characters and underscores".into(),
+        ));
+    }
+    Ok(())
+}
+
 // --- ParamValue ---
 
 /// Pre-serialized parameter for pool API compatibility.
@@ -481,19 +505,26 @@ impl SqlitePool {
     }
 
     /// Create a savepoint within the current transaction.
+    ///
+    /// Name must be a valid SQL identifier (alphanumeric + underscore, starts
+    /// with letter or underscore, max 63 chars). This is validated to prevent
+    /// SQL injection — the name is interpolated into `SAVEPOINT {name}`.
     pub fn savepoint(&self, name: &str) -> Result<(), SqliteError> {
+        validate_savepoint_name(name)?;
         let conn = self.acquire_writer()?;
         conn.exec(&format!("SAVEPOINT {name}"))
     }
 
     /// Release a savepoint.
     pub fn release_savepoint(&self, name: &str) -> Result<(), SqliteError> {
+        validate_savepoint_name(name)?;
         let conn = self.acquire_writer()?;
         conn.exec(&format!("RELEASE SAVEPOINT {name}"))
     }
 
     /// Rollback to a savepoint.
     pub fn rollback_to(&self, name: &str) -> Result<(), SqliteError> {
+        validate_savepoint_name(name)?;
         let conn = self.acquire_writer()?;
         conn.exec(&format!("ROLLBACK TO SAVEPOINT {name}"))
     }
@@ -2658,5 +2689,61 @@ mod tests {
         assert!(result.is_err());
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // --- Savepoint name validation (SQL injection prevention) ---
+
+    #[test]
+    fn savepoint_name_valid() {
+        assert!(validate_savepoint_name("sp1").is_ok());
+        assert!(validate_savepoint_name("_sp").is_ok());
+        assert!(validate_savepoint_name("my_savepoint_123").is_ok());
+        assert!(validate_savepoint_name("a").is_ok());
+        assert!(validate_savepoint_name("_").is_ok());
+    }
+
+    #[test]
+    fn savepoint_name_rejects_empty() {
+        assert!(validate_savepoint_name("").is_err());
+    }
+
+    #[test]
+    fn savepoint_name_rejects_too_long() {
+        let long = "a".repeat(64);
+        assert!(validate_savepoint_name(&long).is_err());
+    }
+
+    #[test]
+    fn savepoint_name_accepts_max_length() {
+        let max = "a".repeat(63);
+        assert!(validate_savepoint_name(&max).is_ok());
+    }
+
+    #[test]
+    fn savepoint_name_rejects_digit_start() {
+        assert!(validate_savepoint_name("1sp").is_err());
+    }
+
+    #[test]
+    fn savepoint_name_rejects_special_chars() {
+        assert!(validate_savepoint_name("sp-1").is_err());
+        assert!(validate_savepoint_name("sp.1").is_err());
+        assert!(validate_savepoint_name("sp 1").is_err());
+        assert!(validate_savepoint_name("sp;1").is_err());
+        assert!(validate_savepoint_name("sp'1").is_err());
+        assert!(validate_savepoint_name("sp\"1").is_err());
+    }
+
+    #[test]
+    fn savepoint_name_rejects_sql_injection() {
+        assert!(validate_savepoint_name("sp; DROP TABLE users").is_err());
+        assert!(validate_savepoint_name("sp'--").is_err());
+        assert!(validate_savepoint_name("sp\"; DROP TABLE t; --").is_err());
+    }
+
+    #[test]
+    fn savepoint_name_rejects_unicode() {
+        assert!(validate_savepoint_name("sp_\u{00e9}").is_err());
+        assert!(validate_savepoint_name("\u{0410}").is_err());
     }
 }
