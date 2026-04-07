@@ -168,14 +168,6 @@ impl AsyncConnection {
         conn.startup(&config).await?;
         conn.validate_server_params()?;
 
-        if config.statement_timeout_secs > 0 {
-            conn.simple_query(&format!(
-                "SET statement_timeout = '{}s'",
-                config.statement_timeout_secs
-            ))
-            .await?;
-        }
-
         Ok(conn)
     }
 
@@ -183,7 +175,20 @@ impl AsyncConnection {
 
     async fn startup(&mut self, config: &Config) -> Result<(), DriverError> {
         self.write_buf.clear();
-        proto::write_startup(&mut self.write_buf, &config.user, &config.database);
+        // Build extra startup parameters (e.g., statement_timeout) to
+        // eliminate a separate SET round-trip after authentication.
+        let timeout_str; // declared first so it outlives extra_params
+        let mut extra_params: smallvec::SmallVec<[(&str, &str); 2]> = smallvec::SmallVec::new();
+        if config.statement_timeout_secs > 0 {
+            timeout_str = format!("{}s", config.statement_timeout_secs);
+            extra_params.push(("statement_timeout", &timeout_str));
+        }
+        proto::write_startup(
+            &mut self.write_buf,
+            &config.user,
+            &config.database,
+            &extra_params,
+        );
         self.flush_write().await?;
 
         loop {

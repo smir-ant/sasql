@@ -137,8 +137,11 @@ pub fn write_message(buf: &mut Vec<u8>, msg_type: u8, payload: &[u8]) {
 }
 
 /// Startup message — no type byte: `[length: i32] [version: i32] [params...] [0x00]`
+///
+/// `extra_params` are appended as key-value pairs (e.g., `statement_timeout`).
+/// Sending them in the startup message eliminates a separate `SET` round-trip.
 #[inline]
-pub fn write_startup(buf: &mut Vec<u8>, user: &str, database: &str) {
+pub fn write_startup(buf: &mut Vec<u8>, user: &str, database: &str, extra_params: &[(&str, &str)]) {
     let start = buf.len();
     buf.extend_from_slice(&[0u8; 4]); // placeholder for length
     buf.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
@@ -150,6 +153,14 @@ pub fn write_startup(buf: &mut Vec<u8>, user: &str, database: &str) {
     buf.extend_from_slice(b"database\0");
     buf.extend_from_slice(database.as_bytes());
     buf.push(0);
+
+    // Extra startup parameters (e.g., statement_timeout)
+    for &(key, value) in extra_params {
+        buf.extend_from_slice(key.as_bytes());
+        buf.push(0);
+        buf.extend_from_slice(value.as_bytes());
+        buf.push(0);
+    }
 
     buf.push(0); // terminating zero
 
@@ -967,7 +978,7 @@ mod tests {
     #[test]
     fn startup_message_format() {
         let mut buf = Vec::new();
-        write_startup(&mut buf, "testuser", "testdb");
+        write_startup(&mut buf, "testuser", "testdb", &[]);
 
         // First 4 bytes = length
         let len = i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
@@ -980,6 +991,27 @@ mod tests {
         // Must contain user\0testuser\0database\0testdb\0\0
         let payload = &buf[8..];
         assert!(payload.starts_with(b"user\0testuser\0database\0testdb\0"));
+        assert_eq!(*buf.last().unwrap(), 0); // trailing NUL
+    }
+
+    #[test]
+    fn startup_message_with_extra_params() {
+        let mut buf = Vec::new();
+        write_startup(
+            &mut buf,
+            "testuser",
+            "testdb",
+            &[("statement_timeout", "30s")],
+        );
+
+        let len = i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        assert_eq!(len as usize, buf.len());
+
+        let payload = &buf[8..];
+        // Must contain the extra parameter
+        let payload_str = String::from_utf8_lossy(payload);
+        assert!(payload_str.contains("statement_timeout"));
+        assert!(payload_str.contains("30s"));
         assert_eq!(*buf.last().unwrap(), 0); // trailing NUL
     }
 

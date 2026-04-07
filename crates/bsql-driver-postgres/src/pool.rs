@@ -364,10 +364,10 @@ impl Pool {
 
     /// Pre-PREPARE warmup statements on a new connection.
     ///
-    /// Uses `prepare_only()` which sends Parse+Describe+Sync without
-    /// Bind+Execute — no query execution, only statement caching.
+    /// Uses `prepare_batch()` to pipeline N × (Parse+Describe) + 1 × Sync
+    /// in a single round-trip, instead of N separate round-trips.
     ///
-    /// Best-effort: errors on individual statements are silently ignored.
+    /// Best-effort: errors are silently ignored.
     /// The connection remains usable even if warmup fails.
     fn warmup_conn(&self, conn: &mut Connection) {
         let sqls = self
@@ -381,10 +381,12 @@ impl Pool {
             return;
         }
 
-        for sql in sqls.iter() {
-            let sql_hash = crate::types::hash_sql(sql);
-            let _ = conn.prepare_only(sql, sql_hash);
-        }
+        let batch: Vec<(&str, u64)> = sqls
+            .iter()
+            .map(|sql| (sql.as_ref(), crate::types::hash_sql(sql)))
+            .collect();
+
+        let _ = conn.prepare_batch(&batch);
     }
 
     /// Set the SQL statements to pre-PREPARE on new connections.

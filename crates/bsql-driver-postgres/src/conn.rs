@@ -271,13 +271,6 @@ impl Connection {
         conn.startup(&config)?;
         conn.validate_server_params()?;
 
-        if config.statement_timeout_secs > 0 {
-            conn.simple_query(&format!(
-                "SET statement_timeout = '{}s'",
-                config.statement_timeout_secs
-            ))?;
-        }
-
         Ok(conn)
     }
 
@@ -285,7 +278,20 @@ impl Connection {
 
     fn startup(&mut self, config: &Config) -> Result<(), DriverError> {
         self.write_buf.clear();
-        proto::write_startup(&mut self.write_buf, &config.user, &config.database);
+        // Build extra startup parameters (e.g., statement_timeout) to
+        // eliminate a separate SET round-trip after authentication.
+        let timeout_str; // declared first so it outlives extra_params
+        let mut extra_params: smallvec::SmallVec<[(&str, &str); 2]> = smallvec::SmallVec::new();
+        if config.statement_timeout_secs > 0 {
+            timeout_str = format!("{}s", config.statement_timeout_secs);
+            extra_params.push(("statement_timeout", &timeout_str));
+        }
+        proto::write_startup(
+            &mut self.write_buf,
+            &config.user,
+            &config.database,
+            &extra_params,
+        );
         self.flush_write()?;
 
         loop {
@@ -509,6 +515,66 @@ impl Connection {
                 bind_template: None,
             },
         );
+        Ok(())
+    }
+
+    /// Prepare multiple statements in a single pipeline round-trip.
+    ///
+    /// Sends N × (Parse + Describe) + 1 × Sync, then reads all N responses.
+    /// This is N times faster than calling `prepare_only` N times (one RTT vs N).
+    ///
+    /// Already-cached statements are skipped. If all statements are cached,
+    /// no I/O is performed.
+    pub fn prepare_batch(&mut self, sqls: &[(&str, u64)]) -> Result<(), DriverError> {
+        if sqls.is_empty() {
+            return Ok(());
+        }
+
+        // Count how many actually need preparing (not already cached).
+        let mut pending = 0usize;
+        self.write_buf.clear();
+        for &(sql, sql_hash) in sqls {
+            if self.stmts.contains_key(&sql_hash, sql) {
+                continue;
+            }
+            let name = make_stmt_name(sql_hash);
+            proto::write_parse(&mut self.write_buf, &name, sql, &[]);
+            proto::write_describe(&mut self.write_buf, b'S', &name);
+            pending += 1;
+        }
+
+        if pending == 0 {
+            return Ok(());
+        }
+
+        proto::write_sync(&mut self.write_buf);
+        self.flush_write()?;
+
+        // Read responses: for each pending statement, ParseComplete + ParameterDescription + RowDescription/NoData.
+        // Then one ReadyForQuery at the end.
+        for &(sql, sql_hash) in sqls {
+            if self.stmts.contains_key(&sql_hash, sql) {
+                continue;
+            }
+
+            self.expect_message(|m| matches!(m, BackendMessage::ParseComplete))?;
+            let columns = self.read_column_description()?;
+
+            let name = make_stmt_name(sql_hash);
+            self.query_counter += 1;
+            self.cache_stmt(
+                sql_hash,
+                StmtInfo {
+                    name,
+                    sql: sql.into(),
+                    columns,
+                    last_used: self.query_counter,
+                    bind_template: None,
+                },
+            );
+        }
+
+        self.expect_ready()?;
         Ok(())
     }
 
