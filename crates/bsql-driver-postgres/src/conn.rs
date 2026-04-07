@@ -1194,38 +1194,63 @@ impl Connection {
         self.flush_write()?;
 
         // Read N x (BindComplete + CommandComplete) + ReadyForQuery
+        // Inline stream_buf parsing — avoids read_one_message per response msg.
         let mut results = Vec::with_capacity(count);
-        for _ in 0..count {
-            self.expect_message(|m| matches!(m, BackendMessage::BindComplete))?;
 
-            let mut affected_rows: u64 = 0;
+        'outer: loop {
             loop {
-                let msg = self.read_one_message()?;
-                match msg {
-                    BackendMessage::DataRow { .. } => {}
-                    BackendMessage::CommandComplete { tag } => {
-                        affected_rows = proto::parse_command_tag(tag);
-                        break;
+                let Some((msg_type, start, end, total)) = self.peek_stream_msg()? else {
+                    break; // need more data
+                };
+
+                if msg_type == b'2' {
+                    // BindComplete — skip.
+                } else if msg_type == b'C' {
+                    // CommandComplete — parse affected rows, push result.
+                    let rows = proto::parse_command_tag_bytes(&self.stream_buf[start..end]);
+                    results.push(rows);
+                } else if msg_type == b'Z' {
+                    // ReadyForQuery — extract tx status and exit.
+                    if end > start {
+                        self.tx_status = self.stream_buf[start];
                     }
-                    BackendMessage::EmptyQuery => break,
-                    BackendMessage::NoticeResponse { .. } => {}
-                    BackendMessage::ErrorResponse { data } => {
-                        let fields = proto::parse_error_response(data);
-                        self.maybe_invalidate_stmt_cache(&fields, sql_hash);
-                        self.drain_to_ready()?;
-                        return Err(self.make_server_error(fields));
-                    }
-                    other => {
-                        return Err(DriverError::Protocol(format!(
-                            "unexpected message during execute_pipeline: {other:?}"
-                        )));
+                    self.advance_stream_msg(total);
+                    break 'outer;
+                } else if msg_type == b'I' {
+                    // EmptyQuery — push zero-row result.
+                    results.push(0);
+                } else if msg_type == b'D' || msg_type == b'N' {
+                    // DataRow / NoticeResponse — skip.
+                } else if msg_type == b'E' {
+                    // ErrorResponse — parse, invalidate cache, drain.
+                    let fields = proto::parse_error_response(&self.stream_buf[start..end]);
+                    self.maybe_invalidate_stmt_cache(&fields, sql_hash);
+                    self.advance_stream_msg(total);
+                    self.drain_to_ready()?;
+                    return Err(self.make_server_error(fields));
+                } else if msg_type == b'A' {
+                    // NotificationResponse — buffer it.
+                    let msg = proto::parse_backend_message(msg_type, &self.stream_buf[start..end])?;
+                    if let BackendMessage::NotificationResponse {
+                        pid,
+                        channel,
+                        payload,
+                    } = msg
+                    {
+                        let ch = channel.to_owned();
+                        let pl = payload.to_owned();
+                        self.buffer_notification(pid, &ch, &pl);
                     }
                 }
+                // else: ParameterStatus, etc. — skip.
+
+                self.advance_stream_msg(total);
             }
-            results.push(affected_rows);
+
+            // Need more data — compact and refill.
+            self.refill_stream_buf()?;
         }
 
-        self.expect_ready()?;
         self.shrink_buffers();
         Ok(results)
     }
@@ -1318,37 +1343,62 @@ impl Connection {
         self.stream.write_all(buf).map_err(DriverError::Io)?;
         buf.clear();
 
+        // Inline stream_buf parsing — avoids read_one_message per response msg.
         let mut results = Vec::with_capacity(count);
-        for _ in 0..count {
-            self.expect_message(|m| matches!(m, BackendMessage::BindComplete))?;
 
-            let mut affected_rows: u64 = 0;
+        'outer: loop {
             loop {
-                let msg = self.read_one_message()?;
-                match msg {
-                    BackendMessage::DataRow { .. } => {}
-                    BackendMessage::CommandComplete { tag } => {
-                        affected_rows = proto::parse_command_tag(tag);
-                        break;
+                let Some((msg_type, start, end, total)) = self.peek_stream_msg()? else {
+                    break; // need more data
+                };
+
+                if msg_type == b'2' {
+                    // BindComplete — skip.
+                } else if msg_type == b'C' {
+                    // CommandComplete — parse affected rows, push result.
+                    let rows = proto::parse_command_tag_bytes(&self.stream_buf[start..end]);
+                    results.push(rows);
+                } else if msg_type == b'Z' {
+                    // ReadyForQuery — extract tx status and exit.
+                    if end > start {
+                        self.tx_status = self.stream_buf[start];
                     }
-                    BackendMessage::EmptyQuery => break,
-                    BackendMessage::NoticeResponse { .. } => {}
-                    BackendMessage::ErrorResponse { data } => {
-                        let fields = proto::parse_error_response(data);
-                        self.drain_to_ready()?;
-                        return Err(self.make_server_error(fields));
-                    }
-                    other => {
-                        return Err(DriverError::Protocol(format!(
-                            "unexpected message during flush_deferred_pipeline: {other:?}"
-                        )));
+                    self.advance_stream_msg(total);
+                    break 'outer;
+                } else if msg_type == b'I' {
+                    // EmptyQuery — push zero-row result.
+                    results.push(0);
+                } else if msg_type == b'D' || msg_type == b'N' {
+                    // DataRow / NoticeResponse — skip.
+                } else if msg_type == b'E' {
+                    // ErrorResponse — parse, drain.
+                    let fields = proto::parse_error_response(&self.stream_buf[start..end]);
+                    self.advance_stream_msg(total);
+                    self.drain_to_ready()?;
+                    return Err(self.make_server_error(fields));
+                } else if msg_type == b'A' {
+                    // NotificationResponse — buffer it.
+                    let msg = proto::parse_backend_message(msg_type, &self.stream_buf[start..end])?;
+                    if let BackendMessage::NotificationResponse {
+                        pid,
+                        channel,
+                        payload,
+                    } = msg
+                    {
+                        let ch = channel.to_owned();
+                        let pl = payload.to_owned();
+                        self.buffer_notification(pid, &ch, &pl);
                     }
                 }
+                // else: ParameterStatus, etc. — skip.
+
+                self.advance_stream_msg(total);
             }
-            results.push(affected_rows);
+
+            // Need more data — compact and refill.
+            self.refill_stream_buf()?;
         }
 
-        self.expect_ready()?;
         self.shrink_buffers();
         Ok(results)
     }
@@ -2920,6 +2970,56 @@ impl Connection {
             _ => {} // NoticeResponse, ParameterStatus — skip
         }
         Ok(())
+    }
+
+    /// Peek at the next complete message in stream_buf without consuming it.
+    ///
+    /// Returns `Some((msg_type, payload_start, payload_end, total_msg_len))`
+    /// if a complete message is available. Returns `None` if the buffer needs
+    /// more data (either partial message or empty). Returns `Err` for protocol
+    /// violations (negative length).
+    #[inline(always)]
+    fn peek_stream_msg(&self) -> Result<Option<(u8, usize, usize, usize)>, DriverError> {
+        let avail = self.stream_buf_end - self.stream_buf_pos;
+        if avail < 5 {
+            return Ok(None);
+        }
+
+        let msg_type = self.stream_buf[self.stream_buf_pos];
+        let raw_len = i32::from_be_bytes([
+            self.stream_buf[self.stream_buf_pos + 1],
+            self.stream_buf[self.stream_buf_pos + 2],
+            self.stream_buf[self.stream_buf_pos + 3],
+            self.stream_buf[self.stream_buf_pos + 4],
+        ]);
+
+        if raw_len < 4 {
+            return Err(DriverError::Protocol(format!(
+                "invalid message length {raw_len} for type '{}'",
+                msg_type as char
+            )));
+        }
+
+        let payload_len = (raw_len - 4) as usize;
+        let total_msg_len = 5 + payload_len;
+
+        if avail < total_msg_len {
+            return Ok(None);
+        }
+
+        let payload_start = self.stream_buf_pos + 5;
+        Ok(Some((
+            msg_type,
+            payload_start,
+            payload_start + payload_len,
+            total_msg_len,
+        )))
+    }
+
+    /// Advance stream_buf position past the current message.
+    #[inline(always)]
+    fn advance_stream_msg(&mut self, total_msg_len: usize) {
+        self.stream_buf_pos += total_msg_len;
     }
 
     /// Read one backend message, auto-buffering notifications.
