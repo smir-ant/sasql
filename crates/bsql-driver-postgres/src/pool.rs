@@ -2151,4 +2151,134 @@ mod n_plus_one_tests {
         let w = d.check_final().unwrap();
         assert_eq!(w, (42, 1));
     }
+
+    #[test]
+    fn independent_detectors_dont_interfere() {
+        // Each PoolGuard has its own detector -- verify independence
+        let mut d1 = NPlusOneDetector::new(5);
+        let mut d2 = NPlusOneDetector::new(5);
+
+        // d1 gets N+1 pattern
+        for _ in 0..10 {
+            d1.track(42);
+        }
+        // d2 gets different pattern
+        d2.track(1);
+        d2.track(2);
+        d2.track(3);
+
+        // d1 should warn, d2 should not
+        assert!(d1.check_final().is_some());
+        assert!(d2.check_final().is_none());
+    }
+
+    #[test]
+    fn rapid_hash_changes_dont_false_positive() {
+        // Rapid switching between many different hashes should never trigger
+        let mut d = NPlusOneDetector::new(2);
+        for i in 0u64..1000 {
+            d.track(i);
+        }
+        // Final hash (999) was only tracked once
+        assert!(d.check_final().is_none());
+    }
+
+    #[test]
+    fn detector_reset_state_after_warning() {
+        // After a sequence triggers, the next sequence starts fresh
+        let mut d = NPlusOneDetector::new(2);
+        d.track(1);
+        d.track(1);
+        d.track(1); // count=3 > 2, would warn on switch
+        d.track(2); // switch triggers warning for hash=1, resets to hash=2, count=1
+        d.track(2); // count=2, not > 2
+        assert!(d.check_final().is_none()); // hash=2, count=2, not > threshold=2
+    }
+
+    #[test]
+    fn detector_with_realistic_orm_pattern() {
+        // Simulate: fetch users, then for each user fetch orders (N+1)
+        let mut d = NPlusOneDetector::new(5);
+        d.track(100); // SELECT * FROM users
+        // N+1 pattern: same query per user
+        for _ in 0..20 {
+            d.track(200); // SELECT * FROM orders WHERE user_id = ?
+        }
+        // Should detect the orders query
+        assert_eq!(d.check_final(), Some((200, 20)));
+    }
+
+    #[test]
+    fn detector_with_legitimate_batch_pattern() {
+        // Legitimate: different params but same prepared statement hash
+        // This IS an N+1 and SHOULD be detected
+        let mut d = NPlusOneDetector::new(10);
+        for _ in 0..15 {
+            d.track(300); // same sql_hash, different params (detector doesn't see params)
+        }
+        assert!(d.check_final().is_some());
+    }
+
+    #[test]
+    fn detector_exactly_at_boundaries() {
+        for threshold in [0u16, 1, 2, 5, 10, 100] {
+            let mut d = NPlusOneDetector::new(threshold);
+            for _ in 0..=threshold {
+                d.track(42);
+            }
+            // count == threshold + 1, should warn (> not >=)
+            assert!(
+                d.check_final().is_some(),
+                "threshold={threshold} should warn at count={}",
+                threshold + 1
+            );
+        }
+    }
+
+    #[test]
+    fn detector_with_deterministic_random_sequences() {
+        // Deterministic "random" hash sequences
+        let mut d = NPlusOneDetector::new(5);
+        let hashes: Vec<u64> = (0..100).map(|i| ((i * 7 + 3) % 4) as u64).collect();
+        for &h in &hashes {
+            d.track(h);
+        }
+        // Should not panic, result depends on sequence
+        let _ = d.check_final();
+    }
+
+    mod proptest_fuzz {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn detector_never_panics(
+                hashes in proptest::collection::vec(0u64..100, 0..500),
+                threshold in 0u16..100,
+            ) {
+                let mut d = NPlusOneDetector::new(threshold);
+                for h in &hashes {
+                    d.track(*h);
+                }
+                let _ = d.check_final();
+            }
+
+            #[test]
+            fn sequential_repeats_always_detected(
+                hash in 1u64..u64::MAX,
+                count in 2u16..1000,
+                threshold in 0u16..100,
+            ) {
+                let mut d = NPlusOneDetector::new(threshold);
+                for _ in 0..count {
+                    d.track(hash);
+                }
+                if count > threshold {
+                    assert!(d.check_final().is_some(),
+                        "count={count} > threshold={threshold} should trigger");
+                }
+            }
+        }
+    }
 }

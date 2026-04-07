@@ -154,6 +154,7 @@ pub trait Executor {
 /// `block_in_place`, no `Handle::current().block_on()`. The tokio scheduler
 /// can run other tasks while this connection waits for PostgreSQL.
 #[cfg(feature = "async")]
+#[allow(clippy::manual_async_fn)] // Intentional: RPITIT gives us + Send bound that async fn doesn't
 impl Executor for Pool {
     #[inline]
     fn query_raw<'a>(
@@ -258,6 +259,7 @@ impl Executor for Pool {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "async")]
+#[allow(clippy::manual_async_fn)]
 impl Executor for PoolConnection {
     #[inline]
     fn query_raw<'a>(
@@ -346,6 +348,7 @@ impl Executor for PoolConnection {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "async")]
+#[allow(clippy::manual_async_fn)]
 impl Executor for Transaction {
     fn query_raw<'a>(
         &'a self,
@@ -577,5 +580,50 @@ mod tests {
         let result = QueryResult::from_parts(vec![], 0, cols, 0);
         let owned = OwnedResult::without_arena(result);
         drop(owned); // Must not panic — arena is Arena::empty()
+    }
+
+    // --- Pool / PoolConnection / Transaction Send+Sync constraints ---
+
+    #[test]
+    fn pool_is_send_and_sync() {
+        fn _assert_send<T: Send>() {}
+        fn _assert_sync<T: Sync>() {}
+        _assert_send::<crate::pool::Pool>();
+        _assert_sync::<crate::pool::Pool>();
+    }
+
+    #[test]
+    fn pool_connection_is_send_and_sync() {
+        fn _assert_send<T: Send>() {}
+        fn _assert_sync<T: Sync>() {}
+        _assert_send::<crate::pool::PoolConnection>();
+        _assert_sync::<crate::pool::PoolConnection>();
+    }
+
+    #[test]
+    fn transaction_is_send_and_sync() {
+        fn _assert_send<T: Send>() {}
+        fn _assert_sync<T: Sync>() {}
+        _assert_send::<crate::transaction::Transaction>();
+        _assert_sync::<crate::transaction::Transaction>();
+    }
+
+    #[test]
+    fn owned_result_is_send_and_sync() {
+        fn _assert_send<T: Send>() {}
+        fn _assert_sync<T: Sync>() {}
+        _assert_send::<OwnedResult>();
+        _assert_sync::<OwnedResult>();
+    }
+
+    #[cfg(feature = "async")]
+    #[test]
+    fn executor_trait_requires_send_sync() {
+        // Verify that the async Executor trait has Send + Sync bounds.
+        // This is a compile-time test: if it compiles, the constraint holds.
+        fn _check_executor_bounds<E: Executor>() {
+            fn _assert_send_sync<T: Send + Sync>() {}
+            _assert_send_sync::<E>();
+        }
     }
 }

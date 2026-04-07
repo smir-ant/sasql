@@ -233,6 +233,7 @@ dependencies = [
  "libsqlite3-sys",
  "log",
  "proc-macro2",
+ "proptest",
  "quote",
  "smallvec",
  "syn 2.0.117",

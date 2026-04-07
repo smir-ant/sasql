@@ -402,4 +402,59 @@ Sort  (cost=100.00..110.00 rows=100 width=36)
         let warnings = analyze_plan(plan, 0);
         assert_eq!(warnings.len(), 1); // 1 > 0
     }
+
+    mod proptest_fuzz {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn analyze_plan_never_panics(plan in ".*") {
+                // Any arbitrary string should not panic
+                let _ = analyze_plan(&plan, 1000);
+            }
+
+            #[test]
+            fn analyze_plan_never_panics_with_seq_scan_like(
+                table in "[a-z_]{1,30}",
+                rows in 0u64..1_000_000,
+                cost in 0.0f64..100000.0,
+            ) {
+                let plan = format!("Seq Scan on {table}  (cost=0.00..{cost:.2} rows={rows} width=36)");
+                let warnings = analyze_plan(&plan, 1000);
+                // If rows > 1000, should have exactly 1 warning
+                if rows > 1000 {
+                    assert_eq!(warnings.len(), 1);
+                }
+            }
+
+            #[test]
+            fn parse_rows_estimate_never_panics(s in ".*") {
+                let _ = parse_rows_estimate(&s);
+            }
+
+            #[test]
+            fn parse_table_name_never_panics(s in ".*") {
+                let _ = parse_table_name(&s);
+            }
+
+            #[test]
+            fn threshold_zero_always_warns_on_seq_scan(
+                table in "[a-z]{1,20}",
+                rows in 1u64..1_000_000,
+            ) {
+                let plan = format!("Seq Scan on {table}  (cost=0.00..10.00 rows={rows} width=4)");
+                let warnings = analyze_plan(&plan, 0);
+                assert!(!warnings.is_empty(), "threshold 0 should warn on rows={rows}");
+            }
+
+            #[test]
+            fn analyze_plan_idempotent(plan in ".{0,200}") {
+                // Running twice on same input should give same result
+                let w1 = analyze_plan(&plan, 500);
+                let w2 = analyze_plan(&plan, 500);
+                assert_eq!(w1.len(), w2.len());
+            }
+        }
+    }
 }

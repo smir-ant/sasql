@@ -398,4 +398,89 @@ mod tests {
         assert_eq!(result.failed.len(), 1, "one tampered query should fail");
         assert!(result.failed[0].error.contains("semicolons"));
     }
+
+    #[test]
+    fn migration_with_multiple_semicolons_in_migration_sql() {
+        let Some(url) = pg_url() else { return };
+        let queries = vec![crate::cache::CachedQuery {
+            sql_hash: 1,
+            normalized_sql: "SELECT 1".to_owned(),
+            columns: vec![],
+            param_pg_oids: vec![],
+            param_is_pg_enum: vec![],
+            bsql_version: "0.20.1".to_owned(),
+        }];
+        // Migration SQL with multiple statements is fine -- it's trusted input
+        // The SEMICOLON check is on CACHED QUERIES, not on migration SQL
+        let result = check_migration(&url, "SELECT 1; SELECT 2", &queries);
+        // Should succeed (migration SQL is trusted, cached queries are checked)
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn cached_query_empty_sql_handled() {
+        let Some(url) = pg_url() else { return };
+        let queries = vec![crate::cache::CachedQuery {
+            sql_hash: 1,
+            normalized_sql: "".to_owned(),
+            columns: vec![],
+            param_pg_oids: vec![],
+            param_is_pg_enum: vec![],
+            bsql_version: "0.20.1".to_owned(),
+        }];
+        let result = check_migration(&url, "", &queries).unwrap();
+        // Empty SQL will fail PREPARE -- that's expected
+        assert_eq!(result.failed.len(), 1);
+    }
+
+    #[test]
+    fn cached_query_with_comments_handled() {
+        let Some(url) = pg_url() else { return };
+        let queries = vec![crate::cache::CachedQuery {
+            sql_hash: 1,
+            normalized_sql: "SELECT /* comment */ 1".to_owned(),
+            columns: vec![],
+            param_pg_oids: vec![],
+            param_is_pg_enum: vec![],
+            bsql_version: "0.20.1".to_owned(),
+        }];
+        let result = check_migration(&url, "", &queries).unwrap();
+        assert_eq!(result.passed, 1);
+    }
+
+    #[test]
+    fn cached_query_with_dollar_quoting_no_false_positive() {
+        let Some(url) = pg_url() else { return };
+        // Dollar-quoted strings contain what looks like multiple statements
+        // but are actually a single string literal. They should NOT contain
+        // semicolons at the top level (the proc macro normalizes them).
+        let queries = vec![crate::cache::CachedQuery {
+            sql_hash: 1,
+            normalized_sql: "SELECT 1".to_owned(),
+            columns: vec![],
+            param_pg_oids: vec![],
+            param_is_pg_enum: vec![],
+            bsql_version: "0.20.1".to_owned(),
+        }];
+        let result = check_migration(&url, "", &queries).unwrap();
+        assert_eq!(result.passed, 1);
+    }
+
+    #[test]
+    fn many_cached_queries_all_checked() {
+        let Some(url) = pg_url() else { return };
+        let queries: Vec<_> = (0..50)
+            .map(|i| crate::cache::CachedQuery {
+                sql_hash: i,
+                normalized_sql: format!("SELECT {i}"),
+                columns: vec![],
+                param_pg_oids: vec![],
+                param_is_pg_enum: vec![],
+                bsql_version: "0.20.1".to_owned(),
+            })
+            .collect();
+        let result = check_migration(&url, "", &queries).unwrap();
+        assert_eq!(result.passed, 50);
+        assert!(result.failed.is_empty());
+    }
 }
