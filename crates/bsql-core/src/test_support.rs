@@ -102,7 +102,7 @@ pub async fn setup_test_schema(fixtures_sql: &[&str]) -> Result<TestContext, Bsq
     let warmup_sql = format!("SET search_path TO \"{}\", public", schema_name);
     // set_warmup_sqls copies strings internally (into Box<str>), so &str
     // only needs to live for the duration of this call. No leak needed.
-    pool.set_warmup_sqls(&[&warmup_sql]);
+    pool.set_warmup_sqls([warmup_sql]);
 
     Ok(TestContext {
         pool,

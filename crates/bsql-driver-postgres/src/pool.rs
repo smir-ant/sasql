@@ -403,16 +403,20 @@ impl Pool {
     /// ```no_run
     /// # fn example() -> Result<(), bsql_driver_postgres::DriverError> {
     /// let pool = bsql_driver_postgres::Pool::connect("postgres://user:pass@localhost/db")?;
-    /// pool.set_warmup_sqls(&[
+    /// pool.set_warmup_sqls([
     ///     "SELECT id, name FROM users WHERE id = $1::int4",
     ///     "SELECT id, title FROM tickets WHERE status = ANY($1::text[])",
     /// ]);
     /// # Ok(())
     /// # }
     /// ```
-    pub fn set_warmup_sqls(&self, sqls: &[&str]) {
-        let boxed: Arc<Vec<Box<str>>> =
-            Arc::new(sqls.iter().map(|s| (*s).into()).collect::<Vec<_>>());
+    /// Set SQL statements to pre-PREPARE on new connections.
+    ///
+    /// Accepts any iterator of items convertible to `Box<str>`:
+    /// - `["SELECT 1", "SELECT 2"]` — static &str, copied into Box
+    /// - `[format!("SET search_path TO {}", name)]` — String, zero-copy move
+    pub fn set_warmup_sqls<S: Into<Box<str>>>(&self, sqls: impl IntoIterator<Item = S>) {
+        let boxed: Arc<Vec<Box<str>>> = Arc::new(sqls.into_iter().map(Into::into).collect());
         *self
             .inner
             .warmup_sqls
@@ -1788,7 +1792,7 @@ mod tests {
     #[test]
     fn pool_set_warmup_sqls_empty() {
         let pool = Pool::connect("postgres://user:pass@localhost/db").unwrap();
-        pool.set_warmup_sqls(&[]);
+        pool.set_warmup_sqls([] as [&str; 0]);
         let sqls = pool
             .inner
             .warmup_sqls
@@ -1801,7 +1805,7 @@ mod tests {
     #[test]
     fn pool_set_warmup_sqls_multiple() {
         let pool = Pool::connect("postgres://user:pass@localhost/db").unwrap();
-        pool.set_warmup_sqls(&["SELECT 1", "SELECT 2", "SELECT 3"]);
+        pool.set_warmup_sqls(["SELECT 1", "SELECT 2", "SELECT 3"]);
         let sqls = pool
             .inner
             .warmup_sqls
@@ -1817,8 +1821,8 @@ mod tests {
     #[test]
     fn pool_set_warmup_sqls_overwrite() {
         let pool = Pool::connect("postgres://user:pass@localhost/db").unwrap();
-        pool.set_warmup_sqls(&["SELECT 1"]);
-        pool.set_warmup_sqls(&["SELECT 99"]);
+        pool.set_warmup_sqls(["SELECT 1"]);
+        pool.set_warmup_sqls(["SELECT 99"]);
         let sqls = pool
             .inner
             .warmup_sqls

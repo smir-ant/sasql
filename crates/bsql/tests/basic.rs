@@ -490,7 +490,7 @@ async fn error_display_format() {
 #[tokio::test]
 async fn warmup_prepares_statements() {
     let pool = pool().await;
-    pool.set_warmup_sqls(&["SELECT id, login FROM users WHERE id = $1::int4"]);
+    pool.set_warmup_sqls(["SELECT id, login FROM users WHERE id = $1::int4"]);
     // Acquire forces warmup on the new connection -- the statement is prepared
     // via Parse+Describe+Sync (no Bind+Execute). Subsequent queries using the
     // same SQL skip the Parse round-trip because the statement is already cached.

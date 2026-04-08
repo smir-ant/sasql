@@ -340,7 +340,7 @@ impl Pool {
     ///
     /// Warmup errors are silently ignored — a bad warmup SQL does not prevent
     /// the connection from being usable.
-    pub fn set_warmup_sqls(&self, sqls: &[&str]) {
+    pub fn set_warmup_sqls<S: Into<Box<str>>>(&self, sqls: impl IntoIterator<Item = S>) {
         self.inner.set_warmup_sqls(sqls);
     }
 
