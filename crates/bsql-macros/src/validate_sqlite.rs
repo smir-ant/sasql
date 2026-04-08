@@ -779,4 +779,165 @@ mod tests {
         drop(conn);
         let _ = std::fs::remove_file(&path);
     }
+
+    // --- pg_to_sqlite_params: WHERE column = ?1 ---
+
+    #[test]
+    fn convert_where_equals() {
+        assert_eq!(
+            pg_to_sqlite_params("SELECT * FROM t WHERE col = $1"),
+            "SELECT * FROM t WHERE col = ?1"
+        );
+    }
+
+    // --- pg_to_sqlite_params: INSERT INTO t (col) VALUES (?1) ---
+
+    #[test]
+    fn convert_insert_values() {
+        assert_eq!(
+            pg_to_sqlite_params("INSERT INTO t (col) VALUES ($1)"),
+            "INSERT INTO t (col) VALUES (?1)"
+        );
+    }
+
+    // --- pg_to_sqlite_params: UPDATE t SET col = ?1 ---
+
+    #[test]
+    fn convert_update_set() {
+        assert_eq!(
+            pg_to_sqlite_params("UPDATE t SET col = $1 WHERE id = $2"),
+            "UPDATE t SET col = ?1 WHERE id = ?2"
+        );
+    }
+
+    // --- validate_query_sqlite: NULL column (all nullable) ---
+
+    #[test]
+    fn validate_all_nullable_columns() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (a TEXT, b INTEGER, c REAL)")
+            .unwrap();
+
+        let parsed = crate::parse::parse_query("SELECT a, b, c FROM t").unwrap();
+        let result = validate_query_sqlite(&parsed, &mut conn).unwrap();
+
+        assert_eq!(result.columns.len(), 3);
+        assert!(result.columns[0].is_nullable);
+        assert!(result.columns[1].is_nullable);
+        assert!(result.columns[2].is_nullable);
+        assert_eq!(result.columns[0].rust_type, "Option<String>");
+        assert_eq!(result.columns[1].rust_type, "Option<i64>");
+        assert_eq!(result.columns[2].rust_type, "Option<f64>");
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- validate_query_sqlite: empty table (0 rows) ---
+
+    #[test]
+    fn validate_empty_table() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER NOT NULL)").unwrap();
+
+        let parsed = crate::parse::parse_query("SELECT id FROM t").unwrap();
+        let result = validate_query_sqlite(&parsed, &mut conn).unwrap();
+
+        assert_eq!(result.columns.len(), 1);
+        assert_eq!(result.columns[0].name, "id");
+        assert!(!result.columns[0].is_nullable);
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- validate_query_sqlite: single row select ---
+
+    #[test]
+    fn validate_select_literal() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+
+        let parsed = crate::parse::parse_query("SELECT 1 AS one").unwrap();
+        let result = validate_query_sqlite(&parsed, &mut conn).unwrap();
+
+        assert_eq!(result.columns.len(), 1);
+        assert_eq!(result.columns[0].name, "one");
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- pg_to_sqlite_params: dollar sign followed by letter (not converted) ---
+
+    #[test]
+    fn convert_dollar_followed_by_letter_unchanged() {
+        assert_eq!(
+            pg_to_sqlite_params("SELECT $abc FROM t"),
+            "SELECT $abc FROM t"
+        );
+    }
+
+    // --- pg_to_sqlite_params: only dollar sign ---
+
+    #[test]
+    fn convert_lone_dollar_unchanged() {
+        assert_eq!(pg_to_sqlite_params("$"), "$");
+    }
+
+    // --- validate_query_sqlite: aggregate columns ---
+
+    #[test]
+    fn validate_count_star() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER NOT NULL)").unwrap();
+
+        let parsed = crate::parse::parse_query("SELECT COUNT(*) AS cnt FROM t").unwrap();
+        let result = validate_query_sqlite(&parsed, &mut conn).unwrap();
+
+        assert_eq!(result.columns.len(), 1);
+        assert_eq!(result.columns[0].name, "cnt");
+        // COUNT(*) in SQLite is computed — marked nullable by default (safe)
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- validate_query_sqlite: table with no matching column ---
+
+    #[test]
+    fn validate_wrong_column_name() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER NOT NULL)").unwrap();
+
+        let parsed = crate::parse::parse_query("SELECT nonexistent FROM t").unwrap();
+        let result = validate_query_sqlite(&parsed, &mut conn);
+        assert!(result.is_err(), "nonexistent column should fail");
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- validate_variants_sqlite: single variant ---
+
+    #[test]
+    fn validate_single_variant() {
+        let path = temp_db_path();
+        let mut conn = SqliteConnection::open(&path).unwrap();
+        conn.exec("CREATE TABLE t (id INTEGER NOT NULL)").unwrap();
+
+        let parsed = crate::parse::parse_query("SELECT id FROM t WHERE id = $id: i64").unwrap();
+        let variants = crate::dynamic::expand_variants(&parsed).unwrap();
+        assert_eq!(variants.len(), 1);
+
+        let result = validate_variants_sqlite(&variants, &parsed, &mut conn).unwrap();
+        assert_eq!(result.columns.len(), 1);
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
 }

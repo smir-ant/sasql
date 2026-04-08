@@ -517,4 +517,107 @@ mod tests {
             unimplemented!()
         }
     }
+
+    // --- OwnedResult affected_rows on without_arena variant ---
+
+    #[test]
+    fn owned_result_without_arena_affected_rows() {
+        let cols: Arc<[ColumnDesc]> = Arc::from(Vec::new());
+        let result = QueryResult::from_parts(vec![], 0, cols, 42);
+        let owned = OwnedResult::without_arena(result);
+        assert_eq!(owned.result.affected_rows(), 42);
+    }
+
+    #[test]
+    fn owned_result_without_arena_affected_rows_zero() {
+        let cols: Arc<[ColumnDesc]> = Arc::from(Vec::new());
+        let result = QueryResult::from_parts(vec![], 0, cols, 0);
+        let owned = OwnedResult::without_arena(result);
+        assert_eq!(owned.result.affected_rows(), 0);
+    }
+
+    // --- OwnedResult iter yields correct rows ---
+
+    #[test]
+    fn owned_result_iter_yields_all_rows() {
+        let owned = make_owned_result(3, 1);
+        let rows: Vec<_> = owned.iter().collect();
+        assert_eq!(rows.len(), 3);
+    }
+
+    // --- OwnedResult Debug format with 0 rows ---
+
+    #[test]
+    fn owned_result_debug_format_zero_rows() {
+        let owned = make_owned_result(0, 2);
+        let dbg = format!("{owned:?}");
+        assert!(dbg.contains("OwnedResult"), "should contain name: {dbg}");
+        assert!(dbg.contains("0"), "should contain 0: {dbg}");
+    }
+
+    // --- OwnedResult row panics for empty result ---
+
+    #[test]
+    #[should_panic]
+    fn owned_result_row_panics_on_empty() {
+        let owned = make_owned_result(0, 1);
+        let _r = owned.row(0);
+    }
+
+    // --- QueryTarget variant discrimination ---
+
+    #[test]
+    fn query_target_pool_variant_matches() {
+        fn _check_pool<'a>(pool: &'a Pool) {
+            let qt: QueryTarget<'a> = pool.into();
+            assert!(matches!(qt, QueryTarget::Pool(_)));
+        }
+    }
+
+    #[test]
+    fn query_target_conn_variant_matches() {
+        fn _check_conn<'a>(conn: &'a mut PoolConnection) {
+            let qt: QueryTarget<'a> = conn.into();
+            assert!(matches!(qt, QueryTarget::Conn(_)));
+        }
+    }
+
+    #[test]
+    fn query_target_tx_variant_matches() {
+        fn _check_tx<'a>(tx: &'a mut Transaction) {
+            let qt: QueryTarget<'a> = tx.into();
+            assert!(matches!(qt, QueryTarget::Tx(_)));
+        }
+    }
+
+    // --- OwnedResult large row count ---
+
+    #[test]
+    fn owned_result_large_row_count() {
+        let owned = make_owned_result(1000, 2);
+        assert_eq!(owned.len(), 1000);
+        assert!(!owned.is_empty());
+        assert_eq!(owned.iter().count(), 1000);
+    }
+
+    // --- OwnedResult single column ---
+
+    #[test]
+    fn owned_result_single_column_row_access() {
+        let owned = make_owned_result(2, 1);
+        let _r0 = owned.row(0);
+        let _r1 = owned.row(1);
+        assert_eq!(owned.len(), 2);
+    }
+
+    // --- Multiple drops don't panic ---
+
+    #[test]
+    fn owned_result_drop_twice_via_option() {
+        let owned = make_owned_result(1, 1);
+        let mut opt = Some(owned);
+        opt.take(); // first drop
+                    // second drop on None — should not panic
+        drop(opt);
+    }
 }

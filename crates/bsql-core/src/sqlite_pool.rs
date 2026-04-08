@@ -1006,4 +1006,391 @@ mod tests {
     // SqliteTransaction is NOT Send (holds Arc to pool with Mutex<SqliteConnection>
     // which is !Send due to raw FFI pointers), but it IS usable from a single thread.
     // We do NOT assert Send/Sync for SqliteTransaction — it is intentionally !Send.
+
+    // --- Nested savepoints (3+ levels) ---
+
+    #[test]
+    fn transaction_nested_savepoints_three_levels() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+            .unwrap();
+
+        let tx = pool.begin().unwrap();
+        // Insert row at transaction level
+        tx.execute_sql(
+            "INSERT INTO t VALUES (?1)",
+            crate::rapid_hash_str("INSERT INTO t VALUES (?1)"),
+            smallvec::smallvec![bsql_driver_sqlite::pool::ParamValue::Int(1)],
+        )
+        .unwrap();
+
+        // Level 1 savepoint
+        tx.savepoint("sp1").unwrap();
+        tx.execute_sql(
+            "INSERT INTO t VALUES (?1)",
+            crate::rapid_hash_str("INSERT INTO t VALUES (?1)"),
+            smallvec::smallvec![bsql_driver_sqlite::pool::ParamValue::Int(2)],
+        )
+        .unwrap();
+
+        // Level 2 savepoint
+        tx.savepoint("sp2").unwrap();
+        tx.execute_sql(
+            "INSERT INTO t VALUES (?1)",
+            crate::rapid_hash_str("INSERT INTO t VALUES (?1)"),
+            smallvec::smallvec![bsql_driver_sqlite::pool::ParamValue::Int(3)],
+        )
+        .unwrap();
+
+        // Level 3 savepoint
+        tx.savepoint("sp3").unwrap();
+        tx.execute_sql(
+            "INSERT INTO t VALUES (?1)",
+            crate::rapid_hash_str("INSERT INTO t VALUES (?1)"),
+            smallvec::smallvec![bsql_driver_sqlite::pool::ParamValue::Int(4)],
+        )
+        .unwrap();
+
+        // Rollback to sp2 (undoes sp3 insert and sp2 insert)
+        tx.rollback_to("sp2").unwrap();
+        tx.commit().unwrap();
+
+        let sql = "SELECT id FROM t ORDER BY id";
+        let hash = crate::rapid_hash_str(sql);
+        let (result, arena) = pool
+            .query_readonly(sql, hash, smallvec::SmallVec::new())
+            .unwrap();
+        // Only rows 1 and 2 should survive (sp2 rollback undoes id=3 and id=4)
+        assert_eq!(result.len(), 2);
+        assert_eq!(result.get_i64(0, 0, &arena), Some(1));
+        assert_eq!(result.get_i64(1, 0, &arena), Some(2));
+
+        pool.close();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- Savepoint with same name twice ---
+
+    #[test]
+    fn transaction_savepoint_same_name_twice() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+            .unwrap();
+
+        let tx = pool.begin().unwrap();
+        tx.execute_sql(
+            "INSERT INTO t VALUES (?1)",
+            crate::rapid_hash_str("INSERT INTO t VALUES (?1)"),
+            smallvec::smallvec![bsql_driver_sqlite::pool::ParamValue::Int(1)],
+        )
+        .unwrap();
+
+        tx.savepoint("sp1").unwrap();
+        tx.execute_sql(
+            "INSERT INTO t VALUES (?1)",
+            crate::rapid_hash_str("INSERT INTO t VALUES (?1)"),
+            smallvec::smallvec![bsql_driver_sqlite::pool::ParamValue::Int(2)],
+        )
+        .unwrap();
+
+        // Second savepoint with same name overwrites the first
+        tx.savepoint("sp1").unwrap();
+        tx.execute_sql(
+            "INSERT INTO t VALUES (?1)",
+            crate::rapid_hash_str("INSERT INTO t VALUES (?1)"),
+            smallvec::smallvec![bsql_driver_sqlite::pool::ParamValue::Int(3)],
+        )
+        .unwrap();
+
+        // Rolling back to sp1 should undo id=3 but keep id=2
+        tx.rollback_to("sp1").unwrap();
+        tx.commit().unwrap();
+
+        let sql = "SELECT id FROM t ORDER BY id";
+        let hash = crate::rapid_hash_str(sql);
+        let (result, arena) = pool
+            .query_readonly(sql, hash, smallvec::SmallVec::new())
+            .unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result.get_i64(0, 0, &arena), Some(1));
+        assert_eq!(result.get_i64(1, 0, &arena), Some(2));
+
+        pool.close();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- Release savepoint ---
+
+    #[test]
+    fn transaction_release_savepoint() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+            .unwrap();
+
+        let tx = pool.begin().unwrap();
+        tx.savepoint("sp1").unwrap();
+        tx.execute_sql(
+            "INSERT INTO t VALUES (?1)",
+            crate::rapid_hash_str("INSERT INTO t VALUES (?1)"),
+            smallvec::smallvec![bsql_driver_sqlite::pool::ParamValue::Int(1)],
+        )
+        .unwrap();
+
+        // Release keeps the changes
+        tx.release_savepoint("sp1").unwrap();
+        tx.commit().unwrap();
+
+        let sql = "SELECT id FROM t";
+        let hash = crate::rapid_hash_str(sql);
+        let (result, _arena) = pool
+            .query_readonly(sql, hash, smallvec::SmallVec::new())
+            .unwrap();
+        assert_eq!(result.len(), 1);
+
+        pool.close();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- SqlitePool warmup ---
+
+    #[test]
+    fn sqlite_pool_warmup() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+            .unwrap();
+
+        // Warmup should not panic even with valid SQL
+        pool.warmup(&["SELECT id FROM t"]);
+
+        pool.close();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- SqlitePool for_each ---
+
+    #[test]
+    fn sqlite_pool_for_each() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+            .unwrap();
+        pool.simple_exec("INSERT INTO t VALUES (1)").unwrap();
+        pool.simple_exec("INSERT INTO t VALUES (2)").unwrap();
+        pool.simple_exec("INSERT INTO t VALUES (3)").unwrap();
+
+        let sql = "SELECT id FROM t ORDER BY id";
+        let hash = crate::rapid_hash_str(sql);
+        let mut ids = Vec::new();
+        pool.for_each(sql, hash, &[], false, |stmt| {
+            let id = stmt.column_int64(0);
+            ids.push(id);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(ids, vec![1, 2, 3]);
+
+        pool.close();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- SqlitePool for_each_collect ---
+
+    #[test]
+    fn sqlite_pool_for_each_collect() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+            .unwrap();
+        pool.simple_exec("INSERT INTO t VALUES (10)").unwrap();
+        pool.simple_exec("INSERT INTO t VALUES (20)").unwrap();
+
+        let sql = "SELECT id FROM t ORDER BY id";
+        let hash = crate::rapid_hash_str(sql);
+        let ids: Vec<i64> = pool
+            .for_each_collect(sql, hash, &[], false, |stmt| Ok(stmt.column_int64(0)))
+            .unwrap();
+
+        assert_eq!(ids, vec![10, 20]);
+
+        pool.close();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- SqlitePool fetch_one_direct ---
+
+    #[test]
+    fn sqlite_pool_fetch_one_direct() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+            .unwrap();
+        pool.simple_exec("INSERT INTO t VALUES (42)").unwrap();
+
+        let sql = "SELECT id FROM t LIMIT 1";
+        let hash = crate::rapid_hash_str(sql);
+        let id: i64 = pool
+            .fetch_one_direct(sql, hash, &[], false, |stmt| Ok(stmt.column_int64(0)))
+            .unwrap();
+
+        assert_eq!(id, 42);
+
+        pool.close();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- SqlitePool fetch_optional_direct ---
+
+    #[test]
+    fn sqlite_pool_fetch_optional_direct_some() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+            .unwrap();
+        pool.simple_exec("INSERT INTO t VALUES (7)").unwrap();
+
+        let sql = "SELECT id FROM t LIMIT 1";
+        let hash = crate::rapid_hash_str(sql);
+        let id: Option<i64> = pool
+            .fetch_optional_direct(sql, hash, &[], false, |stmt| Ok(stmt.column_int64(0)))
+            .unwrap();
+
+        assert_eq!(id, Some(7));
+
+        pool.close();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sqlite_pool_fetch_optional_direct_none() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+            .unwrap();
+
+        let sql = "SELECT id FROM t LIMIT 1";
+        let hash = crate::rapid_hash_str(sql);
+        let id: Option<i64> = pool
+            .fetch_optional_direct(sql, hash, &[], false, |stmt| Ok(stmt.column_int64(0)))
+            .unwrap();
+
+        assert_eq!(id, None);
+
+        pool.close();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- SqlitePool fetch_all_direct ---
+
+    #[test]
+    fn sqlite_pool_fetch_all_direct() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+            .unwrap();
+        pool.simple_exec("INSERT INTO t VALUES (1)").unwrap();
+        pool.simple_exec("INSERT INTO t VALUES (2)").unwrap();
+
+        let sql = "SELECT id FROM t ORDER BY id";
+        let hash = crate::rapid_hash_str(sql);
+        let ids: Vec<i64> = pool
+            .fetch_all_direct(sql, hash, &[], false, |stmt| Ok(stmt.column_int64(0)))
+            .unwrap();
+
+        assert_eq!(ids, vec![1, 2]);
+
+        pool.close();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sqlite_pool_fetch_all_direct_empty() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+            .unwrap();
+
+        let sql = "SELECT id FROM t";
+        let hash = crate::rapid_hash_str(sql);
+        let ids: Vec<i64> = pool
+            .fetch_all_direct(sql, hash, &[], false, |stmt| Ok(stmt.column_int64(0)))
+            .unwrap();
+
+        assert!(ids.is_empty());
+
+        pool.close();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- Transaction: query within transaction sees uncommitted data ---
+
+    #[test]
+    fn transaction_read_own_writes() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+            .unwrap();
+
+        let tx = pool.begin().unwrap();
+        tx.execute_sql(
+            "INSERT INTO t VALUES (?1)",
+            crate::rapid_hash_str("INSERT INTO t VALUES (?1)"),
+            smallvec::smallvec![bsql_driver_sqlite::pool::ParamValue::Int(42)],
+        )
+        .unwrap();
+
+        // Read within transaction should see the uncommitted row
+        let (result, arena) = tx
+            .query_readwrite(
+                "SELECT id FROM t",
+                crate::rapid_hash_str("SELECT id FROM t"),
+                smallvec::SmallVec::new(),
+            )
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result.get_i64(0, 0, &arena), Some(42));
+
+        tx.rollback().unwrap();
+
+        pool.close();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- Transaction execute_batch within tx ---
+
+    #[test]
+    fn transaction_execute_batch() {
+        let path = temp_db_path();
+        let pool = SqlitePool::connect(&path).unwrap();
+        pool.simple_exec("CREATE TABLE t (id INTEGER NOT NULL)")
+            .unwrap();
+
+        let tx = pool.begin().unwrap();
+        let sql = "INSERT INTO t VALUES (?1)";
+        let hash = crate::rapid_hash_str(sql);
+
+        let v1 = 1i64;
+        let v2 = 2i64;
+        let params1: &[&dyn bsql_driver_sqlite::codec::SqliteEncode] = &[&v1];
+        let params2: &[&dyn bsql_driver_sqlite::codec::SqliteEncode] = &[&v2];
+
+        let total = tx.execute_batch(sql, hash, &[params1, params2]).unwrap();
+        assert_eq!(total, 2);
+
+        tx.commit().unwrap();
+
+        let select = "SELECT id FROM t ORDER BY id";
+        let select_hash = crate::rapid_hash_str(select);
+        let (result, _) = pool
+            .query_readonly(select, select_hash, smallvec::SmallVec::new())
+            .unwrap();
+        assert_eq!(result.len(), 2);
+
+        pool.close();
+        let _ = std::fs::remove_file(&path);
+    }
 }

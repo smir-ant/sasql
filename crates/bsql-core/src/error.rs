@@ -1193,4 +1193,284 @@ mod tests {
         assert!(matches!(e, BsqlError::Decode(_)));
         assert!(e.source().is_none());
     }
+
+    // --- is_timeout false for every non-Query variant ---
+
+    #[test]
+    fn is_timeout_false_for_connect() {
+        let e = ConnectError::create("refused");
+        assert!(!e.is_timeout());
+    }
+
+    #[test]
+    fn is_timeout_false_for_decode() {
+        let e = BsqlError::Decode(DecodeError {
+            column: Cow::Borrowed("x"),
+            expected: "i32",
+            actual: Cow::Borrowed("text"),
+            source: None,
+        });
+        assert!(!e.is_timeout());
+    }
+
+    #[test]
+    fn is_timeout_false_for_query_without_code() {
+        let e = BsqlError::Query(QueryError {
+            message: Cow::Borrowed("some error"),
+            pg_code: None,
+            source: None,
+        });
+        assert!(!e.is_timeout());
+    }
+
+    // --- is_serialization_failure false for every non-Query variant ---
+
+    #[test]
+    fn is_serialization_failure_false_for_non_query_pool() {
+        let e = PoolError::exhausted();
+        assert!(!e.is_serialization_failure());
+    }
+
+    #[test]
+    fn is_serialization_failure_false_for_connect() {
+        let e = ConnectError::create("down");
+        assert!(!e.is_serialization_failure());
+    }
+
+    #[test]
+    fn is_serialization_failure_false_for_decode() {
+        let e = BsqlError::Decode(DecodeError {
+            column: Cow::Borrowed("x"),
+            expected: "i32",
+            actual: Cow::Borrowed("text"),
+            source: None,
+        });
+        assert!(!e.is_serialization_failure());
+    }
+
+    // --- is_not_null_violation false for non-query ---
+
+    #[test]
+    fn is_not_null_violation_false_for_pool() {
+        let e = PoolError::exhausted();
+        assert!(!e.is_not_null_violation());
+    }
+
+    #[test]
+    fn is_not_null_violation_false_for_connect() {
+        let e = ConnectError::create("down");
+        assert!(!e.is_not_null_violation());
+    }
+
+    #[test]
+    fn is_not_null_violation_false_for_decode() {
+        let e = BsqlError::Decode(DecodeError {
+            column: Cow::Borrowed("x"),
+            expected: "i32",
+            actual: Cow::Borrowed("text"),
+            source: None,
+        });
+        assert!(!e.is_not_null_violation());
+    }
+
+    // --- is_check_violation false for non-query ---
+
+    #[test]
+    fn is_check_violation_false_for_pool() {
+        let e = PoolError::exhausted();
+        assert!(!e.is_check_violation());
+    }
+
+    #[test]
+    fn is_check_violation_false_for_connect() {
+        let e = ConnectError::create("down");
+        assert!(!e.is_check_violation());
+    }
+
+    #[test]
+    fn is_check_violation_false_for_decode() {
+        let e = BsqlError::Decode(DecodeError {
+            column: Cow::Borrowed("x"),
+            expected: "i32",
+            actual: Cow::Borrowed("text"),
+            source: None,
+        });
+        assert!(!e.is_check_violation());
+    }
+
+    // --- is_foreign_key_violation false for decode ---
+
+    #[test]
+    fn is_foreign_key_violation_false_for_decode() {
+        let e = BsqlError::Decode(DecodeError {
+            column: Cow::Borrowed("x"),
+            expected: "i32",
+            actual: Cow::Borrowed("text"),
+            source: None,
+        });
+        assert!(!e.is_foreign_key_violation());
+    }
+
+    // --- is_deadlock false for connect and decode ---
+
+    #[test]
+    fn is_deadlock_false_for_connect() {
+        let e = ConnectError::create("down");
+        assert!(!e.is_deadlock());
+    }
+
+    #[test]
+    fn is_deadlock_false_for_decode() {
+        let e = BsqlError::Decode(DecodeError {
+            column: Cow::Borrowed("x"),
+            expected: "i32",
+            actual: Cow::Borrowed("text"),
+            source: None,
+        });
+        assert!(!e.is_deadlock());
+    }
+
+    // --- is_unique_violation false for connect and decode ---
+
+    #[test]
+    fn is_unique_violation_false_for_connect() {
+        let e = ConnectError::create("down");
+        assert!(!e.is_unique_violation());
+    }
+
+    #[test]
+    fn is_unique_violation_false_for_decode() {
+        let e = BsqlError::Decode(DecodeError {
+            column: Cow::Borrowed("x"),
+            expected: "i32",
+            actual: Cow::Borrowed("text"),
+            source: None,
+        });
+        assert!(!e.is_unique_violation());
+    }
+
+    // --- pg_code returns None for query error without code ---
+
+    #[test]
+    fn pg_code_none_when_query_has_no_code() {
+        let e = BsqlError::Query(QueryError {
+            message: Cow::Borrowed("io error"),
+            pg_code: None,
+            source: None,
+        });
+        assert_eq!(e.pg_code(), None);
+    }
+
+    // --- BsqlError Debug impl ---
+
+    #[test]
+    fn bsql_error_debug_pool() {
+        let e = PoolError::exhausted();
+        let dbg = format!("{e:?}");
+        assert!(dbg.contains("Pool"), "Pool variant in debug: {dbg}");
+    }
+
+    #[test]
+    fn bsql_error_debug_query() {
+        let e = BsqlError::Query(QueryError {
+            message: Cow::Borrowed("test"),
+            pg_code: Some(Box::from("23505")),
+            source: None,
+        });
+        let dbg = format!("{e:?}");
+        assert!(dbg.contains("Query"), "Query variant in debug: {dbg}");
+        assert!(dbg.contains("23505"), "pg_code in debug: {dbg}");
+    }
+
+    #[test]
+    fn bsql_error_debug_decode() {
+        let e = BsqlError::Decode(DecodeError {
+            column: Cow::Borrowed("col"),
+            expected: "i32",
+            actual: Cow::Borrowed("text"),
+            source: None,
+        });
+        let dbg = format!("{e:?}");
+        assert!(dbg.contains("Decode"), "Decode variant in debug: {dbg}");
+    }
+
+    #[test]
+    fn bsql_error_debug_connect() {
+        let e = ConnectError::create("refused");
+        let dbg = format!("{e:?}");
+        assert!(dbg.contains("Connect"), "Connect variant in debug: {dbg}");
+    }
+
+    // --- Error Display stability ---
+
+    #[test]
+    fn pool_error_display_starts_with_prefix() {
+        let e = PoolError::exhausted();
+        assert!(e.to_string().starts_with("pool error:"));
+    }
+
+    #[test]
+    fn query_error_display_starts_with_prefix() {
+        let e = QueryError::row_count("1 row", 0);
+        assert!(e.to_string().starts_with("query error:"));
+    }
+
+    #[test]
+    fn decode_error_display_starts_with_prefix() {
+        let e = BsqlError::Decode(DecodeError {
+            column: Cow::Borrowed("x"),
+            expected: "i32",
+            actual: Cow::Borrowed("text"),
+            source: None,
+        });
+        assert!(e.to_string().starts_with("decode error:"));
+    }
+
+    #[test]
+    fn connect_error_display_starts_with_prefix() {
+        let e = ConnectError::create("refused");
+        assert!(e.to_string().starts_with("connect error:"));
+    }
+
+    // --- from_driver_query with Auth variant maps through From ---
+
+    #[test]
+    fn from_driver_query_auth_delegates_to_from() {
+        let e = BsqlError::from_driver_query(bsql_driver_postgres::DriverError::Auth("bad".into()));
+        assert!(matches!(e, BsqlError::Connect(_)));
+    }
+
+    // --- from_driver_query with Protocol variant maps through From ---
+
+    #[test]
+    fn from_driver_query_protocol_delegates_to_from() {
+        let e = BsqlError::from_driver_query(bsql_driver_postgres::DriverError::Protocol(
+            "bad msg".into(),
+        ));
+        assert!(matches!(e, BsqlError::Query(_)));
+    }
+
+    // --- Error trait: source chain on various error types ---
+
+    #[test]
+    fn query_error_source_is_none_without_source() {
+        let e = BsqlError::Query(QueryError {
+            message: Cow::Borrowed("test"),
+            pg_code: None,
+            source: None,
+        });
+        assert!(e.source().is_none());
+    }
+
+    #[test]
+    fn connect_error_source_is_none_without_source() {
+        let e = ConnectError::create("test");
+        assert!(e.source().is_none());
+    }
+
+    #[test]
+    fn pool_error_source_is_none_without_source() {
+        let e = PoolError::exhausted();
+        assert!(e.source().is_none());
+    }
 }

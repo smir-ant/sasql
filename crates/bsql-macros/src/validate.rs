@@ -1331,4 +1331,172 @@ mod tests {
         // Empty column name and empty expression — not known NOT NULL
         assert!(!is_known_not_null("", ""));
     }
+
+    // --- is_known_not_null: false literal ---
+
+    #[test]
+    fn is_known_not_null_false_literal() {
+        assert!(is_known_not_null("x", "false"));
+    }
+
+    // --- is_known_not_null: COALESCE with negative number ---
+
+    #[test]
+    fn is_known_not_null_coalesce_with_negative_number() {
+        assert!(is_known_not_null("x", "coalesce(val, -1)"));
+    }
+
+    // --- is_known_not_null: COALESCE with floating point literal ---
+
+    #[test]
+    fn is_known_not_null_coalesce_with_float_literal() {
+        assert!(is_known_not_null("x", "coalesce(val, 0.0)"));
+    }
+
+    // --- is_known_not_null: COALESCE with boolean literal ---
+
+    #[test]
+    fn is_known_not_null_coalesce_with_true_literal() {
+        assert!(is_known_not_null("x", "coalesce(flag, true)"));
+    }
+
+    // --- is_known_not_null: EXISTS is always not null ---
+
+    #[test]
+    fn is_known_not_null_exists_complex() {
+        assert!(is_known_not_null(
+            "has_orders",
+            "exists(select 1 from orders where user_id = u.id)"
+        ));
+    }
+
+    // --- is_known_not_null: CURRENT_TIMESTAMP etc ---
+
+    #[test]
+    fn is_known_not_null_current_user() {
+        assert!(is_known_not_null("x", "current_user"));
+    }
+
+    // --- is_known_not_null: string literal ---
+
+    #[test]
+    fn is_known_not_null_empty_string_literal() {
+        assert!(is_known_not_null("x", "''"));
+    }
+
+    // --- is_known_not_null: SUM is nullable ---
+
+    #[test]
+    fn sum_of_not_null_column_remains_nullable() {
+        // SUM returns NULL for empty groups, even on NOT NULL columns
+        assert!(!is_known_not_null("total", "SUM(amount)"));
+    }
+
+    // --- parse_select_expressions: trailing semicolon ---
+
+    #[test]
+    fn parse_select_with_trailing_semicolon() {
+        let exprs = parse_select_expressions("SELECT 1;");
+        assert_eq!(exprs, vec!["1"]);
+    }
+
+    // --- parse_select_expressions: multiple items no FROM ---
+
+    #[test]
+    fn parse_select_multiple_no_from() {
+        let exprs = parse_select_expressions("SELECT 1, 'hello', true");
+        assert_eq!(exprs, vec!["1", "'hello'", "true"]);
+    }
+
+    // --- strip_alias: complex cases ---
+
+    #[test]
+    fn strip_alias_simple() {
+        assert_eq!(strip_alias("count(*) AS cnt"), "count(*)");
+    }
+
+    #[test]
+    fn strip_alias_no_alias() {
+        assert_eq!(strip_alias("id"), "id");
+    }
+
+    #[test]
+    fn strip_alias_nested_as_in_parens() {
+        // "CASE WHEN status AS thing END AS label" — should strip outer AS
+        assert_eq!(
+            strip_alias("CASE WHEN x THEN 'a' ELSE 'b' END AS label"),
+            "CASE WHEN x THEN 'a' ELSE 'b' END"
+        );
+    }
+
+    // --- check_params_against_pg: enum param with bool rejected ---
+
+    #[test]
+    fn check_params_enum_with_bool_error() {
+        let params = vec![Param {
+            name: "status".into(),
+            rust_type: "bool".into(),
+            position: 1,
+        }];
+        let pg_oids = [99999u32];
+        let pg_enum = [true];
+        let result = check_params_against_pg(&params, &pg_oids, &pg_enum, false, "");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("cannot be used for PostgreSQL enum"),
+            "should reject bool for enum: {err}"
+        );
+    }
+
+    // --- check_params_against_pg: multiple params all matching ---
+
+    #[test]
+    fn check_params_multiple_matching() {
+        let params = vec![
+            Param {
+                name: "id".into(),
+                rust_type: "i32".into(),
+                position: 1,
+            },
+            Param {
+                name: "name".into(),
+                rust_type: "&str".into(),
+                position: 2,
+            },
+            Param {
+                name: "flag".into(),
+                rust_type: "bool".into(),
+                position: 3,
+            },
+        ];
+        let pg_oids = [23u32, 25, 16]; // int4, text, bool
+        let pg_enum = [false, false, false];
+        let result = check_params_against_pg(&params, &pg_oids, &pg_enum, false, "");
+        assert!(result.is_ok());
+    }
+
+    // --- format_driver_error_base: Protocol error ---
+
+    #[test]
+    fn format_protocol_error() {
+        let err = bsql_driver_postgres::DriverError::Protocol("unexpected msg type 'Z'".into());
+        let msg = format_driver_error_base(&err);
+        assert!(msg.contains("unexpected msg type"), "error: {msg}");
+    }
+
+    // --- is_known_not_null: numeric literal 0 ---
+
+    #[test]
+    fn is_known_not_null_zero_literal() {
+        assert!(is_known_not_null("x", "0"));
+    }
+
+    // --- is_known_not_null: negative number as literal ---
+
+    #[test]
+    fn is_known_not_null_negative_number() {
+        // "-1" as an expression — parse::<f64>() returns Ok
+        assert!(is_known_not_null("x", "-1"));
+    }
 }

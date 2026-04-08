@@ -495,4 +495,80 @@ mod tests {
         assert!(validate_savepoint_name("sp'--").is_err());
         assert!(validate_savepoint_name("sp\"test").is_err());
     }
+
+    // --- Transaction consumed error message ---
+
+    #[test]
+    fn consumed_error_message_is_descriptive() {
+        let e = Transaction::consumed_error();
+        let display = e.to_string();
+        assert!(
+            display.contains("transaction already consumed"),
+            "consumed error should be descriptive: {display}"
+        );
+    }
+
+    // --- IsolationLevel as_sql is idempotent ---
+
+    #[test]
+    fn isolation_level_as_sql_is_idempotent() {
+        let level = IsolationLevel::Serializable;
+        assert_eq!(level.as_sql(), level.as_sql());
+        assert_eq!(level.as_sql(), "SERIALIZABLE");
+    }
+
+    // --- IsolationLevel Display matches as_sql ---
+
+    #[test]
+    fn isolation_level_display_matches_as_sql() {
+        for level in [
+            IsolationLevel::ReadUncommitted,
+            IsolationLevel::ReadCommitted,
+            IsolationLevel::RepeatableRead,
+            IsolationLevel::Serializable,
+        ] {
+            assert_eq!(level.to_string(), level.as_sql());
+        }
+    }
+
+    // --- Transaction from_driver sets finished to false ---
+
+    // Cannot construct without driver, but verify at compile-time level
+    #[test]
+    fn transaction_from_driver_compiles() {
+        fn _check(_tx: bsql_driver_postgres::Transaction) -> Transaction {
+            Transaction::from_driver(_tx)
+        }
+    }
+
+    // --- Savepoint name: null bytes rejected ---
+
+    #[test]
+    fn validate_savepoint_name_null_byte_rejected() {
+        assert!(
+            validate_savepoint_name("sp\0name").is_err(),
+            "null byte in savepoint name should be rejected"
+        );
+    }
+
+    // --- Savepoint name: exactly 63 chars OK, 64 chars error ---
+
+    #[test]
+    fn validate_savepoint_name_boundary_63_and_64() {
+        let ok_63 = format!("a{}", "b".repeat(62));
+        assert!(validate_savepoint_name(&ok_63).is_ok());
+        let err_64 = format!("a{}", "b".repeat(63));
+        assert!(validate_savepoint_name(&err_64).is_err());
+    }
+
+    // --- consumed_error produces Query variant ---
+
+    #[test]
+    fn consumed_error_is_query_variant() {
+        let e = Transaction::consumed_error();
+        assert!(
+            matches!(e, BsqlError::Query(_)),
+            "consumed_error should be Query variant"
+        );
+    }
 }

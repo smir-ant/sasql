@@ -631,6 +631,38 @@ mod tests {
         );
     }
 
+    // --- Leader dropped while follower is waiting via wait_for_result ---
+
+    #[test]
+    fn follower_wait_for_result_returns_none_when_leader_dropped() {
+        let sf = Arc::new(Singleflight::new());
+
+        let leader = match sf.try_join(42) {
+            FlightResult::Leader(l) => l,
+            _ => panic!("expected leader"),
+        };
+
+        let follower_state = match sf.try_join(42) {
+            FlightResult::Follower(s) => s,
+            _ => panic!("expected follower"),
+        };
+
+        // Follower actually calls wait_for_result in a thread
+        let handle = std::thread::spawn(move || Singleflight::wait_for_result(&follower_state));
+
+        // Small delay to let follower start waiting
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // Drop leader without completing (simulates panic)
+        drop(leader);
+
+        let received = handle.join().unwrap();
+        assert!(
+            received.is_none(),
+            "follower should get None when leader dropped without completing"
+        );
+    }
+
     // --- Audit: leader drop cleans up, new leader can succeed ---
 
     #[test]

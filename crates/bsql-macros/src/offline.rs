@@ -1238,4 +1238,204 @@ mod tests {
         // The guard condition: if !cached.param_rust_types.is_empty() { check... }
         // With empty vec, no error should be raised regardless of current param types.
     }
+
+    // --- Future version envelope handling ---
+
+    #[test]
+    fn future_version_envelope_rejected() {
+        let cached = sample_cached_query();
+        let inner = bitcode::encode(&cached);
+        let envelope = CacheEnvelope {
+            version: CACHE_FORMAT_VERSION + 1, // future version
+            data: inner,
+        };
+        let bytes = bitcode::encode(&envelope);
+        let err = decode_enveloped(&bytes).unwrap_err();
+        assert!(
+            err.contains("version mismatch"),
+            "future version should be rejected: {err}"
+        );
+    }
+
+    // --- Version 0 envelope rejected ---
+
+    #[test]
+    fn version_zero_envelope_rejected() {
+        let inner = bitcode::encode(&sample_cached_query());
+        let envelope = CacheEnvelope {
+            version: 0,
+            data: inner,
+        };
+        let bytes = bitcode::encode(&envelope);
+        let err = decode_enveloped(&bytes).unwrap_err();
+        assert!(
+            err.contains("version mismatch"),
+            "version 0 should be rejected: {err}"
+        );
+    }
+
+    // --- Empty data field in envelope ---
+
+    #[test]
+    fn empty_data_in_envelope_fails() {
+        let envelope = CacheEnvelope {
+            version: CACHE_FORMAT_VERSION,
+            data: vec![],
+        };
+        let bytes = bitcode::encode(&envelope);
+        let err = decode_enveloped(&bytes).unwrap_err();
+        assert!(err.contains("inner"), "empty data should fail: {err}");
+    }
+
+    // --- Truncated data in envelope ---
+
+    #[test]
+    fn truncated_data_in_envelope_fails() {
+        let cached = sample_cached_query();
+        let inner = bitcode::encode(&cached);
+        let truncated = &inner[..inner.len() / 2]; // truncate
+        let envelope = CacheEnvelope {
+            version: CACHE_FORMAT_VERSION,
+            data: truncated.to_vec(),
+        };
+        let bytes = bitcode::encode(&envelope);
+        let err = decode_enveloped(&bytes).unwrap_err();
+        assert!(!err.is_empty(), "truncated data should fail: {err}");
+    }
+
+    // --- CachedQuery with many columns round trips ---
+
+    #[test]
+    fn cached_query_many_columns_round_trips() {
+        let columns: Vec<CachedColumn> = (0..50)
+            .map(|i| CachedColumn {
+                name: format!("col_{i}"),
+                pg_oid: 23,
+                pg_type_name: "int4".into(),
+                is_nullable: i % 2 == 0,
+                rust_type: if i % 2 == 0 {
+                    "Option<i32>".into()
+                } else {
+                    "i32".into()
+                },
+            })
+            .collect();
+
+        let cached = CachedQuery {
+            sql_hash: 12345,
+            normalized_sql: "SELECT many columns...".into(),
+            columns,
+            param_pg_oids: vec![23, 25],
+            param_is_pg_enum: vec![false, false],
+            bsql_version: BSQL_VERSION.to_owned(),
+            param_rust_types: vec!["i32".into(), "&str".into()],
+        };
+
+        let bytes = encode_enveloped(&cached);
+        let decoded = decode_enveloped(&bytes).unwrap();
+        assert_eq!(decoded.columns.len(), 50);
+        assert_eq!(decoded.columns[0].name, "col_0");
+        assert!(decoded.columns[0].is_nullable);
+        assert_eq!(decoded.columns[49].name, "col_49");
+        assert!(!decoded.columns[49].is_nullable);
+    }
+
+    // --- CachedQuery with empty normalized_sql ---
+
+    #[test]
+    fn cached_query_empty_sql_round_trips() {
+        let cached = CachedQuery {
+            sql_hash: 0,
+            normalized_sql: String::new(),
+            columns: vec![],
+            param_pg_oids: vec![],
+            param_is_pg_enum: vec![],
+            bsql_version: BSQL_VERSION.to_owned(),
+            param_rust_types: vec![],
+        };
+        let bytes = encode_enveloped(&cached);
+        let decoded = decode_enveloped(&bytes).unwrap();
+        assert!(decoded.normalized_sql.is_empty());
+        assert_eq!(decoded.sql_hash, 0);
+    }
+
+    // --- validate_cached_type: additional types ---
+
+    #[test]
+    fn validate_cached_type_i16() {
+        assert!(validate_cached_type("i16").is_ok());
+    }
+
+    #[test]
+    fn validate_cached_type_f32() {
+        assert!(validate_cached_type("f32").is_ok());
+    }
+
+    #[test]
+    fn validate_cached_type_option_i16() {
+        assert!(validate_cached_type("Option<i16>").is_ok());
+    }
+
+    #[test]
+    fn validate_cached_type_option_f32() {
+        assert!(validate_cached_type("Option<f32>").is_ok());
+    }
+
+    #[test]
+    fn validate_cached_type_vec_i32() {
+        assert!(validate_cached_type("Vec<i32>").is_ok());
+    }
+
+    #[test]
+    fn validate_cached_type_vec_i64() {
+        assert!(validate_cached_type("Vec<i64>").is_ok());
+    }
+
+    #[test]
+    fn validate_cached_type_vec_bool() {
+        assert!(validate_cached_type("Vec<bool>").is_ok());
+    }
+
+    #[test]
+    fn validate_cached_type_vec_f32() {
+        assert!(validate_cached_type("Vec<f32>").is_ok());
+    }
+
+    #[test]
+    fn validate_cached_type_vec_f64() {
+        assert!(validate_cached_type("Vec<f64>").is_ok());
+    }
+
+    #[test]
+    fn validate_cached_type_vec_i16() {
+        assert!(validate_cached_type("Vec<i16>").is_ok());
+    }
+
+    // --- validate_cached_type: empty string is invalid ---
+
+    #[test]
+    fn validate_cached_type_empty_string() {
+        // Empty type string parses as nothing — should fail
+        let result = validate_cached_type("");
+        // Empty string may or may not parse, but should be rejected
+        assert!(result.is_err(), "empty type string should be rejected");
+    }
+
+    // --- sql_hash: empty string deterministic ---
+
+    #[test]
+    fn sql_hash_empty_string_deterministic() {
+        let h1 = sql_hash("");
+        let h2 = sql_hash("");
+        assert_eq!(h1, h2);
+    }
+
+    // --- sql_hash: whitespace-sensitive ---
+
+    #[test]
+    fn sql_hash_whitespace_matters() {
+        let h1 = sql_hash("SELECT 1");
+        let h2 = sql_hash("SELECT  1");
+        assert_ne!(h1, h2, "whitespace should produce different hashes");
+    }
 }

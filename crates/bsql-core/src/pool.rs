@@ -948,4 +948,164 @@ mod tests {
         assert!(!row.is_empty());
         assert_eq!(row.get(0), None);
     }
+
+    // --- PoolBuilder stale_timeout ---
+
+    #[test]
+    fn builder_stale_timeout() {
+        let b = Pool::builder().stale_timeout(Duration::from_secs(15));
+        assert_eq!(b.stale_timeout, Some(Duration::from_secs(15)));
+    }
+
+    #[test]
+    fn builder_stale_timeout_default_is_none() {
+        let b = Pool::builder();
+        assert!(b.stale_timeout.is_none());
+    }
+
+    // --- PoolBuilder max_stmt_cache_size ---
+
+    #[test]
+    fn builder_max_stmt_cache_size() {
+        let b = Pool::builder().max_stmt_cache_size(512);
+        assert_eq!(b.max_stmt_cache_size, Some(512));
+    }
+
+    #[test]
+    fn builder_max_stmt_cache_size_default_is_none() {
+        let b = Pool::builder();
+        assert!(b.max_stmt_cache_size.is_none());
+    }
+
+    // --- Pool close / is_closed ---
+
+    #[tokio::test]
+    async fn pool_close_and_is_closed() {
+        let pool = Pool::connect("postgres://user:pass@localhost/db")
+            .await
+            .unwrap();
+        assert!(!pool.is_closed());
+        pool.close();
+        assert!(pool.is_closed());
+    }
+
+    // --- Pool status on fresh pool ---
+
+    #[tokio::test]
+    async fn pool_status_on_fresh_pool() {
+        let pool = Pool::connect("postgres://user:pass@localhost/db")
+            .await
+            .unwrap();
+        let status = pool.status();
+        assert_eq!(status.idle, 0, "fresh pool should have 0 idle");
+        assert_eq!(status.active, 0, "fresh pool should have 0 active");
+        assert_eq!(status.open, 0, "fresh pool should have 0 open");
+        assert_eq!(status.max_size, 10, "default max_size should be 10");
+    }
+
+    // --- PoolStatus Clone and Copy ---
+
+    #[test]
+    fn pool_status_clone_and_copy() {
+        let status = PoolStatus {
+            idle: 1,
+            active: 2,
+            open: 3,
+            max_size: 10,
+        };
+        let cloned = status;
+        assert_eq!(cloned.idle, 1);
+        assert_eq!(cloned.active, 2);
+        assert_eq!(cloned.open, 3);
+        assert_eq!(cloned.max_size, 10);
+    }
+
+    // --- PoolStatus Debug ---
+
+    #[test]
+    fn pool_status_debug() {
+        let status = PoolStatus {
+            idle: 1,
+            active: 2,
+            open: 3,
+            max_size: 10,
+        };
+        let dbg = format!("{status:?}");
+        assert!(
+            dbg.contains("PoolStatus"),
+            "Debug should show PoolStatus: {dbg}"
+        );
+    }
+
+    // --- Builder max_size ---
+
+    #[test]
+    fn builder_max_size() {
+        let b = Pool::builder().max_size(50);
+        assert_eq!(b.max_size, 50);
+    }
+
+    // --- Builder url ---
+
+    #[test]
+    fn builder_url_stored() {
+        let b = Pool::builder().url("postgres://localhost/test");
+        assert_eq!(b.url.as_deref(), Some("postgres://localhost/test"));
+    }
+
+    // --- RawRow unicode content ---
+
+    #[test]
+    fn raw_row_unicode_content() {
+        let row = RawRow(vec![
+            Some("\u{1F600}".into()),                                // emoji
+            Some("\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}".into()), // Arabic
+            Some("\u{00E9}\u{00E8}\u{00EA}".into()),                 // French accents
+        ]);
+        assert_eq!(row.get(0), Some("\u{1F600}"));
+        assert_eq!(row.len(), 3);
+    }
+
+    // --- RawRow large column count ---
+
+    #[test]
+    fn raw_row_many_columns() {
+        let cols: Vec<Option<String>> = (0..100).map(|i| Some(format!("val_{i}"))).collect();
+        let row = RawRow(cols);
+        assert_eq!(row.len(), 100);
+        assert_eq!(row.get(0), Some("val_0"));
+        assert_eq!(row.get(99), Some("val_99"));
+        assert_eq!(row.get(100), None);
+    }
+
+    // --- Pool has_replica false by default ---
+
+    #[tokio::test]
+    async fn pool_has_replica_false_default() {
+        let pool = Pool::connect("postgres://user:pass@localhost/db")
+            .await
+            .unwrap();
+        assert!(!pool.has_replica());
+    }
+
+    // --- Builder complete chaining returns correct state ---
+
+    #[test]
+    fn builder_full_chain() {
+        let b = Pool::builder()
+            .url("postgres://u@localhost/db")
+            .max_size(32)
+            .lifetime_secs(600)
+            .timeout_secs(3)
+            .min_idle(4)
+            .stale_timeout(Duration::from_secs(30))
+            .max_stmt_cache_size(128)
+            .replica_url("postgres://u@replica/db")
+            .replica_max_size(16);
+        assert_eq!(b.max_size, 32);
+        assert_eq!(b.min_idle, Some(4));
+        assert_eq!(b.stale_timeout, Some(Duration::from_secs(30)));
+        assert_eq!(b.max_stmt_cache_size, Some(128));
+        assert_eq!(b.replica_max_size, Some(16));
+    }
 }

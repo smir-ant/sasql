@@ -892,6 +892,166 @@ mod tests {
         assert_eq!(result, "SELECT id FROM t ORDER BY LOWER(name) ASC");
     }
 
+    // --- GRANT keyword rejected ---
+
+    #[test]
+    fn sort_fragment_grant_rejected() {
+        let input = quote! {
+            enum Sort {
+                #[sql("GRANT ALL ON users TO evil")]
+                Bad,
+            }
+        };
+        let result = expand_sort_enum(TokenStream::new(), input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("GRANT"), "should mention GRANT: {err}");
+    }
+
+    // --- REVOKE keyword rejected ---
+
+    #[test]
+    fn sort_fragment_revoke_rejected() {
+        let input = quote! {
+            enum Sort {
+                #[sql("REVOKE ALL ON users FROM evil")]
+                Bad,
+            }
+        };
+        let result = expand_sort_enum(TokenStream::new(), input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("REVOKE"), "should mention REVOKE: {err}");
+    }
+
+    // --- COPY keyword rejected ---
+
+    #[test]
+    fn sort_fragment_copy_rejected() {
+        let input = quote! {
+            enum Sort {
+                #[sql("COPY users TO '/tmp/evil.csv'")]
+                Bad,
+            }
+        };
+        let result = expand_sort_enum(TokenStream::new(), input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("COPY"), "should mention COPY: {err}");
+    }
+
+    // --- ALTER keyword rejected ---
+
+    #[test]
+    fn sort_fragment_alter_rejected() {
+        let input = quote! {
+            enum Sort {
+                #[sql("ALTER TABLE users ADD COLUMN evil TEXT")]
+                Bad,
+            }
+        };
+        let result = expand_sort_enum(TokenStream::new(), input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("ALTER"), "should mention ALTER: {err}");
+    }
+
+    // --- CREATE keyword rejected ---
+
+    #[test]
+    fn sort_fragment_create_rejected() {
+        let input = quote! {
+            enum Sort {
+                #[sql("CREATE TABLE evil (id int)")]
+                Bad,
+            }
+        };
+        let result = expand_sort_enum(TokenStream::new(), input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("CREATE"), "should mention CREATE: {err}");
+    }
+
+    // --- EXECUTE keyword rejected ---
+
+    #[test]
+    fn sort_fragment_execute_rejected() {
+        let input = quote! {
+            enum Sort {
+                #[sql("EXECUTE evil_func()")]
+                Bad,
+            }
+        };
+        let result = expand_sort_enum(TokenStream::new(), input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("EXECUTE"), "should mention EXECUTE: {err}");
+    }
+
+    // --- Fragment with LOWER() function expression accepted ---
+
+    #[test]
+    fn sort_fragment_lower_function_accepted() {
+        let input = quote! {
+            enum Sort {
+                #[sql("LOWER(name) ASC")]
+                NameAsc,
+            }
+        };
+        let result = expand_sort_enum(TokenStream::new(), input);
+        assert!(result.is_ok(), "LOWER(name) ASC should be accepted");
+        let code = result.unwrap().to_string();
+        assert!(
+            code.contains("LOWER(name) ASC"),
+            "fragment preserved: {code}"
+        );
+    }
+
+    // --- Fragment with COALESCE accepted ---
+
+    #[test]
+    fn sort_fragment_coalesce_accepted() {
+        let input = quote! {
+            enum Sort {
+                #[sql("COALESCE(priority, 999) ASC")]
+                Priority,
+            }
+        };
+        let result = expand_sort_enum(TokenStream::new(), input);
+        assert!(
+            result.is_ok(),
+            "COALESCE in sort fragment should be accepted"
+        );
+    }
+
+    // --- Fragment with case-insensitive keyword detection ---
+
+    #[test]
+    fn sort_fragment_lowercase_drop_rejected() {
+        let input = quote! {
+            enum Sort {
+                #[sql("drop table users")]
+                Bad,
+            }
+        };
+        let result = expand_sort_enum(TokenStream::new(), input);
+        assert!(result.is_err(), "lowercase 'drop' should be rejected");
+    }
+
+    // --- Fragment with mixed case keyword detection ---
+
+    #[test]
+    fn sort_fragment_mixed_case_delete_rejected() {
+        let input = quote! {
+            enum Sort {
+                #[sql("DeLeTe from users")]
+                Bad,
+            }
+        };
+        let result = expand_sort_enum(TokenStream::new(), input);
+        assert!(result.is_err(), "mixed case 'DeLeTe' should be rejected");
+    }
+
     #[test]
     fn sort_registry_overwrite_on_recompile() {
         let dir = std::env::temp_dir().join("bsql_test_sort_overwrite");
