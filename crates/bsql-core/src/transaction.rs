@@ -52,7 +52,7 @@ impl fmt::Display for IsolationLevel {
 /// `commit()`, the connection is discarded from the pool and a warning is logged.
 ///
 /// Use `.defer(&mut tx)` on queries to buffer writes, then `tx.commit()` to flush
-/// them all in a single pipeline. Use `.run(&mut tx)` or `.fetch(&mut tx)` for immediate
+/// them all in a single pipeline. Use `.execute(&mut tx)` or `.fetch(&mut tx)` for immediate
 /// execution within the transaction.
 ///
 /// # Example
@@ -69,7 +69,7 @@ impl fmt::Display for IsolationLevel {
 ///
 /// // Or execute immediately within the transaction
 /// bsql::query!("UPDATE accounts SET balance = 0 WHERE id = $id: i32")
-///     .run(&mut tx)?;
+///     .execute(&mut tx)?;
 ///
 /// // commit() flushes all deferred operations, then commits
 /// tx.commit()?;

@@ -400,7 +400,7 @@ impl SqlitePool {
 ///
 /// // Execute writes within the transaction...
 /// bsql::query!("INSERT INTO log (msg) VALUES ($msg: &str)")
-///     .run(&tx)?;
+///     .execute(&tx)?;
 ///
 /// tx.commit()?;  // or drop to auto-rollback
 /// ```

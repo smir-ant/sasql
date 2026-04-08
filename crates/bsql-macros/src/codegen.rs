@@ -97,7 +97,7 @@ pub fn generate_sort_query_code(
         .collect();
 
     let executor_struct = quote! {
-        #[must_use = "query is not executed until .fetch(), .run(), or another execution method is called"]
+        #[must_use = "query is not executed until .fetch(), .execute(), or another execution method is called"]
         #[allow(non_camel_case_types)]
         struct #executor_name<'_bsql> {
             #(#param_fields,)*
@@ -411,15 +411,6 @@ pub fn generate_sort_query_code(
                     }
                 }
 
-                /// Execute (INSERT/UPDATE/DELETE). Returns affected row count.
-                ::bsql_core::__bsql_fn! {
-                    pub fn run(
-                        self,
-                        executor: impl Into<::bsql_core::QueryTarget<'_>>,
-                    ) -> ::bsql_core::BsqlResult<u64> {
-                        ::bsql_core::__bsql_call!(self.execute(executor))
-                    }
-                }
             }
         }
     } else {
@@ -442,16 +433,6 @@ pub fn generate_sort_query_code(
                     pub fn defer(self, tx: &mut ::bsql_core::Transaction) -> ::bsql_core::BsqlResult<()> {
                         #build_sql
                         ::bsql_core::__bsql_call!(tx.defer_execute(sql, sql_hash, #params_slice))
-                    }
-                }
-
-                /// Execute (INSERT/UPDATE/DELETE). Returns affected row count.
-                ::bsql_core::__bsql_fn! {
-                    pub fn run(
-                        self,
-                        executor: impl Into<::bsql_core::QueryTarget<'_>>,
-                    ) -> ::bsql_core::BsqlResult<u64> {
-                        ::bsql_core::__bsql_call!(self.execute(executor))
                     }
                 }
             }
@@ -651,25 +632,12 @@ fn gen_query_as_executor_impls(
         }
     };
 
-    let run_method = quote! {
-        /// Execute (INSERT/UPDATE/DELETE). Returns affected row count.
-        ::bsql_core::__bsql_fn! {
-            pub fn run(
-                self,
-                executor: impl Into<::bsql_core::QueryTarget<'_>>,
-            ) -> ::bsql_core::BsqlResult<u64> {
-                ::bsql_core::__bsql_call!(self.execute(executor))
-            }
-        }
-    };
-
     quote! {
         #[allow(non_camel_case_types)]
         impl<'_bsql> #executor_name<'_bsql> {
             #fetch_methods
             #execute_method
             #defer_method
-            #run_method
         }
     }
 }
@@ -732,7 +700,7 @@ fn gen_executor_struct(parsed: &ParsedQuery) -> TokenStream {
         .collect();
 
     quote! {
-        #[must_use = "query is not executed until .fetch(), .run(), or another execution method is called"]
+        #[must_use = "query is not executed until .fetch(), .execute(), or another execution method is called"]
         #[allow(non_camel_case_types)]
         struct #struct_name<'_bsql> {
             #(#fields,)*
@@ -998,7 +966,7 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
         TokenStream::new()
     };
 
-    // --- Simple API (fetch/fetch_one/fetch_optional/run) ---
+    // --- Simple API (fetch/fetch_one/fetch_optional) ---
     // fetch(), fetch_one(), fetch_optional() now return zero-copy borrowed wrappers
     // (the old fetch_ref / fetch_one_ref / fetch_optional_ref).
     // fetch_all() remains as the owned-String variant for users who need it.
@@ -1061,18 +1029,6 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
         TokenStream::new()
     };
 
-    let simple_api_run = quote! {
-        /// Execute (INSERT/UPDATE/DELETE). Returns affected row count.
-        ::bsql_core::__bsql_fn! {
-            pub fn run(
-                self,
-                executor: impl Into<::bsql_core::QueryTarget<'_>>,
-            ) -> ::bsql_core::BsqlResult<u64> {
-                ::bsql_core::__bsql_call!(self.execute(executor))
-            }
-        }
-    };
-
     quote! {
         #stream_struct
         #for_each_row_struct
@@ -1086,7 +1042,6 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
             #execute_method
             #defer_method
             #simple_api_fetch
-            #simple_api_run
         }
     }
 }
@@ -1118,7 +1073,7 @@ fn gen_dynamic_executor_struct(parsed: &ParsedQuery) -> TokenStream {
     }
 
     quote! {
-        #[must_use = "query is not executed until .fetch(), .run(), or another execution method is called"]
+        #[must_use = "query is not executed until .fetch(), .execute(), or another execution method is called"]
         #[allow(non_camel_case_types)]
         struct #struct_name<'_bsql> {
             #(#fields,)*
@@ -1388,7 +1343,7 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
         TokenStream::new()
     };
 
-    // --- Simple API (fetch/fetch_one/fetch_optional/run) ---
+    // --- Simple API (fetch/fetch_one/fetch_optional) ---
     // For SELECT queries, fetch/fetch_one/fetch_optional return zero-copy borrowed wrappers.
     // For non-SELECT (e.g. dynamic INSERT RETURNING), they delegate to the owned variants.
     let simple_api_fetch = if has_columns && is_select {
@@ -1469,18 +1424,6 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
         TokenStream::new()
     };
 
-    let simple_api_run = quote! {
-        /// Execute (INSERT/UPDATE/DELETE). Returns affected row count.
-        ::bsql_core::__bsql_fn! {
-            pub fn run(
-                self,
-                executor: impl Into<::bsql_core::QueryTarget<'_>>,
-            ) -> ::bsql_core::BsqlResult<u64> {
-                ::bsql_core::__bsql_call!(self.execute(executor))
-            }
-        }
-    };
-
     quote! {
         #stream_struct
         #rows_struct
@@ -1493,7 +1436,6 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
             #execute_method
             #defer_method
             #simple_api_fetch
-            #simple_api_run
         }
     }
 }
@@ -3266,8 +3208,8 @@ mod tests {
             "missing fetch method: {code_str}"
         );
         assert!(
-            code_str.contains("fn run"),
-            "missing run method: {code_str}"
+            !code_str.contains("fn run"),
+            "run alias should be removed: {code_str}"
         );
         // get and stream aliases should NOT be generated on the executor
         // (fn get on BsqlRows/BsqlSingleRef is fine — check for executor method signature)
@@ -3828,7 +3770,10 @@ mod tests {
             "missing fetch_optional: {code_str}"
         );
         assert!(code_str.contains("execute"), "missing execute: {code_str}");
-        assert!(code_str.contains("fn run"), "missing run: {code_str}");
+        assert!(
+            !code_str.contains("fn run"),
+            "run alias should be removed: {code_str}"
+        );
         assert!(code_str.contains("fn defer"), "missing defer: {code_str}");
     }
 

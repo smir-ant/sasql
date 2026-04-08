@@ -214,7 +214,7 @@ No string concatenation. No runtime SQL assembly. 2 optional clauses = 4 variant
 | Method            | Returns      | Use                    |
 | ----------------- | ------------ | ---------------------- |
 | `.fetch(&pool).await` | `Vec<Row>` | SELECT queries         |
-| `.run(&pool).await`   | `u64`      | INSERT, UPDATE, DELETE |
+| `.execute(&pool).await`   | `u64`      | INSERT, UPDATE, DELETE |
 | `.defer(&mut tx).await`   | `()`       | Buffer in transaction  |
 
 Power users: `fetch_one`, `fetch_optional`, `fetch_stream`, `for_each` also available.
@@ -363,7 +363,7 @@ let pool = Pool::builder()
 let users = bsql::query!("SELECT id, login FROM users").fetch(&pool).await?;
 
 // INSERT/UPDATE/DELETE always route to the primary:
-bsql::query!("INSERT INTO users (login) VALUES ($login: &str)").run(&pool).await?;
+bsql::query!("INSERT INTO users (login) VALUES ($login: &str)").execute(&pool).await?;
 ```
 
 The proc macro knows which queries are read-only (SELECT) at compile time and generates code that routes through `query_raw_readonly`, which the pool sends to the replica. No user code changes needed -- just add `replica_url` to the builder.

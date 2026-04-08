@@ -266,22 +266,11 @@ fn gen_query_as_executor_impls(
         }
     };
 
-    let run_method = quote! {
-        /// Execute (INSERT/UPDATE/DELETE). Returns affected row count.
-        pub fn run(
-            self,
-            pool: &::bsql_core::SqlitePool,
-        ) -> ::bsql_core::BsqlResult<u64> {
-            self.execute(pool)
-        }
-    };
-
     quote! {
         #[allow(non_camel_case_types)]
         impl<'_bsql> #executor_name<'_bsql> {
             #fetch_methods
             #execute_method
-            #run_method
         }
     }
 }
@@ -638,7 +627,7 @@ fn gen_executor_struct(parsed: &ParsedQuery) -> TokenStream {
         .collect();
 
     quote! {
-        #[must_use = "query is not executed until .fetch(), .run(), or another execution method is called"]
+        #[must_use = "query is not executed until .fetch(), .execute(), or another execution method is called"]
         #[allow(non_camel_case_types)]
         struct #struct_name<'_bsql> {
             #(#fields,)*
@@ -1084,7 +1073,7 @@ fn gen_executor_impls(
         }
     };
 
-    // --- Simple API (fetch/run) ---
+    // --- Simple API (fetch) ---
     let simple_api_fetch = if has_columns {
         let result_name = result_struct_name(parsed);
 
@@ -1118,16 +1107,6 @@ fn gen_executor_impls(
         TokenStream::new()
     };
 
-    let simple_api_run = quote! {
-        /// Execute (INSERT/UPDATE/DELETE). Returns affected row count.
-        pub fn run(
-            self,
-            pool: &::bsql_core::SqlitePool,
-        ) -> ::bsql_core::BsqlResult<u64> {
-            self.execute(pool)
-        }
-    };
-
     quote! {
         #[allow(non_camel_case_types)]
         impl<'_bsql> #executor_name<'_bsql> {
@@ -1135,7 +1114,6 @@ fn gen_executor_impls(
             #for_each_methods
             #execute_method
             #simple_api_fetch
-            #simple_api_run
         }
     }
 }
@@ -1810,7 +1788,7 @@ fn gen_dynamic_executor_struct(parsed: &ParsedQuery) -> TokenStream {
     }
 
     quote! {
-        #[must_use = "query is not executed until .fetch(), .run(), or another execution method is called"]
+        #[must_use = "query is not executed until .fetch(), .execute(), or another execution method is called"]
         #[allow(non_camel_case_types)]
         struct #struct_name<'_bsql> {
             #(#fields,)*
@@ -2121,7 +2099,7 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
         }
     };
 
-    // --- Simple API (fetch/run) ---
+    // --- Simple API (fetch) ---
     let simple_api_fetch = if has_columns {
         let result_name = result_struct_name(parsed);
 
@@ -2155,16 +2133,6 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
         TokenStream::new()
     };
 
-    let simple_api_run = quote! {
-        /// Execute (INSERT/UPDATE/DELETE). Returns affected row count.
-        pub fn run(
-            self,
-            pool: &::bsql_core::SqlitePool,
-        ) -> ::bsql_core::BsqlResult<u64> {
-            self.execute(pool)
-        }
-    };
-
     quote! {
         #[allow(non_camel_case_types)]
         impl<'_bsql> #executor_name<'_bsql> {
@@ -2172,7 +2140,6 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
             #for_each_methods
             #execute_method
             #simple_api_fetch
-            #simple_api_run
         }
     }
 }
@@ -2434,7 +2401,7 @@ pub fn generate_sort_sqlite_query_code(
         .collect();
 
     let executor_struct = quote! {
-        #[must_use = "query is not executed until .fetch(), .run(), or another execution method is called"]
+        #[must_use = "query is not executed until .fetch(), .execute(), or another execution method is called"]
         #[allow(non_camel_case_types)]
         struct #executor_name<'_bsql> {
             #(#param_fields,)*
@@ -2627,14 +2594,6 @@ pub fn generate_sort_sqlite_query_code(
                 ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
                     self.fetch_all(pool)
                 }
-
-                /// Execute (INSERT/UPDATE/DELETE). Returns affected row count.
-                pub fn run(
-                    self,
-                    pool: &::bsql_core::SqlitePool,
-                ) -> ::bsql_core::BsqlResult<u64> {
-                    self.execute(pool)
-                }
             }
         }
     } else {
@@ -2649,14 +2608,6 @@ pub fn generate_sort_sqlite_query_code(
                     #direct_params_build
                     #build_sql
                     pool.execute_direct(&sql, sql_hash, _bsql_params)
-                }
-
-                /// Execute (INSERT/UPDATE/DELETE). Returns affected row count.
-                pub fn run(
-                    self,
-                    pool: &::bsql_core::SqlitePool,
-                ) -> ::bsql_core::BsqlResult<u64> {
-                    self.execute(pool)
                 }
             }
         }

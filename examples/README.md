@@ -34,7 +34,7 @@ SQL
 
 | Example | What it demonstrates |
 |---|---|
-| [pg_basic.rs](pg_basic.rs) | CRUD operations: `.fetch()`, `.run()`, `.pop()` for single-row lookups |
+| [pg_basic.rs](pg_basic.rs) | CRUD operations: `.fetch()`, `.execute()`, `.pop()` for single-row lookups |
 | [pg_async.rs](pg_async.rs) | Async mode with tokio — concurrent queries, transactions |
 | [pg_sync.rs](pg_sync.rs) | Sync mode — no tokio, no async, maximum single-query performance |
 | [pg_dynamic.rs](pg_dynamic.rs) | Optional WHERE clauses, sort enums, pagination |

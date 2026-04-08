@@ -358,7 +358,7 @@ fn query_impl_sort(parsed: parse::ParsedQuery) -> Result<proc_macro2::TokenStrea
 /// # Execution methods
 ///
 /// Same as `query!`: `.fetch_one(executor)`, `.fetch_all(executor)`,
-/// `.fetch_optional(executor)`, `.execute(executor)`, `.run(executor)`, `.defer(tx)`.
+/// `.fetch_optional(executor)`, `.execute(executor)`, `.defer(tx)`.
 #[proc_macro]
 pub fn query_as(input: TokenStream) -> TokenStream {
     let input2: proc_macro2::TokenStream = input.into();

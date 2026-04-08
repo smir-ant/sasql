@@ -117,7 +117,7 @@ mod tests {
     async fn test_create_table(pool: Pool) {
         pool.raw_execute("CREATE TABLE temp (id INT)").await.unwrap();
         bsql::query!("INSERT INTO temp (id) VALUES (1)")
-            .run(&pool).await.unwrap();
+            .execute(&pool).await.unwrap();
 
         let rows = bsql::query!("SELECT id FROM temp")
             .fetch(&pool).await.unwrap();
@@ -129,7 +129,7 @@ mod tests {
     #[bsql::test(fixtures("schema", "seed"))]
     async fn test_delete_is_isolated(pool: Pool) {
         bsql::query!("DELETE FROM users")
-            .run(&pool).await.unwrap();
+            .execute(&pool).await.unwrap();
 
         let result = bsql::query!("SELECT COUNT(*) AS cnt FROM users")
             .fetch_one(&pool).await.unwrap();

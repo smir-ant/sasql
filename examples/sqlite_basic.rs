@@ -1,6 +1,6 @@
 //! Basic SQLite CRUD operations with bsql.
 //!
-//! Same API as PostgreSQL: `.fetch()`, `.run()`, `.pop()`.
+//! Same API as PostgreSQL: `.fetch()`, `.execute()`, `.pop()`.
 //! bsql validates SQLite queries at compile time against the real database
 //! file, just like it does for PostgreSQL.
 //!
@@ -33,14 +33,14 @@ async fn main() -> Result<(), BsqlError> {
     let pool = SqlitePool::open("./myapp.db")?;
 
     // ---------------------------------------------------------------
-    // INSERT — .run() returns affected row count, same as PostgreSQL
+    // INSERT — .execute() returns affected row count, same as PostgreSQL
     // ---------------------------------------------------------------
     let name = "alice";
     let email = "alice@example.com";
     let affected = bsql::query!(
         "INSERT INTO users (name, email) VALUES ($name: &str, $email: &str)"
     )
-    .run(&pool)?;
+    .execute(&pool)?;
     println!("Inserted {affected} row(s)");
 
     // ---------------------------------------------------------------
@@ -75,14 +75,14 @@ async fn main() -> Result<(), BsqlError> {
     let updated = bsql::query!(
         "UPDATE users SET email = $new_email: &str WHERE id = $id: i64"
     )
-    .run(&pool)?;
+    .execute(&pool)?;
     println!("Updated {updated} row(s)");
 
     // ---------------------------------------------------------------
     // DELETE
     // ---------------------------------------------------------------
     let deleted = bsql::query!("DELETE FROM users WHERE id = $id: i64")
-        .run(&pool)?;
+        .execute(&pool)?;
     println!("Deleted {deleted} row(s)");
 
     Ok(())

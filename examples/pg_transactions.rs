@@ -3,7 +3,7 @@
 //! Demonstrates:
 //!   - `pool.begin()` to start a transaction
 //!   - `.defer(&mut tx)` to buffer writes (no network I/O until commit)
-//!   - `.run(&mut tx)` for immediate writes within a transaction
+//!   - `.execute(&mut tx)` for immediate writes within a transaction
 //!   - `tx.commit()` to flush deferred operations and commit
 //!   - Savepoints for partial rollback within a transaction
 //!   - Isolation levels for serializable reads
@@ -93,7 +93,7 @@ async fn main() -> Result<(), BsqlError> {
     bsql::query!(
         "UPDATE accounts SET balance = balance + $debit: i32 WHERE id = $account_id: i32"
     )
-    .run(&mut tx).await?;
+    .execute(&mut tx).await?;
 
     // Create a savepoint before a risky operation.
     tx.savepoint("before_audit").await?;
@@ -105,7 +105,7 @@ async fn main() -> Result<(), BsqlError> {
         "INSERT INTO audit_log (account_id, delta, note)
          VALUES ($account_id: i32, $debit: i32, $note: &str)"
     )
-    .run(&mut tx).await;
+    .execute(&mut tx).await;
 
     match audit_result {
         Ok(_) => println!("Audit log inserted."),

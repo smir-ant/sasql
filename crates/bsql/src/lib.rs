@@ -39,7 +39,7 @@
 //! | Method | Returns | Use |
 //! |--------|---------|-----|
 //! | `.fetch(&pool).await` | `Vec<Row>` | SELECT queries |
-//! | `.run(&pool).await` | `u64` | INSERT, UPDATE, DELETE |
+//! | `.execute(&pool).await` | `u64` | INSERT, UPDATE, DELETE |
 //!
 //! Also: `fetch_one`, `fetch_optional`, `fetch_stream`, `for_each`, `defer` (for transactions).
 //!

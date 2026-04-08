@@ -39,7 +39,7 @@ async fn main() -> Result<(), BsqlError> {
     let email = "new@example.com";
     bsql::query!(
         "INSERT INTO users (login, first_name, last_name, email) VALUES ($login: &str, $first_name: &str, $last_name: &str, $email: &str)"
-    ).run(&pool).await?;
+    ).execute(&pool).await?;
     println!("Inserted user: {login}");
 
     // Transaction

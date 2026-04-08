@@ -2,7 +2,7 @@
 //!
 //! Demonstrates the three core methods:
 //!   - `.fetch(&pool)` for SELECT (returns Vec<Row>)
-//!   - `.run(&pool)` for INSERT/UPDATE/DELETE (returns affected row count)
+//!   - `.execute(&pool)` for INSERT/UPDATE/DELETE (returns affected row count)
 //!   - `.pop()` on fetch results for single-row lookups
 //!
 //! Every query is validated at compile time against your real database.
@@ -34,14 +34,14 @@ async fn main() -> Result<(), BsqlError> {
     let pool = Pool::connect("postgres://user:pass@localhost/mydb").await?;
 
     // ---------------------------------------------------------------
-    // INSERT — .run() returns the number of affected rows (u64)
+    // INSERT — .execute() returns the number of affected rows (u64)
     // ---------------------------------------------------------------
     let name = "alice";
     let email = "alice@example.com";
     let affected = bsql::query!(
         "INSERT INTO users (name, email) VALUES ($name: &str, $email: &str)"
     )
-    .run(&pool).await?;
+    .execute(&pool).await?;
     println!("Inserted {affected} row(s)");
 
     // ---------------------------------------------------------------
@@ -72,20 +72,20 @@ async fn main() -> Result<(), BsqlError> {
     }
 
     // ---------------------------------------------------------------
-    // UPDATE — .run() returns how many rows were changed
+    // UPDATE — .execute() returns how many rows were changed
     // ---------------------------------------------------------------
     let new_email = "alice@newdomain.com";
     let updated = bsql::query!(
         "UPDATE users SET email = $new_email: &str WHERE id = $id: i32"
     )
-    .run(&pool).await?;
+    .execute(&pool).await?;
     println!("Updated {updated} row(s)");
 
     // ---------------------------------------------------------------
-    // DELETE — .run() returns how many rows were removed
+    // DELETE — .execute() returns how many rows were removed
     // ---------------------------------------------------------------
     let deleted = bsql::query!("DELETE FROM users WHERE id = $id: i32")
-        .run(&pool).await?;
+        .execute(&pool).await?;
     println!("Deleted {deleted} row(s)");
 
     Ok(())

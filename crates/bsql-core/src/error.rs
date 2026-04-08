@@ -27,7 +27,7 @@ use std::fmt;
 ///
 /// // Match on error variants for fine-grained handling
 /// let result = bsql::query!("INSERT INTO users (name) VALUES ($n: &str)")
-///     .run(&pool).await;
+///     .execute(&pool).await;
 /// match result {
 ///     Ok(affected) => println!("inserted {affected}"),
 ///     Err(e) if e.is_unique_violation() => println!("already exists"),
