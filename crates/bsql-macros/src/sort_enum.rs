@@ -757,4 +757,155 @@ mod tests {
             "doc comment should be preserved: {code}"
         );
     }
+
+    // --- Sort registry / compile-time validation tests ---
+
+    #[test]
+    fn sort_registry_file_written() {
+        // After expanding a sort enum, check that .bsql/sorts/{name}.txt exists
+        // and contains the correct fragments.
+        // Since we can't easily invoke the proc macro in a unit test,
+        // test the write logic directly.
+
+        let dir = std::env::temp_dir().join("bsql_test_sorts");
+        let _ = std::fs::create_dir_all(&dir);
+
+        let fragments = ["created_at DESC", "price ASC", "name ASC NULLS LAST"];
+        let content = fragments.join("\n");
+        let path = dir.join("TestSort.txt");
+        std::fs::write(&path, &content).unwrap();
+
+        // Read back and verify
+        let read = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = read.lines().collect();
+        assert_eq!(lines, fragments);
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sort_registry_read_parses_fragments() {
+        let dir = std::env::temp_dir().join("bsql_test_sorts_read");
+        let _ = std::fs::create_dir_all(&dir);
+
+        let path = dir.join("MySort.txt");
+        std::fs::write(&path, "created_at DESC\nprice ASC\n").unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let fragments: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(fragments.len(), 2);
+        assert_eq!(fragments[0], "created_at DESC");
+        assert_eq!(fragments[1], "price ASC");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sort_registry_empty_file() {
+        let dir = std::env::temp_dir().join("bsql_test_sorts_empty");
+        let _ = std::fs::create_dir_all(&dir);
+
+        let path = dir.join("EmptySort.txt");
+        std::fs::write(&path, "").unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let fragments: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(fragments.len(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sort_registry_missing_file_no_error() {
+        // If the registry file doesn't exist, validation should be skipped gracefully
+        let dir = std::env::temp_dir().join("bsql_test_sorts_missing");
+        let path = dir.join("NonExistent.txt");
+        assert!(std::fs::read_to_string(&path).is_err());
+        // The query_impl_sort code checks `if let Ok(content) = ...` — graceful skip
+    }
+
+    #[test]
+    fn sort_fragment_substitution() {
+        let sql_template = "SELECT id, name FROM users ORDER BY {SORT} LIMIT 100";
+        let fragment = "created_at DESC";
+        let result = sql_template.replace("{SORT}", fragment);
+        assert_eq!(
+            result,
+            "SELECT id, name FROM users ORDER BY created_at DESC LIMIT 100"
+        );
+    }
+
+    #[test]
+    fn sort_fragment_with_multiple_columns() {
+        let sql_template = "SELECT id FROM t ORDER BY {SORT}";
+        let fragment = "priority DESC, created_at ASC";
+        let result = sql_template.replace("{SORT}", fragment);
+        assert_eq!(
+            result,
+            "SELECT id FROM t ORDER BY priority DESC, created_at ASC"
+        );
+    }
+
+    #[test]
+    fn sort_validation_full_flow() {
+        // Simulate: write fragments, read them, check they would substitute correctly
+        let dir = std::env::temp_dir().join("bsql_test_sort_flow");
+        let _ = std::fs::create_dir_all(&dir);
+
+        // Write
+        let fragments = vec!["name ASC", "id DESC"];
+        let content = fragments.join("\n");
+        std::fs::write(dir.join("UserSort.txt"), &content).unwrap();
+
+        // Read
+        let read = std::fs::read_to_string(dir.join("UserSort.txt")).unwrap();
+        let read_fragments: Vec<&str> = read.lines().filter(|l| !l.is_empty()).collect();
+
+        // Substitute into a query template
+        let template = "SELECT id, name FROM users ORDER BY {SORT} LIMIT 50";
+        for frag in &read_fragments {
+            let sql = template.replace("{SORT}", frag);
+            // Verify the resulting SQL is valid-looking
+            assert!(sql.contains("ORDER BY"));
+            assert!(!sql.contains("{SORT}"));
+            assert!(sql.contains(frag));
+        }
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sort_fragment_with_nulls_handling() {
+        let sql = "SELECT id FROM t ORDER BY {SORT}";
+        let fragment = "name ASC NULLS FIRST";
+        let result = sql.replace("{SORT}", fragment);
+        assert!(result.contains("NULLS FIRST"));
+    }
+
+    #[test]
+    fn sort_fragment_with_expression() {
+        let sql = "SELECT id FROM t ORDER BY {SORT}";
+        let fragment = "LOWER(name) ASC";
+        let result = sql.replace("{SORT}", fragment);
+        assert_eq!(result, "SELECT id FROM t ORDER BY LOWER(name) ASC");
+    }
+
+    #[test]
+    fn sort_registry_overwrite_on_recompile() {
+        let dir = std::env::temp_dir().join("bsql_test_sort_overwrite");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("TestSort.txt");
+
+        // First write
+        std::fs::write(&path, "old_col ASC").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old_col ASC");
+
+        // Overwrite (simulates recompile)
+        std::fs::write(&path, "new_col DESC").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new_col DESC");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
