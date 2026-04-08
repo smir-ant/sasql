@@ -132,7 +132,7 @@ See [examples/](examples/) for more complete, runnable programs.
 
 **Rust 1.75+** (MSRV). Required for RPITIT — `impl Future + Send` in trait return position. This is how bsql provides true async without `block_in_place` or `BoxFuture`. Rust 1.75 was released December 2023.
 
-**PostgreSQL 12+**. bsql uses: prepared statements with binary protocol (PG 7.4+), `pg_catalog` introspection (PG 7.x+), `CREATE SCHEMA` for test isolation (PG 7.3+), SCRAM-SHA-256 authentication (PG 10+). The realistic minimum is PG 10 (SCRAM), but PG 12+ is recommended and CI-tested. PG 15-18 are tested in CI matrix.
+**PostgreSQL 10+**. bsql uses prepared statements with binary protocol, `pg_catalog` introspection, SCRAM-SHA-256 authentication (PG 10+), and `CREATE SCHEMA` for test isolation. PG 15-18 are tested in CI matrix.
 
 **SQLite 3.37+** (for STRICT tables). bsql uses WAL mode, mmap, foreign keys, and STRICT tables by default. SQLite 3.37 (2021) added STRICT.
 

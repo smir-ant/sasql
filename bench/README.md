@@ -86,7 +86,7 @@ Each binary does identical work: connect, 10K SELECTs by PK, 1K INSERTs, exit. b
 ## How to reproduce
 
 ### Prerequisites
-- PostgreSQL 12+ (CI tests PG 15-18)
+- PostgreSQL 10+ (CI tests PG 15-18)
 - Rust stable (1.75+)
 - Go 1.22+
 - C compiler (clang or gcc)
