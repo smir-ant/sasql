@@ -814,8 +814,13 @@ impl PoolGuard {
     // --- Introspection dispatch methods ---
 
     /// Get the backend process ID for this connection.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the connection has already been returned to the pool (Drop ran).
+    /// This cannot happen in safe code because `PoolGuard` owns the connection.
     pub fn pid(&self) -> i32 {
-        match self.conn.as_ref().expect("connection taken") {
+        match self.conn.as_ref().expect("connection returned to pool") {
             PoolSlot::Sync(conn) => conn.pid(),
             #[cfg(feature = "async")]
             PoolSlot::Async(conn) => conn.pid(),
@@ -823,8 +828,13 @@ impl PoolGuard {
     }
 
     /// Whether the connection is idle (not in a transaction).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the connection has already been returned to the pool (Drop ran).
+    /// This cannot happen in safe code because `PoolGuard` owns the connection.
     pub fn is_idle(&self) -> bool {
-        match self.conn.as_ref().expect("connection taken") {
+        match self.conn.as_ref().expect("connection returned to pool") {
             PoolSlot::Sync(conn) => conn.is_idle(),
             #[cfg(feature = "async")]
             PoolSlot::Async(conn) => conn.is_idle(),
@@ -832,8 +842,13 @@ impl PoolGuard {
     }
 
     /// Whether the connection is inside a transaction.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the connection has already been returned to the pool (Drop ran).
+    /// This cannot happen in safe code because `PoolGuard` owns the connection.
     pub fn is_in_transaction(&self) -> bool {
-        match self.conn.as_ref().expect("connection taken") {
+        match self.conn.as_ref().expect("connection returned to pool") {
             PoolSlot::Sync(conn) => conn.is_in_transaction(),
             #[cfg(feature = "async")]
             PoolSlot::Async(conn) => conn.is_in_transaction(),
@@ -1068,11 +1083,9 @@ impl PoolGuard {
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
         buf: &mut Vec<u8>,
-    ) {
-        let conn = self
-            .sync_conn()
-            .expect("sync_conn failed in write_deferred");
-        conn.write_deferred_bind_execute(sql, sql_hash, params, buf);
+    ) -> Result<(), DriverError> {
+        let conn = self.sync_conn()?;
+        conn.write_deferred_bind_execute(sql, sql_hash, params, buf)
     }
 
     /// Flush a buffer of deferred Bind+Execute messages as a single pipeline.
@@ -1322,7 +1335,7 @@ impl Transaction {
 
         // Buffer the Bind+Execute bytes — no I/O
         self.guard
-            .write_deferred_bind_execute(sql, sql_hash, params, &mut self.deferred_buf);
+            .write_deferred_bind_execute(sql, sql_hash, params, &mut self.deferred_buf)?;
         self.deferred_count += 1;
         Ok(())
     }

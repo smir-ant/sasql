@@ -323,6 +323,144 @@ fn query_impl_sort(parsed: parse::ParsedQuery) -> Result<proc_macro2::TokenStrea
     ))
 }
 
+/// Map query results into a user-defined struct at compile time.
+///
+/// # Syntax
+///
+/// ```text
+/// bsql::query_as!(MyStruct, "SELECT col1, col2 FROM table WHERE col1 = $param: Type")
+/// ```
+///
+/// The first argument is the target type (a path like `User` or `crate::models::User`).
+/// The second argument is the SQL string with inline parameters (same syntax as `query!`).
+///
+/// Unlike `query!` which generates an anonymous struct, `query_as!` maps results
+/// directly into the named struct. Field names must match column names, and rustc
+/// verifies field types via struct literal construction — no runtime checks needed.
+///
+/// # Execution methods
+///
+/// Same as `query!`: `.fetch_one(executor)`, `.fetch_all(executor)`,
+/// `.fetch_optional(executor)`, `.execute(executor)`, `.run(executor)`, `.defer(tx)`.
+#[proc_macro]
+pub fn query_as(input: TokenStream) -> TokenStream {
+    let input2: proc_macro2::TokenStream = input.into();
+    match query_as_impl(input2) {
+        Ok(output) => output.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
+/// Arguments for `query_as!`: target type path + SQL string.
+struct QueryAsArgs {
+    target_type: syn::Path,
+    _comma: syn::Token![,],
+    sql: syn::LitStr,
+}
+
+impl syn::parse::Parse for QueryAsArgs {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        Ok(QueryAsArgs {
+            target_type: input.parse()?,
+            _comma: input.parse()?,
+            sql: input.parse()?,
+        })
+    }
+}
+
+fn extract_type_and_sql(
+    input: proc_macro2::TokenStream,
+) -> Result<(syn::Path, String), syn::Error> {
+    let args: QueryAsArgs = syn::parse2(input)?;
+    Ok((args.target_type, args.sql.value()))
+}
+
+fn query_as_impl(input: proc_macro2::TokenStream) -> Result<proc_macro2::TokenStream, syn::Error> {
+    let (target_type, sql) = extract_type_and_sql(input)?;
+
+    let parsed = parse::parse_query(&sql)
+        .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?;
+
+    // Reject sort queries — query_as! does not support $[sort: ...] placeholders
+    if parsed.sort_placeholder.is_some() {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "query_as! does not support $[sort: ...] placeholders; use query! instead",
+        ));
+    }
+
+    // Reject dynamic queries with optional clauses (for now)
+    if !parsed.optional_clauses.is_empty() {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "query_as! does not support optional clauses; use query! instead",
+        ));
+    }
+
+    // Detect backend from database URL
+    #[cfg(feature = "sqlite")]
+    {
+        let backend = connection::detect_backend()
+            .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?;
+        if backend == Some(connection::Backend::Sqlite) {
+            return query_as_impl_sqlite(parsed, target_type);
+        }
+    }
+
+    // PostgreSQL path (default)
+    query_as_impl_postgres(parsed, target_type)
+}
+
+fn query_as_impl_postgres(
+    parsed: parse::ParsedQuery,
+    target_type: syn::Path,
+) -> Result<proc_macro2::TokenStream, syn::Error> {
+    let validation = if offline::is_offline() {
+        offline::lookup_cached_validation(&parsed)
+            .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?
+    } else {
+        let result = connection::with_connection(|conn| {
+            validate::validate_query_with_suggestions(&parsed, conn)
+        })?;
+
+        offline::write_cache(&parsed, &result);
+        result
+    };
+
+    validate::check_param_types(&parsed, &validation)
+        .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?;
+
+    Ok(codegen::generate_query_as_code(
+        &parsed,
+        &validation,
+        &target_type,
+    ))
+}
+
+#[cfg(feature = "sqlite")]
+fn query_as_impl_sqlite(
+    parsed: parse::ParsedQuery,
+    target_type: syn::Path,
+) -> Result<proc_macro2::TokenStream, syn::Error> {
+    let validation = if offline::is_offline() {
+        offline::lookup_cached_validation(&parsed)
+            .map_err(|msg| syn::Error::new(proc_macro2::Span::call_site(), msg))?
+    } else {
+        let result = connection::with_sqlite_connection(|conn| {
+            validate_sqlite::validate_query_sqlite(&parsed, conn)
+        })?;
+
+        offline::write_cache(&parsed, &result);
+        result
+    };
+
+    Ok(codegen_sqlite::generate_sqlite_query_as_code(
+        &parsed,
+        &validation,
+        &target_type,
+    ))
+}
+
 /// Extract the SQL text from the macro input.
 ///
 /// Accepts a string literal: `query!("SELECT ...")`
@@ -407,5 +545,58 @@ pub fn sort(attr: TokenStream, item: TokenStream) -> TokenStream {
     match sort_enum::expand_sort_enum(attr2, item2) {
         Ok(output) => output.into(),
         Err(err) => err.to_compile_error().into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_query_as_args() {
+        let tokens: proc_macro2::TokenStream = "User, \"SELECT id FROM users\"".parse().unwrap();
+        let args: QueryAsArgs = syn::parse2(tokens).unwrap();
+        assert_eq!(args.sql.value(), "SELECT id FROM users");
+        // target_type should be "User"
+        let last_segment = args.target_type.segments.last().unwrap().ident.to_string();
+        assert_eq!(last_segment, "User");
+    }
+
+    #[test]
+    fn parse_query_as_args_module_path() {
+        let tokens: proc_macro2::TokenStream = "crate::models::User, \"SELECT id FROM users\""
+            .parse()
+            .unwrap();
+        let args: QueryAsArgs = syn::parse2(tokens).unwrap();
+        assert_eq!(args.sql.value(), "SELECT id FROM users");
+        let segments: Vec<String> = args
+            .target_type
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect();
+        assert_eq!(segments, vec!["crate", "models", "User"]);
+    }
+
+    #[test]
+    fn extract_type_and_sql_basic() {
+        let tokens: proc_macro2::TokenStream = "Row, \"SELECT name FROM t WHERE id = $id: i32\""
+            .parse()
+            .unwrap();
+        let (path, sql) = extract_type_and_sql(tokens).unwrap();
+        assert_eq!(sql, "SELECT name FROM t WHERE id = $id: i32");
+        assert_eq!(path.segments.last().unwrap().ident.to_string(), "Row");
+    }
+
+    #[test]
+    fn extract_type_and_sql_missing_comma_fails() {
+        let tokens: proc_macro2::TokenStream = "User \"SELECT id FROM t\"".parse().unwrap();
+        assert!(extract_type_and_sql(tokens).is_err());
+    }
+
+    #[test]
+    fn extract_type_and_sql_missing_sql_fails() {
+        let tokens: proc_macro2::TokenStream = "User,".parse().unwrap();
+        assert!(extract_type_and_sql(tokens).is_err());
     }
 }

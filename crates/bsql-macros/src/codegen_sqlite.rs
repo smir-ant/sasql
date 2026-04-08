@@ -41,6 +41,261 @@ pub fn generate_sqlite_query_code(
     }
 }
 
+/// Generate the complete Rust code for a SQLite `query_as!` invocation.
+///
+/// Like `generate_sqlite_query_code` but maps results into `#target_type` instead
+/// of generating an anonymous struct.
+pub fn generate_sqlite_query_as_code(
+    parsed: &ParsedQuery,
+    validation: &ValidationResult,
+    target_type: &syn::Path,
+) -> TokenStream {
+    let sqlite_sql = pg_to_sqlite_params(&parsed.positional_sql);
+    let executor_struct = gen_executor_struct(parsed);
+    let executor_impls = gen_query_as_executor_impls(parsed, validation, &sqlite_sql, target_type);
+    let constructor = gen_constructor(parsed);
+
+    quote! {
+        {
+            #executor_struct
+            #executor_impls
+            #constructor
+        }
+    }
+}
+
+/// Generate executor impls for SQLite `query_as!` — maps results into `#target_type`.
+fn gen_query_as_executor_impls(
+    parsed: &ParsedQuery,
+    validation: &ValidationResult,
+    sqlite_sql: &str,
+    target_type: &syn::Path,
+) -> TokenStream {
+    let executor_name = executor_struct_name(parsed);
+    let sql_lit = sqlite_sql;
+
+    let is_select = parsed.kind == crate::parse::QueryKind::Select;
+    let is_write = !is_select;
+
+    // Build direct param refs
+    let direct_param_binds: Vec<TokenStream> = parsed
+        .params
+        .iter()
+        .map(|p| {
+            let name = param_ident(&p.name);
+            gen_direct_param_ref(&name, &p.rust_type)
+        })
+        .collect();
+
+    let direct_params_build = if direct_param_binds.is_empty() {
+        quote! { let _bsql_params: &[&dyn ::bsql_core::driver_sqlite::SqliteEncode] = &[]; }
+    } else {
+        quote! {
+            let _bsql_params: &[&dyn ::bsql_core::driver_sqlite::SqliteEncode] = &[
+                #(#direct_param_binds),*
+            ];
+        }
+    };
+
+    let sql_hash_val = bsql_core::rapid_hash_str(sqlite_sql);
+
+    let has_columns = !validation.columns.is_empty();
+
+    let needs_limit = has_columns && is_select && !parsed.normalized_sql.contains(" limit ");
+
+    let limited_sql = if needs_limit {
+        format!("{sqlite_sql} LIMIT 2")
+    } else {
+        sqlite_sql.to_owned()
+    };
+    let limited_sql_lit = &limited_sql;
+    let limited_sql_hash_val = bsql_core::rapid_hash_str(&limited_sql);
+
+    let direct_decode = if has_columns {
+        gen_sqlite_direct_decode(validation)
+    } else {
+        TokenStream::new()
+    };
+
+    let sqlite_column_check = gen_sqlite_column_count_check(validation);
+    let inline_bind = gen_inline_param_bind();
+
+    let fetch_methods = if has_columns {
+        let decode_one_inner = wrap_decode_as_bsql_for_path(target_type, &direct_decode);
+        let decode_opt_inner = wrap_decode_as_bsql_for_path(target_type, &direct_decode);
+        let decode_all = wrap_decode_as_bsql_for_path(target_type, &direct_decode);
+
+        let inline_acquire_one = gen_inline_acquire(is_write);
+        let inline_acquire_opt = gen_inline_acquire(is_write);
+        let inline_acquire_all = gen_inline_acquire(is_write);
+
+        let fetch_one_method = quote! {
+            /// Fetch exactly one row, mapped into the target struct.
+            pub fn fetch_one(
+                self,
+                pool: &::bsql_core::SqlitePool,
+            ) -> ::bsql_core::BsqlResult<#target_type> {
+                #direct_params_build
+                let mut _bsql_conn = #inline_acquire_one;
+                let _bsql_stmt = _bsql_conn.__get_or_prepare(#limited_sql_lit, #limited_sql_hash_val)
+                    .map_err(::bsql_core::BsqlError::from_sqlite)?;
+                #inline_bind
+                #sqlite_column_check
+                match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
+                    ::bsql_core::driver_sqlite::StepResult::Row => {
+                        let _bsql_result = #decode_one_inner;
+                        if let ::bsql_core::driver_sqlite::StepResult::Row =
+                            _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)?
+                        {
+                            _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                            drop(_bsql_conn);
+                            return Err(::bsql_core::BsqlError::from_sqlite(
+                                ::bsql_core::driver_sqlite::SqliteError::Internal(
+                                    "expected 1 row, got 2+".into(),
+                                ),
+                            ));
+                        }
+                        _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                        drop(_bsql_conn);
+                        Ok(_bsql_result)
+                    }
+                    ::bsql_core::driver_sqlite::StepResult::Done => {
+                        _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                        drop(_bsql_conn);
+                        Err(::bsql_core::BsqlError::from_sqlite(
+                            ::bsql_core::driver_sqlite::SqliteError::Internal(
+                                "expected 1 row, got 0".into(),
+                            ),
+                        ))
+                    }
+                }
+            }
+        };
+
+        let fetch_optional_method = quote! {
+            /// Fetch zero or one row, mapped into the target struct.
+            pub fn fetch_optional(
+                self,
+                pool: &::bsql_core::SqlitePool,
+            ) -> ::bsql_core::BsqlResult<Option<#target_type>> {
+                #direct_params_build
+                let mut _bsql_conn = #inline_acquire_opt;
+                let _bsql_stmt = _bsql_conn.__get_or_prepare(#limited_sql_lit, #limited_sql_hash_val)
+                    .map_err(::bsql_core::BsqlError::from_sqlite)?;
+                #inline_bind
+                #sqlite_column_check
+                match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
+                    ::bsql_core::driver_sqlite::StepResult::Row => {
+                        let _bsql_result = #decode_opt_inner;
+                        _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                        drop(_bsql_conn);
+                        Ok(Some(_bsql_result))
+                    }
+                    ::bsql_core::driver_sqlite::StepResult::Done => {
+                        _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                        drop(_bsql_conn);
+                        Ok(None)
+                    }
+                }
+            }
+        };
+
+        let fetch_all_method = quote! {
+            /// Fetch all rows, mapped into the target struct.
+            pub fn fetch_all(
+                self,
+                pool: &::bsql_core::SqlitePool,
+            ) -> ::bsql_core::BsqlResult<Vec<#target_type>> {
+                #direct_params_build
+                let mut _bsql_conn = #inline_acquire_all;
+                let _bsql_stmt = _bsql_conn.__get_or_prepare(#sql_lit, #sql_hash_val)
+                    .map_err(::bsql_core::BsqlError::from_sqlite)?;
+                #inline_bind
+                #sqlite_column_check
+                let mut _bsql_rows = Vec::new();
+                loop {
+                    match _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)? {
+                        ::bsql_core::driver_sqlite::StepResult::Row => {
+                            _bsql_rows.push(#decode_all);
+                        }
+                        ::bsql_core::driver_sqlite::StepResult::Done => break,
+                    }
+                }
+                _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                drop(_bsql_conn);
+                Ok(_bsql_rows)
+            }
+        };
+
+        quote! {
+            #fetch_one_method
+            #fetch_all_method
+            #fetch_optional_method
+
+            /// Fetch all rows as a Vec (alias for fetch_all).
+            pub fn fetch(
+                self,
+                pool: &::bsql_core::SqlitePool,
+            ) -> ::bsql_core::BsqlResult<Vec<#target_type>> {
+                self.fetch_all(pool)
+            }
+        }
+    } else {
+        TokenStream::new()
+    };
+
+    let execute_method = {
+        let inline_acquire_exec = gen_inline_acquire(/*is_write=*/ true);
+        quote! {
+            /// Execute the statement (INSERT/UPDATE/DELETE), return affected rows.
+            pub fn execute(
+                self,
+                pool: &::bsql_core::SqlitePool,
+            ) -> ::bsql_core::BsqlResult<u64> {
+                #direct_params_build
+                let mut _bsql_conn = #inline_acquire_exec;
+                let _bsql_stmt = _bsql_conn.__get_or_prepare(#sql_lit, #sql_hash_val)
+                    .map_err(::bsql_core::BsqlError::from_sqlite)?;
+                #inline_bind
+                _bsql_stmt.step().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                _bsql_stmt.reset().map_err(::bsql_core::BsqlError::from_sqlite)?;
+                let _bsql_changes = _bsql_conn.__changes();
+                drop(_bsql_conn);
+                Ok(_bsql_changes)
+            }
+        }
+    };
+
+    let run_method = quote! {
+        /// Execute (INSERT/UPDATE/DELETE). Returns affected row count.
+        pub fn run(
+            self,
+            pool: &::bsql_core::SqlitePool,
+        ) -> ::bsql_core::BsqlResult<u64> {
+            self.execute(pool)
+        }
+    };
+
+    quote! {
+        #[allow(non_camel_case_types)]
+        impl<'_bsql> #executor_name<'_bsql> {
+            #fetch_methods
+            #execute_method
+            #run_method
+        }
+    }
+}
+
+/// Wrap a decode expression for a user-provided type path (query_as!).
+/// Similar to `wrap_decode_as_bsql` but uses a `syn::Path` instead of an ident.
+fn wrap_decode_as_bsql_for_path(target_type: &syn::Path, decode: &TokenStream) -> TokenStream {
+    quote! {
+        (|| -> Result<#target_type, ::bsql_core::driver_sqlite::SqliteError> {
+            Ok(#target_type { #decode })
+        })().map_err(::bsql_core::BsqlError::from_sqlite)?
+    }
+}
+
 // --- Result struct (identical structure to PG, different field types possible) ---
 
 fn gen_result_struct(parsed: &ParsedQuery, validation: &ValidationResult) -> TokenStream {

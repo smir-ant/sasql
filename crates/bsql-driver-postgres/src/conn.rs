@@ -597,7 +597,9 @@ impl Connection {
     ) -> Result<QueryResult, DriverError> {
         let columns = self
             .send_pipeline(sql, sql_hash, params, true, true)?
-            .expect("send_pipeline(need_columns=true) must return Some");
+            .ok_or_else(|| {
+                DriverError::Protocol("send_pipeline(need_columns=true) returned None".into())
+            })?;
 
         let num_cols = columns.len();
         let mut all_col_offsets = acquire_col_offsets();
@@ -765,11 +767,10 @@ impl Connection {
         let mut has_exec_sync = false;
 
         if can_use_template {
-            // SAFETY: can_use_template is true only when bind_template.is_some()
-            let tmpl = info
-                .bind_template
-                .as_ref()
-                .expect("guarded by can_use_template");
+            // can_use_template is true only when bind_template.is_some()
+            let tmpl = info.bind_template.as_ref().ok_or_else(|| {
+                DriverError::Protocol("bind_template missing despite can_use_template".into())
+            })?;
             self.write_buf.extend_from_slice(&tmpl.bytes);
 
             let mut template_ok = true;
@@ -1174,7 +1175,9 @@ impl Connection {
         let stmt_name = self
             .stmts
             .get(&sql_hash, sql)
-            .expect("BUG: stmt just cached but not found")
+            .ok_or_else(|| {
+                DriverError::Protocol("stmt just cached but not found in execute_pipeline".into())
+            })?
             .name;
         let count = param_sets.len();
 
@@ -1310,14 +1313,17 @@ impl Connection {
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
         buf: &mut Vec<u8>,
-    ) {
+    ) -> Result<(), DriverError> {
         let stmt_name = self
             .stmts
             .get(&sql_hash, sql)
-            .expect("BUG: stmt just cached but not found")
+            .ok_or_else(|| {
+                DriverError::Protocol("stmt just cached but not found in write_deferred".into())
+            })?
             .name;
         proto::write_bind_params(buf, b"", &stmt_name, params);
         buf.extend_from_slice(proto::EXECUTE_ONLY);
+        Ok(())
     }
 
     /// Flush a buffer of deferred Bind+Execute messages as a single pipeline.
@@ -1552,11 +1558,10 @@ impl Connection {
         let mut has_exec_sync = false;
 
         if can_use_template {
-            // SAFETY: can_use_template is true only when bind_template.is_some()
-            let tmpl = info
-                .bind_template
-                .as_ref()
-                .expect("guarded by can_use_template");
+            // can_use_template is true only when bind_template.is_some()
+            let tmpl = info.bind_template.as_ref().ok_or_else(|| {
+                DriverError::Protocol("bind_template missing despite can_use_template".into())
+            })?;
             self.write_buf.extend_from_slice(&tmpl.bytes);
 
             let mut template_ok = true;
@@ -2385,11 +2390,10 @@ impl Connection {
                 .is_some_and(|t| t.param_slots.len() == params.len());
 
             if can_use_template {
-                // SAFETY: can_use_template is true only when bind_template.is_some()
-                let tmpl = info
-                    .bind_template
-                    .as_ref()
-                    .expect("guarded by can_use_template");
+                // can_use_template is true only when bind_template.is_some()
+                let tmpl = info.bind_template.as_ref().ok_or_else(|| {
+                    DriverError::Protocol("bind_template missing despite can_use_template".into())
+                })?;
                 // Copy only the Bind portion (not EXECUTE_SYNC) — streaming
                 // needs Execute+Flush instead.
                 self.write_buf
@@ -2691,11 +2695,10 @@ impl Connection {
             if can_use_template {
                 // Fast path: copy template (includes EXECUTE_SYNC) and patch params
                 // directly via encode_at — no scratch buffer, no double-copy.
-                // SAFETY: can_use_template is true only when bind_template.is_some()
-                let tmpl = info
-                    .bind_template
-                    .as_ref()
-                    .expect("guarded by can_use_template");
+                // can_use_template is true only when bind_template.is_some()
+                let tmpl = info.bind_template.as_ref().ok_or_else(|| {
+                    DriverError::Protocol("bind_template missing despite can_use_template".into())
+                })?;
                 self.write_buf.extend_from_slice(&tmpl.bytes);
 
                 let mut template_ok = true;

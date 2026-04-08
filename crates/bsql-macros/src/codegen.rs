@@ -156,70 +156,69 @@ pub fn generate_sort_query_code(
     };
     let limited_suffix_lit = &limited_suffix;
 
-    // Generate the sort SQL lookup helper that caches (&'static str, u64) per sort fragment.
-    // Uses a static mutex-free DashMap-like approach: since sort enums have a small
-    // finite number of variants and sort.sql() returns &'static str, we cache using
-    // the pointer value as key. First call per variant allocates once via Box::leak;
-    // all subsequent calls return (&'static str, u64) with zero allocation.
+    // Generate the sort SQL lookup helper that caches (Arc<str>, u64) per sort fragment.
+    // Uses a static Mutex<Vec> cache: since sort enums have a small finite number of
+    // variants and sort.sql() returns &'static str, we cache using the pointer value
+    // as key. First call per variant allocates once into an Arc<str>; all subsequent
+    // calls clone the Arc (cheap ref-count bump) and borrow from the local clone.
     //
-    // Box::leak intentionally leaks one String per unique sort variant (typically
-    // 3-10 total). The leaked strings live for the process lifetime — same semantics
-    // as the previous raw-pointer approach but without any unsafe code.
+    // No Box::leak — the Arc<str> is owned by the cache Vec (which lives in a static
+    // OnceLock) and by the local clone (which lives for the duration of the function).
+    // Total memory is bounded: one Arc<str> per unique sort variant (typically 3-10).
     let build_sql = quote! {
-        // Cache: maps sort fragment &'static str pointer -> (leaked &'static str, hash)
-        static SORT_SQL_CACHE: ::std::sync::OnceLock<::std::sync::Mutex<Vec<(usize, &'static str, u64)>>> = ::std::sync::OnceLock::new();
+        // Cache: maps sort fragment &'static str pointer -> (Arc<str>, hash)
+        static SORT_SQL_CACHE: ::std::sync::OnceLock<::std::sync::Mutex<Vec<(usize, ::std::sync::Arc<str>, u64)>>> = ::std::sync::OnceLock::new();
         let sort_fragment: &'static str = self.sort.sql();
         let cache = SORT_SQL_CACHE.get_or_init(|| ::std::sync::Mutex::new(Vec::new()));
         let key = sort_fragment.as_ptr() as usize;
-        let (sql, sql_hash) = {
+        let (sql_arc, sql_hash) = {
             let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(entry) = guard.iter().find(|e| e.0 == key) {
-                (entry.1, entry.2)
+                (entry.1.clone(), entry.2)
             } else {
                 drop(guard);
                 let built = format!("{}{}{}", #sql_prefix, sort_fragment, #sql_suffix);
                 let hash = ::bsql_core::driver::hash_sql(&built);
-                let leaked: &'static str = Box::leak(built.into_boxed_str());
+                let arc: ::std::sync::Arc<str> = ::std::sync::Arc::from(built);
                 let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
                 // Double-check after re-acquiring lock
                 if let Some(entry) = guard.iter().find(|e| e.0 == key) {
-                    (entry.1, entry.2)
+                    (entry.1.clone(), entry.2)
                 } else {
-                    guard.push((key, leaked, hash));
-                    let entry = guard.last().unwrap();
-                    (entry.1, entry.2)
+                    guard.push((key, arc.clone(), hash));
+                    (arc, hash)
                 }
             }
         };
-        let sql: &str = sql;
+        let sql: &str = &sql_arc;
     };
 
     let build_limited_sql = if needs_limit {
         quote! {
-            static SORT_LIMITED_SQL_CACHE: ::std::sync::OnceLock<::std::sync::Mutex<Vec<(usize, &'static str, u64)>>> = ::std::sync::OnceLock::new();
+            // Cache: maps sort fragment &'static str pointer -> (Arc<str>, hash)
+            static SORT_LIMITED_SQL_CACHE: ::std::sync::OnceLock<::std::sync::Mutex<Vec<(usize, ::std::sync::Arc<str>, u64)>>> = ::std::sync::OnceLock::new();
             let sort_fragment: &'static str = self.sort.sql();
             let cache = SORT_LIMITED_SQL_CACHE.get_or_init(|| ::std::sync::Mutex::new(Vec::new()));
             let key = sort_fragment.as_ptr() as usize;
-            let (sql, sql_hash) = {
+            let (sql_arc, sql_hash) = {
                 let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(entry) = guard.iter().find(|e| e.0 == key) {
-                    (entry.1, entry.2)
+                    (entry.1.clone(), entry.2)
                 } else {
                     drop(guard);
                     let built = format!("{}{}{}", #sql_prefix, sort_fragment, #limited_suffix_lit);
                     let hash = ::bsql_core::driver::hash_sql(&built);
-                    let leaked: &'static str = Box::leak(built.into_boxed_str());
+                    let arc: ::std::sync::Arc<str> = ::std::sync::Arc::from(built);
                     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(entry) = guard.iter().find(|e| e.0 == key) {
-                        (entry.1, entry.2)
+                        (entry.1.clone(), entry.2)
                     } else {
-                        guard.push((key, leaked, hash));
-                        let entry = guard.last().unwrap();
-                        (entry.1, entry.2)
+                        guard.push((key, arc.clone(), hash));
+                        (arc, hash)
                     }
                 }
             };
-            let sql: &str = sql;
+            let sql: &str = &sql_arc;
         }
     } else {
         build_sql.clone()
@@ -487,6 +486,190 @@ pub fn generate_sort_query_code(
             #fetch_methods
             #fetch_ref_block
             #constructor
+        }
+    }
+}
+
+/// Generate the complete Rust code for a `query_as!` invocation.
+///
+/// Like `generate_query_code` but maps results into `#target_type` instead of
+/// generating an anonymous struct. No result struct, rows struct, or borrowed
+/// wrappers are generated — rustc verifies field names and types via the struct
+/// literal `#target_type { field: decode, ... }`.
+pub fn generate_query_as_code(
+    parsed: &ParsedQuery,
+    validation: &ValidationResult,
+    target_type: &syn::Path,
+) -> TokenStream {
+    let executor_struct = gen_executor_struct(parsed);
+    let executor_impls = gen_query_as_executor_impls(parsed, validation, target_type);
+    let constructor = gen_constructor(parsed);
+
+    quote! {
+        {
+            #executor_struct
+            #executor_impls
+            #constructor
+        }
+    }
+}
+
+/// Generate executor impls for `query_as!` — maps results into `#target_type`.
+fn gen_query_as_executor_impls(
+    parsed: &ParsedQuery,
+    validation: &ValidationResult,
+    target_type: &syn::Path,
+) -> TokenStream {
+    let executor_name = executor_struct_name(parsed);
+    let sql_lit = &parsed.positional_sql;
+
+    let is_select = parsed.kind == crate::parse::QueryKind::Select;
+    let query_method = if is_select {
+        quote! { query_raw_readonly }
+    } else {
+        quote! { query_raw }
+    };
+
+    // Build the params slice
+    let param_refs: Vec<TokenStream> = parsed
+        .params
+        .iter()
+        .map(|p| {
+            let name = param_ident(&p.name);
+            quote! { &self.#name as &(dyn ::bsql_core::driver::Encode + Sync) }
+        })
+        .collect();
+
+    let params_slice = if param_refs.is_empty() {
+        quote! { &[] }
+    } else {
+        quote! { &[#(#param_refs),*] }
+    };
+
+    let sql_hash_val = bsql_core::rapid_hash_str(&parsed.positional_sql);
+
+    let has_columns = !validation.columns.is_empty();
+
+    // LIMIT 2 variant for fetch_one/fetch_optional
+    let needs_limit = has_columns
+        && is_select
+        && !parsed.normalized_sql.contains(" limit ")
+        && !parsed.normalized_sql.contains(" for ");
+    let limited_sql = if needs_limit {
+        format!("{} LIMIT 2", parsed.positional_sql)
+    } else {
+        parsed.positional_sql.clone()
+    };
+    let limited_sql_lit = &limited_sql;
+    let limited_sql_hash_val = bsql_core::rapid_hash_str(&limited_sql);
+
+    let row_decode = if has_columns {
+        gen_row_decode(validation)
+    } else {
+        TokenStream::new()
+    };
+
+    let column_check = gen_column_count_check(validation);
+
+    let fetch_methods = if has_columns {
+        let qm = &query_method;
+
+        quote! {
+            ::bsql_core::__bsql_fn! {
+                pub fn fetch_one<E: ::bsql_core::Executor>(
+                    self,
+                    executor: &E,
+                ) -> ::bsql_core::BsqlResult<#target_type> {
+                    let owned = ::bsql_core::__bsql_call!(executor.#qm(#limited_sql_lit, #limited_sql_hash_val, #params_slice))?;
+                    if owned.len() != 1 {
+                        return Err(::bsql_core::error::QueryError::row_count(
+                            "exactly 1 row",
+                            owned.len() as u64,
+                        ));
+                    }
+                    let row = owned.row(0);
+                    #column_check
+                    Ok(#target_type { #row_decode })
+                }
+            }
+
+            ::bsql_core::__bsql_fn! {
+                pub fn fetch_all<E: ::bsql_core::Executor>(
+                    self,
+                    executor: &E,
+                ) -> ::bsql_core::BsqlResult<Vec<#target_type>> {
+                    let owned = ::bsql_core::__bsql_call!(executor.#qm(#sql_lit, #sql_hash_val, #params_slice))?;
+                    owned.iter().map(|row| {
+                        #column_check
+                        Ok(#target_type { #row_decode })
+                    }).collect::<::bsql_core::BsqlResult<Vec<_>>>()
+                }
+            }
+
+            ::bsql_core::__bsql_fn! {
+                pub fn fetch_optional<E: ::bsql_core::Executor>(
+                    self,
+                    executor: &E,
+                ) -> ::bsql_core::BsqlResult<Option<#target_type>> {
+                    let owned = ::bsql_core::__bsql_call!(executor.#qm(#limited_sql_lit, #limited_sql_hash_val, #params_slice))?;
+                    match owned.len() {
+                        0 => Ok(None),
+                        1 => {
+                            let row = owned.row(0);
+                            #column_check
+                            Ok(Some(#target_type { #row_decode }))
+                        }
+                        n => Err(::bsql_core::error::QueryError::row_count(
+                            "0 or 1 rows",
+                            n as u64,
+                        )),
+                    }
+                }
+            }
+        }
+    } else {
+        TokenStream::new()
+    };
+
+    let execute_method = quote! {
+        ::bsql_core::__bsql_fn! {
+            pub fn execute<E: ::bsql_core::Executor>(
+                self,
+                executor: &E,
+            ) -> ::bsql_core::BsqlResult<u64> {
+                ::bsql_core::__bsql_call!(executor.execute_raw(#sql_lit, #sql_hash_val, #params_slice))
+            }
+        }
+    };
+
+    let defer_method = quote! {
+        /// Buffer this operation in a transaction for pipeline flush on commit.
+        ::bsql_core::__bsql_fn! {
+            pub fn defer(self, tx: &::bsql_core::Transaction) -> ::bsql_core::BsqlResult<()> {
+                ::bsql_core::__bsql_call!(tx.defer_execute(#sql_lit, #sql_hash_val, #params_slice))
+            }
+        }
+    };
+
+    let run_method = quote! {
+        /// Execute (INSERT/UPDATE/DELETE). Returns affected row count.
+        ::bsql_core::__bsql_fn! {
+            pub fn run<E: ::bsql_core::Executor>(
+                self,
+                executor: &E,
+            ) -> ::bsql_core::BsqlResult<u64> {
+                ::bsql_core::__bsql_call!(self.execute(executor))
+            }
+        }
+    };
+
+    quote! {
+        #[allow(non_camel_case_types)]
+        impl<'_bsql> #executor_name<'_bsql> {
+            #fetch_methods
+            #execute_method
+            #defer_method
+            #run_method
         }
     }
 }
@@ -3590,6 +3773,139 @@ mod tests {
         assert!(
             code.contains("DecodeError :: column_count"),
             "should reference DecodeError::column_count: {code}"
+        );
+    }
+
+    // --- query_as! codegen tests ---
+
+    #[test]
+    fn query_as_uses_target_type_not_anonymous_struct() {
+        let parsed = parse_query("SELECT id, name FROM users WHERE id = $id: i32").unwrap();
+        let validation = make_validation(vec![col("id", "i32"), col("name", "String")]);
+        let target_type: syn::Path = syn::parse_str("User").unwrap();
+        let code = generate_query_as_code(&parsed, &validation, &target_type);
+        let code_str = code.to_string();
+
+        // Should reference User { ... } for struct construction
+        assert!(
+            code_str.contains("User"),
+            "should reference target type User: {code_str}"
+        );
+        // Should NOT generate BsqlResult_ anonymous struct
+        assert!(
+            !code_str.contains("BsqlResult_"),
+            "should not generate anonymous result struct: {code_str}"
+        );
+        // Should NOT generate BsqlRows_ or BsqlSingleRef_ wrappers
+        assert!(
+            !code_str.contains("BsqlRows_"),
+            "should not generate rows struct: {code_str}"
+        );
+        assert!(
+            !code_str.contains("BsqlSingleRef_"),
+            "should not generate single ref struct: {code_str}"
+        );
+    }
+
+    #[test]
+    fn query_as_generates_fetch_methods() {
+        let parsed = parse_query("SELECT id FROM t WHERE id = $id: i32").unwrap();
+        let validation = make_validation(vec![col("id", "i32")]);
+        let target_type: syn::Path = syn::parse_str("MyRow").unwrap();
+        let code = generate_query_as_code(&parsed, &validation, &target_type);
+        let code_str = code.to_string();
+
+        assert!(
+            code_str.contains("fetch_one"),
+            "missing fetch_one: {code_str}"
+        );
+        assert!(
+            code_str.contains("fetch_all"),
+            "missing fetch_all: {code_str}"
+        );
+        assert!(
+            code_str.contains("fetch_optional"),
+            "missing fetch_optional: {code_str}"
+        );
+        assert!(code_str.contains("execute"), "missing execute: {code_str}");
+        assert!(code_str.contains("fn run"), "missing run: {code_str}");
+        assert!(code_str.contains("fn defer"), "missing defer: {code_str}");
+    }
+
+    #[test]
+    fn query_as_with_module_path() {
+        let parsed = parse_query("SELECT id FROM t WHERE id = $id: i32").unwrap();
+        let validation = make_validation(vec![col("id", "i32")]);
+        let target_type: syn::Path = syn::parse_str("crate::models::User").unwrap();
+        let code = generate_query_as_code(&parsed, &validation, &target_type);
+        let code_str = code.to_string();
+
+        assert!(
+            code_str.contains("crate :: models :: User"),
+            "should use fully qualified path: {code_str}"
+        );
+    }
+
+    #[test]
+    fn query_as_no_columns_has_no_fetch() {
+        let parsed = parse_query("UPDATE t SET a = $a: i32 WHERE id = $id: i32").unwrap();
+        let validation = make_validation(vec![]);
+        let target_type: syn::Path = syn::parse_str("User").unwrap();
+        let code = generate_query_as_code(&parsed, &validation, &target_type);
+        let code_str = code.to_string();
+
+        assert!(
+            !code_str.contains("fetch_one"),
+            "execute-only should not have fetch_one: {code_str}"
+        );
+        assert!(code_str.contains("execute"), "missing execute: {code_str}");
+    }
+
+    #[test]
+    fn query_as_has_column_count_check() {
+        let parsed = parse_query("SELECT id, name FROM t WHERE id = $id: i32").unwrap();
+        let validation = make_validation(vec![col("id", "i32"), col("name", "String")]);
+        let target_type: syn::Path = syn::parse_str("User").unwrap();
+        let code = generate_query_as_code(&parsed, &validation, &target_type);
+        let code_str = code.to_string();
+
+        assert!(
+            code_str.contains("column_count"),
+            "should have column count check: {code_str}"
+        );
+    }
+
+    #[test]
+    fn query_as_nullable_column() {
+        let parsed = parse_query("SELECT email FROM t WHERE id = $id: i32").unwrap();
+        let validation = make_validation(vec![col("email", "Option<String>")]);
+        let target_type: syn::Path = syn::parse_str("UserEmail").unwrap();
+        let code = generate_query_as_code(&parsed, &validation, &target_type);
+        let code_str = code.to_string();
+
+        // Should reference the target type, not anonymous struct
+        assert!(
+            code_str.contains("UserEmail"),
+            "should use target type: {code_str}"
+        );
+        // Should have nullable decode (get_str that returns Option)
+        assert!(
+            code_str.contains("get_str"),
+            "should decode String column: {code_str}"
+        );
+    }
+
+    #[test]
+    fn query_as_injects_limit_2() {
+        let parsed = parse_query("SELECT id FROM t WHERE id = $id: i32").unwrap();
+        let validation = make_validation(vec![col("id", "i32")]);
+        let target_type: syn::Path = syn::parse_str("Row").unwrap();
+        let code = generate_query_as_code(&parsed, &validation, &target_type);
+        let code_str = code.to_string();
+
+        assert!(
+            code_str.contains("LIMIT 2"),
+            "missing LIMIT 2 in query_as fetch_one: {code_str}"
         );
     }
 }

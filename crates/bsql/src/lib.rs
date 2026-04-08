@@ -55,9 +55,10 @@
 //! `raw_query` / `raw_execute` bypass compile-time validation entirely.
 //! Use `query!` for everything else.
 
-// Re-export the query! macro and attribute macros
+// Re-export the query! macro, query_as! macro, and attribute macros
 pub use bsql_macros::pg_enum;
 pub use bsql_macros::query;
+pub use bsql_macros::query_as;
 pub use bsql_macros::sort;
 
 // Re-export all runtime types

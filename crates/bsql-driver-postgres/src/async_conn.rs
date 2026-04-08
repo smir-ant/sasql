@@ -398,7 +398,9 @@ impl AsyncConnection {
         let columns = self
             .send_pipeline(sql, sql_hash, params, true)
             .await?
-            .expect("send_pipeline(need_columns=true) must return Some");
+            .ok_or_else(|| {
+                DriverError::Protocol("send_pipeline(need_columns=true) returned None".into())
+            })?;
 
         let num_cols = columns.len();
         let mut all_col_offsets = crate::conn::acquire_col_offsets();
@@ -769,10 +771,10 @@ impl AsyncConnection {
             let mut has_exec_sync = false;
 
             if can_use_template {
-                let tmpl = info
-                    .bind_template
-                    .as_ref()
-                    .expect("guarded by can_use_template");
+                // can_use_template is true only when bind_template.is_some()
+                let tmpl = info.bind_template.as_ref().ok_or_else(|| {
+                    DriverError::Protocol("bind_template missing despite can_use_template".into())
+                })?;
                 self.write_buf.extend_from_slice(&tmpl.bytes);
 
                 let mut template_ok = true;
