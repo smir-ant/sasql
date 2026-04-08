@@ -100,11 +100,9 @@ pub async fn setup_test_schema(fixtures_sql: &[&str]) -> Result<TestContext, Bsq
     // the correct search_path (the pool has max_size=10 by default,
     // but for tests we typically only use 1 connection).
     let warmup_sql = format!("SET search_path TO \"{}\", public", schema_name);
-    // Pool::set_warmup_sqls takes &[&str] but the string must live long enough.
-    // Since warmup is best-effort and tests are short-lived, we leak the string
-    // to get a 'static lifetime. The leak is bounded (one allocation per test).
-    let leaked: &'static str = Box::leak(warmup_sql.into_boxed_str());
-    pool.set_warmup_sqls(&[leaked]);
+    // set_warmup_sqls copies strings internally (into Box<str>), so &str
+    // only needs to live for the duration of this call. No leak needed.
+    pool.set_warmup_sqls(&[&warmup_sql]);
 
     Ok(TestContext {
         pool,
