@@ -11,7 +11,7 @@ Compile-time safe SQL for Rust. PostgreSQL and SQLite.
 - **Minimal footprint** -- 1.61 MB peak memory — 4.2x less than C (libpq), 4.3x less than sqlx, 10.7x less than Go. See [memory benchmarks](https://github.com/smir-ant/bsql/blob/main/bench/README.md#memory-peak-rss).
 - **Async and sync — both first-class** -- same `query!` macro, same performance, same features. Async uses true cooperative scheduling (RPITIT, no `block_in_place` hacks). Sync removes tokio entirely — pure `fn`, zero async runtime overhead. Switch by changing one line in `Cargo.toml`. Most Rust SQL libraries are async-first with sync as an afterthought, or sync-only. bsql is both, equally.
 - **PostgreSQL and SQLite** -- same `query!` macro, same compile-time safety, both databases. SQLite is not a second-class citizen.
-- **Things nobody else does** -- [automatic N+1 detection](#n1-query-detection), [compile-time query plan analysis](#compile-time-query-plan-analysis), [migration safety checking](#migration-safety-check), [request coalescing](#singleflight-request-coalescing). Details below.
+- **Things nobody else does** -- [automatic N+1 detection](#n1-query-detection), [compile-time query plan analysis](#compile-time-query-plan-analysis), [migration safety checking](#migration-safety-check), [request coalescing](#singleflight-request-coalescing), [SQLite parameter type checking](#sqlite-parameter-type-checking), [smart NULL inference](#smart-null-inference). Details below.
 
 ```rust
 let id = 42i32;
@@ -526,11 +526,40 @@ let pool = Pool::builder()
 
 Only read queries are coalesced. Writes always execute independently. The deduplication key is the query hash combined with the encoded parameter bytes -- same query + same parameters = one database round-trip.
 
+### SQLite parameter type checking
+
+Every Rust SQLite library checks parameter types at runtime — pass a string where an integer is expected, and you get a runtime error. bsql checks at compile time.
+
+```rust
+// Column "id" is INTEGER in the schema.
+// This won't compile — &str is incompatible with INTEGER:
+bsql::query!("SELECT name FROM users WHERE id = $id: &str")
+// error: parameter $id declared as &str but column "id" is INTEGER (expected i64)
+```
+
+bsql parses the SQL, finds which column each parameter is compared against, looks up the column's declared type via `PRAGMA table_info`, and verifies compatibility. Works for `WHERE`, `INSERT VALUES`, `UPDATE SET`, and comparison operators (`=`, `>`, `<`, `LIKE`, `IN`, etc.). No other Rust SQL library does this for SQLite.
+
+### Smart NULL inference
+
+Most SQL libraries treat all computed expressions as nullable. `SELECT COUNT(*) as cnt` returns `Option<i64>` — even though `COUNT(*)` can never be NULL. You end up writing `.unwrap()` everywhere for values that are guaranteed to exist.
+
+bsql analyzes the SQL and infers NOT NULL for expressions that are guaranteed by the SQL standard:
+
+| Expression | Other libraries | bsql |
+|---|---|---|
+| `COUNT(*)` | `Option<i64>` | `i64` |
+| `COALESCE(name, 'unknown')` | `Option<String>` | `String` |
+| `EXISTS(subquery)` | `Option<bool>` | `bool` |
+| `CURRENT_TIMESTAMP` | `Option<...>` | `OffsetDateTime` |
+| `42` (literal) | `Option<i64>` | `i64` |
+
+No `!` override syntax, no user hints, no runtime panics. If the macro can prove NOT NULL — you get the bare type. If it can't — you get `Option<T>` (safe default).
+
 ---
 
 ## About
 
-Built with [Claude Code](https://claude.ai/code). Seventeen design principles written before the first line of code. Specifications first, then implementation, then multiple rounds of architectural audit. 1,800+ tests proving not just that the code works, but that broken code is rejected.
+Built with [Claude Code](https://claude.ai/code). Seventeen design principles written before the first line of code. Specifications first, then implementation, then multiple rounds of architectural audit. 1,650+ tests proving not just that the code works, but that broken code is rejected.
 
 Don't follow the author's name. Don't assume a library that's been around for 2 years is 12 times better than one that's been around for 2 months. Run the benchmarks yourself, read the tests, check the code.
 
