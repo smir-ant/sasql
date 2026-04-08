@@ -42,21 +42,25 @@ impl OwnedResult {
     }
 
     /// Number of rows.
+    #[inline]
     pub fn len(&self) -> usize {
         self.result.len()
     }
 
     /// Whether the result set is empty.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.result.is_empty()
     }
 
     /// Get a row by index.
+    #[inline]
     pub fn row(&self, idx: usize) -> bsql_driver_postgres::Row<'_> {
         self.result.row(idx, &self.arena)
     }
 
     /// Iterate over rows.
+    #[inline]
     pub fn iter(&self) -> impl Iterator<Item = bsql_driver_postgres::Row<'_>> {
         self.result.rows(&self.arena)
     }
