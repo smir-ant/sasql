@@ -1833,6 +1833,132 @@ mod tests {
         assert_eq!(&*sqls[0], "SELECT 99");
     }
 
+    #[test]
+    fn pool_set_warmup_sqls_with_iter_empty() {
+        let pool = Pool::connect("postgres://user:pass@localhost/db").unwrap();
+        pool.set_warmup_sqls(std::iter::empty::<&str>());
+        let sqls = pool
+            .inner
+            .warmup_sqls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert!(sqls.is_empty());
+    }
+
+    #[test]
+    fn pool_set_warmup_sqls_with_owned_string() {
+        let pool = Pool::connect("postgres://user:pass@localhost/db").unwrap();
+        let dynamic = format!("SET search_path TO test_{}", 42);
+        pool.set_warmup_sqls([dynamic]);
+        let sqls = pool
+            .inner
+            .warmup_sqls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert_eq!(sqls.len(), 1);
+        assert_eq!(&*sqls[0], "SET search_path TO test_42");
+    }
+
+    #[test]
+    fn pool_set_warmup_sqls_with_vec_of_strings() {
+        let pool = Pool::connect("postgres://user:pass@localhost/db").unwrap();
+        let sqls_owned: Vec<String> = vec!["SELECT 1".to_owned(), "SELECT 2".to_owned()];
+        pool.set_warmup_sqls(sqls_owned);
+        let sqls = pool
+            .inner
+            .warmup_sqls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert_eq!(sqls.len(), 2);
+        assert_eq!(&*sqls[0], "SELECT 1");
+    }
+
+    #[test]
+    fn pool_set_warmup_sqls_with_boxed_str() {
+        let pool = Pool::connect("postgres://user:pass@localhost/db").unwrap();
+        let b: Box<str> = "SELECT 1".into();
+        pool.set_warmup_sqls([b]);
+        let sqls = pool
+            .inner
+            .warmup_sqls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert_eq!(&*sqls[0], "SELECT 1");
+    }
+
+    #[test]
+    fn pool_set_warmup_sqls_single_static_str() {
+        let pool = Pool::connect("postgres://user:pass@localhost/db").unwrap();
+        pool.set_warmup_sqls(["SET statement_timeout = '30s'"]);
+        let sqls = pool
+            .inner
+            .warmup_sqls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert_eq!(sqls.len(), 1);
+    }
+
+    #[test]
+    fn pool_set_warmup_sqls_preserves_order() {
+        let pool = Pool::connect("postgres://user:pass@localhost/db").unwrap();
+        pool.set_warmup_sqls(["first", "second", "third"]);
+        let sqls = pool
+            .inner
+            .warmup_sqls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert_eq!(&*sqls[0], "first");
+        assert_eq!(&*sqls[1], "second");
+        assert_eq!(&*sqls[2], "third");
+    }
+
+    #[test]
+    fn pool_set_warmup_sqls_unicode() {
+        let pool = Pool::connect("postgres://user:pass@localhost/db").unwrap();
+        pool.set_warmup_sqls(["SET client_encoding TO 'UTF8'", "SELECT '日本語'"]);
+        let sqls = pool
+            .inner
+            .warmup_sqls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert_eq!(&*sqls[1], "SELECT '日本語'");
+    }
+
+    #[test]
+    fn pool_set_warmup_sqls_empty_string() {
+        let pool = Pool::connect("postgres://user:pass@localhost/db").unwrap();
+        pool.set_warmup_sqls([""]);
+        let sqls = pool
+            .inner
+            .warmup_sqls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert_eq!(sqls.len(), 1);
+        assert_eq!(&*sqls[0], "");
+    }
+
+    #[test]
+    fn pool_set_warmup_sqls_long_sql() {
+        let pool = Pool::connect("postgres://user:pass@localhost/db").unwrap();
+        let long = "SELECT ".to_owned() + &"x, ".repeat(1000) + "1";
+        pool.set_warmup_sqls([long]);
+        let sqls = pool
+            .inner
+            .warmup_sqls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert!(sqls[0].len() > 3000);
+    }
+
     // ===============================================================
     // PoolStatus Debug
     // ===============================================================
