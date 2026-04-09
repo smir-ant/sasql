@@ -41,6 +41,15 @@ CREATE TABLE tickets (
     start_time TIME                 -- nullable
 );
 
+-- v0.24: JSONB/JSON test table
+DROP TABLE IF EXISTS test_jsonb CASCADE;
+CREATE TABLE test_jsonb (
+    id SERIAL PRIMARY KEY,
+    data JSONB NOT NULL,
+    meta JSONB,
+    notes JSON
+);
+
 -- Seed data
 INSERT INTO users (login, first_name, last_name, email, score, rating, balance) VALUES
     ('alice', 'Alice', 'Smith', 'alice@example.com', 42, 4.5, 100.50),

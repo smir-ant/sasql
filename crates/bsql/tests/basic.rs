@@ -1023,12 +1023,11 @@ async fn json_null_column() {
     let pool = pool().await;
 
     let data = r#"{"x": 1}"#;
-    let row = bsql::query!(
-        "INSERT INTO test_jsonb (data) VALUES ($data: &str) RETURNING id, notes"
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let row =
+        bsql::query!("INSERT INTO test_jsonb (data) VALUES ($data: &str) RETURNING id, notes")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
     assert!(row.notes.is_none());
 
