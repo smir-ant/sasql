@@ -101,15 +101,18 @@ fn build_columns(
                 nullable_flags[i] = false;
             }
             // Cast inference: `column::type` or `CAST(column AS type)` inherits
-            // nullability from the source column. If the source column is NOT NULL
-            // in this query, the cast result is also NOT NULL.
+            // nullability from the source column. SAFETY: only mark NOT NULL if
+            // there is exactly ONE column with that name and it's NOT NULL.
+            // If ambiguous (multiple columns with same name), stay nullable.
             else if let Some(source_col) = extract_cast_source(expr) {
+                let mut matches: Vec<usize> = Vec::new();
                 for (j, other) in pg_columns.iter().enumerate() {
-                    if j != i && !nullable_flags[j] && other.name.eq_ignore_ascii_case(&source_col)
-                    {
-                        nullable_flags[i] = false;
-                        break;
+                    if j != i && other.name.eq_ignore_ascii_case(&source_col) {
+                        matches.push(j);
                     }
+                }
+                if matches.len() == 1 && !nullable_flags[matches[0]] {
+                    nullable_flags[i] = false;
                 }
             }
         }
@@ -341,12 +344,8 @@ fn extract_cast_source(expr: &str) -> Option<String> {
     // PostgreSQL-style cast: `expr::type`
     if let Some(idx) = lower.find("::") {
         let source = lower[..idx].trim();
-        // Only match bare column names (no parens, no operators, no spaces)
-        if !source.is_empty()
-            && !source.contains('(')
-            && !source.contains(' ')
-            && !source.contains('\'')
-        {
+        // Only match bare column names (no parens, operators, spaces, dots, quotes)
+        if is_bare_column_name(source) {
             return Some(source.to_owned());
         }
     }
@@ -356,17 +355,30 @@ fn extract_cast_source(expr: &str) -> Option<String> {
         let inner = &lower[5..lower.len() - 1]; // strip "cast(" and ")"
         if let Some(as_pos) = inner.rfind(" as ") {
             let source = inner[..as_pos].trim();
-            if !source.is_empty()
-                && !source.contains('(')
-                && !source.contains(' ')
-                && !source.contains('\'')
-            {
+            if is_bare_column_name(source) {
                 return Some(source.to_owned());
             }
         }
     }
 
     None
+}
+
+/// Check if a string is a bare column name (safe to look up in the query).
+/// Rejects expressions, schema-qualified names, literals, functions, etc.
+fn is_bare_column_name(s: &str) -> bool {
+    !s.is_empty()
+        && !s.contains('(')
+        && !s.contains(')')
+        && !s.contains(' ')
+        && !s.contains('\'')
+        && !s.contains('.')
+        && !s.contains('+')
+        && !s.contains('-')
+        && !s.contains('*')
+        && !s.contains('/')
+        && !s.contains('"')
+        && s.parse::<f64>().is_err() // reject numeric literals
 }
 
 /// Check if an expression is a literal value (numeric, string, or boolean).
@@ -1802,5 +1814,42 @@ mod tests {
     fn extract_cast_no_cast_returns_none() {
         assert_eq!(extract_cast_source("plain_column"), None);
         assert_eq!(extract_cast_source("count(*)"), None);
+    }
+
+    #[test]
+    fn extract_cast_whitespace_handling() {
+        assert_eq!(
+            extract_cast_source("  status :: text  "),
+            Some("status".into())
+        );
+        assert_eq!(
+            extract_cast_source("  CAST( name  AS  text )  "),
+            Some("name".into())
+        );
+    }
+
+    #[test]
+    fn extract_cast_nested_cast_returns_none() {
+        // CAST(CAST(x AS int) AS text) — inner expr has parens → not bare column
+        assert_eq!(extract_cast_source("CAST(CAST(x AS int) AS text)"), None);
+    }
+
+    #[test]
+    fn extract_cast_function_call_returns_none() {
+        assert_eq!(extract_cast_source("CAST(lower(name) AS text)"), None);
+        assert_eq!(extract_cast_source("coalesce(a, b)::text"), None);
+    }
+
+    #[test]
+    fn extract_cast_with_schema_qualified_name_returns_none() {
+        // "public.status::text" has a dot — treated as non-bare (safe: stays nullable)
+        assert_eq!(extract_cast_source("public.status::text"), None);
+    }
+
+    #[test]
+    fn extract_cast_empty_returns_none() {
+        assert_eq!(extract_cast_source(""), None);
+        assert_eq!(extract_cast_source("::text"), None);
+        assert_eq!(extract_cast_source("CAST( AS text)"), None);
     }
 }
