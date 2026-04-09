@@ -123,7 +123,7 @@ macro_rules! __bsql_fn {
 pub use error::{BsqlError, BsqlResult};
 pub use executor::{OwnedResult, QueryTarget};
 pub use listener::{Listener, Notification};
-pub use pool::{Pool, PoolBuilder, PoolConnection, PoolStatus};
+pub use pool::{PgPool, Pool, PoolBuilder, PoolConnection, PoolStatus};
 #[cfg(feature = "sqlite")]
 pub use sqlite_pool::{SqlitePool, SqliteStreamingQuery, SqliteTransaction};
 pub use stream::QueryStream;

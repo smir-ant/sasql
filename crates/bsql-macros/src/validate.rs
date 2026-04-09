@@ -274,7 +274,7 @@ fn build_columns(
         }
     }
 
-    // Detect which columns are PG enum types (for the enum error message).
+    // Detect which columns are PG enum types.
     let enum_flags = detect_column_enums(conn, pg_columns);
 
     let mut columns = Vec::with_capacity(pg_columns.len());
@@ -287,10 +287,21 @@ fn build_columns(
         let is_nullable = nullable_flags[i];
 
         if enum_flags[i] {
-            return Err(format!(
-                "column \"{name}\" is PostgreSQL enum type `{pg_type_name}`. \
-                 Define a Rust enum with #[bsql::pg_enum] or cast to text: {name}::text"
-            ));
+            // PG enums are sent as text labels in binary format.
+            // Map to String — user can .parse::<EnumType>() if they have a #[pg_enum].
+            let rust_type = if is_nullable {
+                "Option<String>".to_owned()
+            } else {
+                "String".to_owned()
+            };
+            columns.push(ColumnInfo {
+                name,
+                pg_oid,
+                pg_type_name,
+                is_nullable,
+                rust_type,
+            });
+            continue;
         }
 
         let base_rust_type = crate::types::resolve_rust_type(pg_oid)
@@ -2403,5 +2414,49 @@ mod tests {
         let pg_oids = [21]; // int2
         let result = rewrite_sql_with_casts(sql, &rust_oids, &pg_oids);
         assert_eq!(result, sql, "int4→int2 should NOT be auto-cast");
+    }
+
+    // --- enum column mapping: String (not error) ---
+
+    #[test]
+    fn enum_column_maps_to_string_not_nullable() {
+        // Simulate what build_columns does when enum_flags[i] is true
+        // and the column is NOT NULL.
+        let is_nullable = false;
+        let rust_type = if is_nullable {
+            "Option<String>".to_owned()
+        } else {
+            "String".to_owned()
+        };
+        let col = ColumnInfo {
+            name: "status".into(),
+            pg_oid: 99999,
+            pg_type_name: "unknown".into(),
+            is_nullable,
+            rust_type,
+        };
+        assert_eq!(col.rust_type, "String");
+        assert!(!col.is_nullable);
+    }
+
+    #[test]
+    fn enum_column_maps_to_option_string_nullable() {
+        // Simulate what build_columns does when enum_flags[i] is true
+        // and the column IS nullable.
+        let is_nullable = true;
+        let rust_type = if is_nullable {
+            "Option<String>".to_owned()
+        } else {
+            "String".to_owned()
+        };
+        let col = ColumnInfo {
+            name: "status".into(),
+            pg_oid: 99999,
+            pg_type_name: "unknown".into(),
+            is_nullable,
+            rust_type,
+        };
+        assert_eq!(col.rust_type, "Option<String>");
+        assert!(col.is_nullable);
     }
 }

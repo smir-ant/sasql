@@ -81,6 +81,38 @@ async fn pg_enum_debug() {
 // UUID tests (feature = "uuid")
 // ---------------------------------------------------------------------------
 
+#[tokio::test]
+async fn pg_enum_without_text_cast() {
+    // Enum columns now map to String directly — no ::text cast needed.
+    let pool = pool().await;
+    let id = 1i32;
+    let ticket = bsql::query!("SELECT id, status FROM tickets WHERE id = $id: i32")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(ticket.id, 1);
+    assert_eq!(ticket.status, "new");
+}
+
+#[tokio::test]
+async fn pg_enum_in_join_context() {
+    // Enum detection must work in JOIN context too.
+    let pool = pool().await;
+    let rows = bsql::query!(
+        "SELECT t.id, t.status, u.login
+         FROM tickets t
+         JOIN users u ON u.id = t.created_by_user_id
+         ORDER BY t.id LIMIT 2"
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].status, "new");
+}
+
+// ---------------------------------------------------------------------------
+
 #[cfg(feature = "uuid")]
 mod uuid_tests {
     use super::*;

@@ -68,7 +68,7 @@ pub use bsql_core::error::{self, BsqlError, BsqlResult};
 #[doc(hidden)]
 pub use bsql_core::executor::{OwnedResult, QueryTarget};
 pub use bsql_core::listener::{Listener, Notification};
-pub use bsql_core::pool::{Pool, PoolBuilder, PoolStatus, RawRow};
+pub use bsql_core::pool::{PgPool, Pool, PoolBuilder, PoolStatus, RawRow};
 
 /// A connection borrowed from the pool via [`Pool::acquire()`].
 ///

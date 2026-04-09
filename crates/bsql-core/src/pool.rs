@@ -103,7 +103,7 @@ fn binary_col_to_text(row: &bsql_driver_postgres::Row<'_>, idx: usize, type_oid:
 
 /// A PostgreSQL connection pool.
 ///
-/// Created via [`Pool::connect`] or [`Pool::builder`]. The pool manages a set
+/// Created via [`PgPool::connect`] or [`PgPool::builder`]. The pool manages a set
 /// of connections, automatically acquires/releases them for each query, and
 /// supports optional read/write splitting with a replica.
 ///
@@ -121,11 +121,14 @@ fn binary_col_to_text(row: &bsql_driver_postgres::Row<'_>, idx: usize, type_oid:
 ///     .timeout_secs(5)
 ///     .build()?;
 /// ```
-pub struct Pool {
+pub struct PgPool {
     pub(crate) inner: bsql_driver_postgres::Pool,
     /// Optional read replica pool. When present, `query_raw_readonly` routes here.
     pub(crate) read_pool: Option<bsql_driver_postgres::Pool>,
 }
+
+/// Backward-compatible type alias. Use [`PgPool`] for new code.
+pub type Pool = PgPool;
 
 /// Builder for configuring a connection pool.
 ///
@@ -255,7 +258,7 @@ impl PoolBuilder {
         self
     }
 
-    pub async fn build(self) -> BsqlResult<Pool> {
+    pub async fn build(self) -> BsqlResult<PgPool> {
         let url = self.url.ok_or_else(|| {
             BsqlError::from(bsql_driver_postgres::DriverError::Pool(
                 "pool builder requires a URL".into(),
@@ -300,11 +303,11 @@ impl PoolBuilder {
             None
         };
 
-        Ok(Pool { inner, read_pool })
+        Ok(PgPool { inner, read_pool })
     }
 }
 
-impl Pool {
+impl PgPool {
     /// Connect to PostgreSQL using a connection URL.
     ///
     /// Creates the pool (parses URL, allocates pool structures). Actual TCP/UDS
@@ -313,7 +316,7 @@ impl Pool {
     /// Format: `postgres://user:password@host:port/dbname`
     pub async fn connect(url: &str) -> BsqlResult<Self> {
         let inner = bsql_driver_postgres::Pool::connect(url).map_err(BsqlError::from)?;
-        Ok(Pool {
+        Ok(PgPool {
             inner,
             read_pool: None,
         })
@@ -656,18 +659,18 @@ impl Pool {
     }
 }
 
-impl Clone for Pool {
+impl Clone for PgPool {
     fn clone(&self) -> Self {
-        Pool {
+        PgPool {
             inner: self.inner.clone(),
             read_pool: self.read_pool.clone(),
         }
     }
 }
 
-impl std::fmt::Debug for Pool {
+impl std::fmt::Debug for PgPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Pool")
+        f.debug_struct("PgPool")
             .field("status", &self.status())
             .finish()
     }
@@ -1236,5 +1239,32 @@ mod tests {
         assert_eq!(row.len(), 2);
         assert_eq!(row.get(0), None);
         assert_eq!(row.get(1), None);
+    }
+
+    // --- PgPool rename with Pool type alias ---
+
+    #[test]
+    fn pgpool_and_pool_alias_are_same_type() {
+        // Pool is a type alias for PgPool — both refer to the same struct.
+        fn accepts_pgpool(_: &PgPool) {}
+        fn accepts_pool(_: &Pool) {}
+        fn returns_pgpool() -> fn(&PgPool) {
+            accepts_pool // Pool alias accepted where PgPool expected
+        }
+        fn returns_pool() -> fn(&Pool) {
+            accepts_pgpool // PgPool accepted where Pool alias expected
+        }
+        let _ = returns_pgpool();
+        let _ = returns_pool();
+    }
+
+    #[test]
+    fn pgpool_builder_accessible_via_alias() {
+        // Confirm Pool::builder() works through the type alias
+        let b = Pool::builder();
+        assert_eq!(b.max_size, 10);
+        // Also confirm PgPool::builder() works
+        let b2 = PgPool::builder();
+        assert_eq!(b2.max_size, 10);
     }
 }
