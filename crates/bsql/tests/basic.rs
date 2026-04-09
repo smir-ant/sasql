@@ -2129,6 +2129,113 @@ async fn concurrent_execute_different_rows() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Remaining SQL constructs
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn sql_intersect() {
+    let pool = pool().await;
+    // Users who created tickets AND are active
+    let rows = bsql::query!(
+        "SELECT id FROM users WHERE active = true
+         INTERSECT
+         SELECT created_by_user_id AS id FROM tickets"
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(!rows.is_empty());
+}
+
+#[tokio::test]
+async fn sql_except() {
+    let pool = pool().await;
+    // All user IDs EXCEPT those who created tickets (should be empty with seed data)
+    let rows = bsql::query!(
+        "SELECT id FROM users
+         EXCEPT
+         SELECT created_by_user_id AS id FROM tickets"
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    // Both seed users created tickets
+    assert!(rows.is_empty());
+}
+
+#[tokio::test]
+async fn sql_window_partition_by() {
+    let pool = pool().await;
+    let rows = bsql::query!(
+        "SELECT id, created_by_user_id,
+                ROW_NUMBER() OVER (PARTITION BY created_by_user_id ORDER BY id) AS rn
+         FROM tickets ORDER BY id LIMIT 4"
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(!rows.is_empty());
+    // rn should be i64 (NOT NULL)
+    assert!(rows[0].rn >= 1);
+}
+
+#[tokio::test]
+async fn sql_multiple_ctes() {
+    let pool = pool().await;
+    let rows = bsql::query!(
+        "WITH active_users AS (SELECT id, login FROM users WHERE active = true),
+              user_tickets AS (SELECT created_by_user_id, COUNT(*) AS cnt FROM tickets GROUP BY created_by_user_id)
+         SELECT au.login, ut.cnt
+         FROM active_users au
+         JOIN user_tickets ut ON au.id = ut.created_by_user_id
+         ORDER BY au.login"
+    ).fetch_all(&pool).await.unwrap();
+    assert!(!rows.is_empty());
+}
+
+#[tokio::test]
+async fn sql_in_list_with_params() {
+    let pool = pool().await;
+    let id1 = 1i32;
+    let id2 = 2i32;
+    let rows =
+        bsql::query!("SELECT id, login FROM users WHERE id IN ($id1: i32, $id2: i32) ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows.len(), 2);
+}
+
+#[tokio::test]
+async fn sql_insert_on_conflict_do_update() {
+    let pool = pool().await;
+    // Insert alice — she already exists, so DO UPDATE changes email
+    let affected = bsql::query!(
+        "INSERT INTO users (login, first_name, last_name, email)
+         VALUES ('alice', 'Alice', 'Smith', 'updated@example.com')
+         ON CONFLICT (login) DO UPDATE SET email = EXCLUDED.email"
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(affected, 1);
+
+    // Verify update
+    let id = 1i32;
+    let user = bsql::query!("SELECT email FROM users WHERE id = $id: i32")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(user.email, "updated@example.com");
+
+    // Restore
+    bsql::query!("UPDATE users SET email = 'alice@example.com' WHERE login = 'alice'")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
 // ===========================================================================
 // STRESS TESTS — run with: cargo test -- --ignored
 // ===========================================================================

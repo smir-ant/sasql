@@ -530,3 +530,46 @@ async fn subscribed_channels_idempotent_listen() {
     assert_eq!(channels.len(), 1);
     assert_eq!(channels[0], ch);
 }
+
+// ---------------------------------------------------------------------------
+// Listener edge cases: unlisten then re-listen, unlisten_all then listen new
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn listener_unlisten_then_relisten() {
+    let ch = unique_channel("relisten_test");
+    let mut listener = Listener::connect(DB_URL).await.unwrap();
+
+    listener.listen(&ch).await.unwrap();
+    listener.unlisten(&ch).await.unwrap();
+    listener.listen(&ch).await.unwrap(); // re-subscribe
+
+    // Should receive on re-subscribed channel
+    let sender = Listener::connect(DB_URL).await.unwrap();
+    sender.notify(&ch, "relisten_test").await.unwrap();
+
+    let notification = listener.recv().await.unwrap();
+
+    assert_eq!(notification.channel(), ch);
+    assert_eq!(notification.payload(), "relisten_test");
+}
+
+#[tokio::test]
+async fn listener_unlisten_all_then_listen_new() {
+    let ch1 = unique_channel("ua_old");
+    let ch2 = unique_channel("ua_new");
+    let mut listener = Listener::connect(DB_URL).await.unwrap();
+
+    listener.listen(&ch1).await.unwrap();
+    listener.unlisten_all().await.unwrap();
+    listener.listen(&ch2).await.unwrap();
+
+    // Notify on ch2 — should receive
+    let sender = Listener::connect(DB_URL).await.unwrap();
+    sender.notify(&ch2, "after_unlisten_all").await.unwrap();
+
+    let notification = listener.recv().await.unwrap();
+
+    assert_eq!(notification.channel(), ch2);
+    assert_eq!(notification.payload(), "after_unlisten_all");
+}
