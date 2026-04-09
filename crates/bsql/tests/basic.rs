@@ -849,3 +849,53 @@ async fn fetch_stream_single_row() {
     // No more rows
     assert!(!stream.advance().await.unwrap());
 }
+
+// ---------------------------------------------------------------------------
+// LEFT JOIN nullability — right-side columns must be Option<T>
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn left_join_right_side_is_nullable() {
+    let pool = pool().await;
+    let uid = 1i32;
+
+    // tickets LEFT JOIN users: users columns should be Option even though
+    // users.login is NOT NULL in the table definition, because LEFT JOIN
+    // can produce NULL when no matching row exists.
+    let rows = bsql::query!(
+        "SELECT t.id, u.login
+         FROM tickets t
+         LEFT JOIN users u ON u.id = $uid: i32 AND u.id = -1
+         WHERE t.id = 1"
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    // u.id = -1 guarantees no match → u.login should be None.
+    // bsql detects LEFT JOIN and forces all table-backed columns to Option<T>.
+    assert!(!rows.is_empty());
+    assert!(
+        rows[0].login.is_none(),
+        "LEFT JOIN with no match should produce NULL login"
+    );
+}
+
+#[tokio::test]
+async fn cast_on_not_null_column_is_not_null() {
+    let pool = pool().await;
+    let id = 1i32;
+
+    // tickets.title is NOT NULL. title::text should also be NOT NULL.
+    let ticket = bsql::query!(
+        "SELECT id, title, title::text AS title_text
+         FROM tickets WHERE id = $id: i32"
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    // title_text should be String, not Option<String>
+    assert!(!ticket.title_text.is_empty());
+    assert_eq!(ticket.title, ticket.title_text);
+}

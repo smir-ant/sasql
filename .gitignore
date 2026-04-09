@@ -18,3 +18,5 @@ bench.db
 # Each enum writes its SQL fragments here for query! to validate.
 # Regenerated on every build — not source-controlled.
 .bsql/sorts/
+
+TODO

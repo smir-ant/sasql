@@ -85,6 +85,19 @@ fn build_columns(
 ) -> Result<Vec<ColumnInfo>, String> {
     let mut nullable_flags = resolve_nullability_batch(conn, pg_columns);
 
+    // SAFETY: outer joins make table-backed columns potentially NULL even if
+    // pg_attribute says NOT NULL. The PG wire protocol doesn't report this.
+    // If the query contains any outer join, force ALL table-backed columns to
+    // nullable. This is conservative (may add unnecessary Option<T>) but
+    // prevents runtime panics from unexpected NULLs.
+    if has_outer_join(sql) {
+        for (i, col) in pg_columns.iter().enumerate() {
+            if col.table_oid != 0 {
+                nullable_flags[i] = true;
+            }
+        }
+    }
+
     // Second pass: override known-NOT-NULL computed columns (Fix-6).
     // Parse the SELECT list and check each computed column (table_oid == 0)
     // against known NOT NULL expression patterns.
@@ -329,6 +342,18 @@ fn is_known_not_null(col_name: &str, select_expr: &str) -> bool {
     }
 
     false
+}
+
+/// Check if SQL contains an outer join (LEFT/RIGHT/FULL JOIN).
+/// Uses simple keyword detection — no full SQL parsing.
+fn has_outer_join(sql: &str) -> bool {
+    let lower = sql.to_lowercase();
+    lower.contains(" left join ")
+        || lower.contains(" left outer join ")
+        || lower.contains(" right join ")
+        || lower.contains(" right outer join ")
+        || lower.contains(" full join ")
+        || lower.contains(" full outer join ")
 }
 
 /// Extract the source column name from a cast expression.
@@ -1851,5 +1876,53 @@ mod tests {
         assert_eq!(extract_cast_source(""), None);
         assert_eq!(extract_cast_source("::text"), None);
         assert_eq!(extract_cast_source("CAST( AS text)"), None);
+    }
+
+    // --- has_outer_join ---
+
+    #[test]
+    fn has_outer_join_detects_left() {
+        assert!(has_outer_join(
+            "SELECT a.id FROM a LEFT JOIN b ON a.id = b.id"
+        ));
+        assert!(has_outer_join(
+            "SELECT a.id FROM a LEFT OUTER JOIN b ON a.id = b.id"
+        ));
+    }
+
+    #[test]
+    fn has_outer_join_detects_right() {
+        assert!(has_outer_join(
+            "SELECT a.id FROM a RIGHT JOIN b ON a.id = b.id"
+        ));
+    }
+
+    #[test]
+    fn has_outer_join_detects_full() {
+        assert!(has_outer_join(
+            "SELECT a.id FROM a FULL JOIN b ON a.id = b.id"
+        ));
+        assert!(has_outer_join(
+            "SELECT a.id FROM a FULL OUTER JOIN b ON a.id = b.id"
+        ));
+    }
+
+    #[test]
+    fn has_outer_join_false_for_inner() {
+        assert!(!has_outer_join("SELECT a.id FROM a JOIN b ON a.id = b.id"));
+        assert!(!has_outer_join(
+            "SELECT a.id FROM a INNER JOIN b ON a.id = b.id"
+        ));
+    }
+
+    #[test]
+    fn has_outer_join_false_for_no_join() {
+        assert!(!has_outer_join("SELECT id FROM users WHERE id = $1"));
+    }
+
+    #[test]
+    fn has_outer_join_case_insensitive() {
+        assert!(has_outer_join("select * from a left join b on true"));
+        assert!(has_outer_join("SELECT * FROM a LEFT JOIN b ON TRUE"));
     }
 }
