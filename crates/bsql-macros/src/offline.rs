@@ -9,9 +9,94 @@
 //! needed and incremental compilation works naturally.
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use bitcode::{Decode, Encode};
+
+// ---------------------------------------------------------------------------
+// Stale cache auto-cleanup
+// ---------------------------------------------------------------------------
+
+/// Build state tracker. Uses a generation file (.generation) with PID+timestamp
+/// to detect new cargo build invocations, even when the proc macro DLL stays
+/// loaded across incremental builds.
+static BUILD_STATE: OnceLock<Mutex<BuildState>> = OnceLock::new();
+
+struct BuildState {
+    seen_hashes: std::collections::HashSet<u64>,
+}
+
+/// Ensure stale cleanup has run for this build, and record the hash as active.
+fn track_and_cleanup(dir: &std::path::Path, hash: u64) {
+    let state = BUILD_STATE.get_or_init(|| {
+        // First query! in this DLL load — check if this is a new build
+        let gen_path = dir.join(".generation");
+        let my_gen = format!("{}_{}", std::process::id(), timestamp_nanos());
+
+        let prev_gen = std::fs::read_to_string(&gen_path).unwrap_or_default();
+        let prev_gen = prev_gen.trim();
+
+        // Always treat as new build on first DLL load (OnceLock fires once)
+        if !prev_gen.is_empty() {
+            cleanup_stale_files(dir);
+        }
+
+        // Write new generation + truncate manifest
+        let _ = std::fs::write(&gen_path, &my_gen);
+        let _ = std::fs::write(dir.join(".manifest"), "");
+
+        Mutex::new(BuildState {
+            seen_hashes: std::collections::HashSet::new(),
+        })
+    });
+
+    if let Ok(mut s) = state.lock() {
+        if s.seen_hashes.insert(hash) {
+            let manifest = dir.join(".manifest");
+            let line = format!("{hash:016x}\n");
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&manifest)
+                .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+        }
+    }
+}
+
+fn timestamp_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
+/// Delete .bitcode files not listed in the previous build's manifest.
+fn cleanup_stale_files(dir: &std::path::Path) {
+    let manifest_path = dir.join(".manifest");
+    let active: std::collections::HashSet<String> = std::fs::read_to_string(&manifest_path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.trim().to_owned())
+        .collect();
+
+    if active.is_empty() {
+        return;
+    }
+
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "bitcode") {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    if !active.contains(stem) {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+    }
+}
 
 use crate::parse::ParsedQuery;
 use crate::validate::{ColumnInfo, ValidationResult};
@@ -223,6 +308,10 @@ pub fn sql_hash(normalized_sql: &str) -> u64 {
 pub fn lookup_cached_validation(parsed: &ParsedQuery) -> Result<ValidationResult, String> {
     let hash = sql_hash(&parsed.normalized_sql);
     let dir = cache_dir()?;
+
+    // Track this hash as active (for stale cleanup on next build)
+    track_and_cleanup(dir, hash);
+
     let path = dir.join(format!("{hash:016x}.bitcode"));
 
     if !path.exists() {
@@ -438,6 +527,9 @@ fn write_cache_inner(parsed: &ParsedQuery, validation: &ValidationResult) -> Res
     })?;
 
     let hash = sql_hash(&parsed.normalized_sql);
+
+    // Auto-cleanup: track active hashes, remove stale files on new build
+    track_and_cleanup(dir, hash);
     let cached = validation_to_cached(hash, parsed, validation);
 
     // Wrap in versioned envelope: encode CachedQuery first, then envelope
