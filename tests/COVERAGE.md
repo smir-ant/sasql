@@ -1,129 +1,217 @@
-# Test Coverage Checklist
+# Test Coverage Specification
 
-Tracks what scenarios are tested for each backend. Each row must have a test
-for every applicable backend. Missing tests = technical debt.
+What must be tested. Every item is a scenario that must have a passing test.
+Organized by behavior category, not by backend.
 
-Legend: ✅ = tested, ❌ = missing, — = not applicable
+## 1. Query Execution
 
-## Core Query API
+### 1.1 fetch_all
+- Returns Vec with correct rows
+- Empty result → empty Vec
+- Multiple rows returned correctly
 
-| Scenario | PG | SQLite | Test location |
-|---|---|---|---|
-| fetch_all returns Vec<Row> | ✅ | ✅ | basic:select_fetch_all, sqlite_query:sqlite_fetch_all |
-| fetch_one returns Row | ✅ | ✅ | basic:select_fetch_one, sqlite_query:sqlite_fetch_one |
-| fetch_one on 0 rows → Err | ✅ | ✅ | basic:fetch_one_zero_rows_errors, sqlite_query:sqlite_fetch_one_empty_errors |
-| fetch_optional found | ✅ | ✅ | basic:select_fetch_optional_found, sqlite_query:sqlite_fetch_optional_found |
-| fetch_optional not found → None | ✅ | ✅ | basic:select_fetch_optional_not_found, sqlite_query:sqlite_fetch_optional_not_found |
-| fetch_all empty → empty Vec | ✅ | ✅ | basic:fetch_all_empty_result, sqlite_query:sqlite_fetch_all_empty |
-| execute returns affected count | ✅ | ✅ | basic:update_execute, sqlite_query:sqlite_execute |
-| execute affected = 0 | ✅ | ❌ | basic:execute_returns_zero_for_no_match |
-| execute affected > 1 | ✅ | ❌ | basic:execute_update_multiple_rows |
-| nullable column → Option<T> | ✅ | ✅ | basic:select_nullable_column, sqlite_query:sqlite_nullable_column |
-| NOT NULL column → T | ✅ | ✅ | basic:select_fetch_one, sqlite_query:sqlite_not_null_column |
+### 1.2 fetch_one
+- Returns single row
+- 0 rows → Err
+- 2+ rows → Err
 
-## Parameters
+### 1.3 fetch_optional
+- Found → Some(row)
+- Not found → None
+- 2+ rows → Err
 
-| Scenario | PG | SQLite | Test location |
-|---|---|---|---|
-| String auto-deref → &str | ✅ | ✅ | basic:string_variable_accepted, sqlite_query:sqlite_string_auto_deref |
-| Vec<T> auto-deref → &[T] | ✅ | ❌ | basic:vec_variable_accepted |
-| Option<T> param None → NULL | ✅ | ❌ | basic:option_param_none_inserts_null |
-| Option<T> param Some → value | ✅ | ❌ | basic:option_param_some_inserts_value |
-| Option<i32> on integer column | ✅ | ❌ | basic:option_i32_none_sets_null |
-| &[String] array param | ✅ | — | basic:slice_of_string_as_param |
-| &[i32] array param (ANY) | ✅ | — | basic:array_param_with_any |
-| Empty array param | ✅ | — | basic:empty_string_array_param |
+### 1.4 execute
+- Returns affected count
+- Affected = 0 (no match)
+- Affected = 1
+- Affected > 1 (batch update/delete)
+- Via Pool
+- Via Transaction
+- Via PoolConnection
 
-## Type System
+### 1.5 for_each (zero-alloc)
+- Iterates all rows with borrowed fields
+- Empty result → 0 iterations
+- for_each_map collects results into Vec
 
-| Scenario | PG | SQLite | Test location |
-|---|---|---|---|
-| i32, i64, bool, f32, f64 | ✅ | ✅ | basic:select_multiple_types, sqlite_basic tests |
-| String (TEXT) | ✅ | ✅ | basic, sqlite_query |
-| bytea / BLOB | ✅ | ❌ | basic:bytea_column_type |
-| Array types (int[], text[]) | ✅ | — | basic:array_column_type |
-| PG enum → String | ✅ | — | types:pg_enum_without_text_cast |
-| PG enum in JOIN | ✅ | — | types:pg_enum_in_join_context |
-| PG enum in subquery | ✅ | — | types:pg_enum_in_subquery |
-| JSONB auto-cast | ✅ | — | basic:jsonb_insert_and_select |
-| JSON auto-cast | ✅ | — | basic:json_insert_and_select |
-| Invalid JSON → error | ✅ | — | basic:jsonb_invalid_json_returns_error |
-| UUID | ✅ | — | types:uuid_tests (feature-gated) |
-| Timestamp | ✅ | — | types:time_tests (feature-gated) |
-| Decimal | ✅ | — | types:decimal_tests (feature-gated) |
+### 1.6 fetch_stream (PG only)
+- Streams rows one by one
+- With parameters
+- Drop mid-stream → connection discarded
+- Fully consumed → connection returned to pool
 
-## Transactions
+### 1.7 query_as!
+- Maps to target struct
+- Nullable column → Option field
+- fetch_all variant
 
-| Scenario | PG | SQLite | Test location |
-|---|---|---|---|
-| begin + commit | ✅ | ❌ | transactions:transaction_commit_persists |
-| begin + rollback | ✅ | ❌ | transactions:transaction_rollback_discards |
-| drop without commit → rollback | ✅ | — | transactions:transaction_drop_without_commit |
-| execute in transaction | ✅ | ❌ | transactions:transaction_execute_returns_affected |
-| savepoint + rollback_to | ✅ | — | transactions:savepoint_and_rollback_to |
-| nested savepoints | ✅ | — | transactions:nested_savepoints |
-| deferred pipeline | ✅ | — | transactions:transaction_defer_execute_commit |
-| isolation levels | ✅ | — | transactions:set_isolation_serializable |
+## 2. Parameters
 
-## Error Handling
+### 2.1 Scalar types
+- i32, i64, bool, f32, f64
+- &str / String
+- bytea / BLOB
 
-| Scenario | PG | SQLite | Test location |
-|---|---|---|---|
-| Bad SQL → compile error | ✅ | ✅ | compile_fail tests, sqlite_basic:sqlite_error_bad_sql |
-| Nonexistent table → error | ✅ | ✅ | compile_fail:invalid_table, sqlite_basic:sqlite_error_nonexistent_table |
-| Unique constraint violation | ✅ | ❌ | basic:execute_unique_constraint_violation |
-| FK violation | ✅ | ❌ | basic:execute_foreign_key_violation |
-| Connection refused | ✅ | ❌ | integration:connect_wrong_port |
-| QueryError constructable | ✅ | ✅ | basic:query_error_constructable (shared type) |
+### 2.2 Auto-deref
+- String variable → &str param
+- Vec<T> variable → &[T] param
 
-## Pool & Connection
+### 2.3 Option<T> (nullable params)
+- None → SQL NULL
+- Some(v) → value
+- Option<i32> on integer column
+- Option<&str> on text column
 
-| Scenario | PG | SQLite | Test location |
-|---|---|---|---|
-| Pool connect | ✅ | ✅ | basic:pool(), sqlite_basic:sqlite_open_memory |
-| Pool acquire + use | ✅ | — | basic:pool_acquire_and_use |
-| Pool max_size exhaustion | ✅ | — | integration:pool_concurrent_acquire |
-| Pool acquire timeout | ✅ | — | integration:pool_acquire_timeout |
-| Pool max_lifetime | ✅ | — | integration:pool_max_lifetime |
-| Server disconnect → error | ✅ | — | integration:server_kill_backend |
-| Statement timeout | ✅ | — | integration:statement_timeout |
-| In-memory isolation | — | ✅ | sqlite_basic:sqlite_in_memory_isolation |
+### 2.4 Arrays (PG only)
+- Vec<i32> in ANY()
+- Vec<String> / &[String]
+- Empty array → 0 matches
 
-## Advanced PG Features
+### 2.5 Edge cases
+- Empty string param (not NULL)
+- NULL vs empty string distinction
 
-| Scenario | PG | Test location |
-|---|---|---|
-| Dynamic queries (optional clauses) | ✅ | dynamic:* (19 tests) |
-| Sort enums | ✅ | (compile-time validated) |
-| Singleflight coalescing | ✅ | singleflight:* (10 tests) |
-| Read/write split | ✅ | read_write_split:* (7 tests) |
-| LISTEN/NOTIFY | ✅ | listener:* (31 tests) |
-| Streaming (fetch_stream) | ✅ | basic:fetch_stream_* |
-| for_each (zero-alloc) | ✅ | (used in benchmarks) |
-| pgbouncer unnamed statements | ✅ | integration:unnamed_statement_* (7 tests) |
-| TLS custom CA | ✅ | (unit tests in tls_sync.rs) |
-| raw_query_params | ✅ | basic:raw_query_params_* |
-| query_as! with nullable | ✅ | basic:query_as_with_nullable_column |
-| LEFT JOIN → Option<T> | ✅ | basic:left_join_right_side_is_nullable |
-| Cast NOT NULL inference | ✅ | basic:cast_on_not_null_column |
+## 3. Type System & Nullability
 
-## CLI
+### 3.1 Column nullability
+- NOT NULL column → T
+- Nullable column → Option<T>
+- LEFT JOIN columns → all Option<T>
+- Cast (col::text) inherits NOT NULL from source
 
-| Scenario | Test location |
-|---|---|
-| migrate --check | migrate.rs tests (43 total) |
-| check --verify-cache | verify.rs tests |
-| bsql clean | main.rs:cmd_clean_* |
+### 3.2 NOT NULL inference (computed expressions)
+- COUNT(*) → i64 (not Option)
+- ROW_NUMBER() OVER → i64 (not Option)
+- SUM() on empty group → Option (correctly nullable)
+- COALESCE(col, literal) → T
+- CASE WHEN ... THEN literal ELSE literal END → T
+- NOW(), CURRENT_TIMESTAMP → T
 
-## SQLite Gaps (need tests)
+### 3.3 PG-specific types
+- PG enum → String (without ::text cast)
+- PG enum in JOIN context
+- PG enum in subquery context
+- JSONB auto-cast (&str → jsonb)
+- JSON auto-cast (&str → json)
+- Invalid JSON → PG error (not panic)
+- UUID (feature-gated)
+- Timestamp/Date/Time (feature-gated)
+- Decimal (feature-gated)
+- Array columns (int[], text[])
 
-Priority items missing for SQLite parity:
-1. ❌ execute affected = 0 (no matching WHERE)
-2. ❌ execute affected > 1 (batch update)
-3. ❌ Option<T> param None → NULL
-4. ❌ Option<T> param Some → value
-5. ❌ Vec<T> auto-deref
-6. ❌ Transaction commit/rollback via query!
-7. ❌ Unique constraint violation
-8. ❌ for_each zero-alloc
-9. ❌ query_as! with nullable
+## 4. SQL Constructs
+
+- Simple SELECT with WHERE
+- INSERT with RETURNING
+- UPDATE with WHERE
+- DELETE with WHERE
+- JOIN (INNER)
+- LEFT JOIN
+- Subquery in FROM
+- CTE (WITH clause)
+- UNION ALL
+- GROUP BY + aggregate (COUNT, SUM)
+- Window function (ROW_NUMBER OVER)
+- ORDER BY + LIMIT
+- Dynamic queries with optional clauses (PG)
+- Sort enums (PG)
+
+## 5. Transactions
+
+- Begin + commit → persists
+- Begin + rollback → discards
+- Drop without commit → auto-rollback
+- Execute in transaction → returns affected
+- Error inside tx → aborted state
+- Query after tx error → also fails
+- Rollback after error → recovers
+- Deferred pipeline + flush (PG)
+- Savepoint + rollback_to (PG)
+- Nested savepoints (PG)
+- Isolation levels (PG)
+- Independent transactions isolated (PG)
+
+## 6. Error Handling
+
+### 6.1 Compile-time errors
+- Invalid table name
+- Invalid column name
+- Type mismatch (multiple variants)
+- Parameter missing type annotation
+- Parameter conflicting types
+- DDL rejected (CREATE/DROP/ALTER)
+- DELETE without WHERE
+- UPDATE without WHERE
+- SQL injection attempt
+- Empty/whitespace-only SQL
+- Multiple statements
+- Missing feature flag
+
+### 6.2 Runtime errors
+- Unique constraint violation
+- FK constraint violation
+- Connection refused / wrong port
+- Server disconnect mid-query
+- Statement timeout
+- Query after connection lost
+- Invalid JSON → PG error
+
+### 6.3 Error API
+- QueryError constructable from user code
+- QueryError with source
+- is_unique_violation()
+- is_foreign_key_violation()
+- pg_code() accessor
+
+## 7. Pool & Connection
+
+### 7.1 Connection lifecycle
+- Pool connect / open
+- Pool acquire + use + release
+- Multiple sequential reads
+
+### 7.2 Pool limits
+- Concurrent acquire up to max_size
+- Acquire timeout when exhausted
+- max_lifetime → connection replaced
+- stale_timeout → idle evicted
+
+### 7.3 Recovery
+- Pool recovers after backend terminated
+- Connection usable after statement timeout
+- Pool status invariants under concurrent load
+
+### 7.4 Configuration
+- Builder with all options
+- URL parsing (all params)
+- pgbouncer unnamed statements (PG)
+- Statement cache disabled (PG)
+- In-memory isolation (SQLite)
+
+## 8. Advanced Features
+
+### 8.1 PG-specific
+- LISTEN/NOTIFY
+- Singleflight query coalescing
+- Read/write split
+- COPY protocol
+- TLS with custom CA
+- raw_query_params (dynamic SQL with bind)
+
+### 8.2 CLI
+- migrate --check
+- check --verify-cache
+- bsql clean
+
+### 8.3 Macros
+- #[bsql::pg_enum]
+- #[bsql::test] (schema isolation)
+- #[bsql::sort]
+
+## 9. Performance Contracts
+
+- for_each: zero heap allocations on hot path
+- fetch_stream: constant memory for large result sets
+- Statement cache: cache hit avoids Parse roundtrip
+- Bind template: patching avoids Bind rebuild
+- Thread-local buffer recycling
