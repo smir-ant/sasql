@@ -1945,6 +1945,190 @@ async fn same_param_used_twice() {
     assert!(!rows.is_empty());
 }
 
+// ---------------------------------------------------------------------------
+// Feature interactions
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn dynamic_query_in_transaction() {
+    let pool = pool().await;
+    let mut tx = pool.begin().await.unwrap();
+    let dept: Option<i32> = Some(999);
+    let affected = bsql::query!(
+        "UPDATE tickets SET description = 'dyn_tx'
+         WHERE deleted_at IS NULL
+         [AND department_id = $dept: Option<i32>]"
+    )
+    .execute(&mut tx)
+    .await
+    .unwrap();
+    assert_eq!(affected, 0); // no tickets in dept 999
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn fetch_one_then_execute_same_connection() {
+    let pool = pool().await;
+    let mut conn = pool.acquire().await.unwrap();
+
+    // Read then write on same PoolConnection
+    let id = 1i32;
+    let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(user.login, "alice");
+
+    let desc = "conn_reuse_test";
+    bsql::query!("UPDATE tickets SET description = $desc: &str WHERE id = $id: i32")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    // Restore
+    let desc2: Option<&str> = None;
+    bsql::query!("UPDATE tickets SET description = $desc2: Option<&str> WHERE id = $id: i32")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn multiple_fetch_all_same_pool() {
+    let pool = pool().await;
+    // Two fetch_all calls in sequence — pool should handle connection reuse
+    let users = bsql::query!("SELECT id, login FROM users ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    let tickets = bsql::query!("SELECT id, title FROM tickets ORDER BY id LIMIT 2")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(users.len(), 2);
+    assert_eq!(tickets.len(), 2);
+}
+
+#[tokio::test]
+async fn option_param_in_insert_returning() {
+    let pool = pool().await;
+    let title = "opt_returning";
+    let desc: Option<&str> = None;
+    let uid = 1i32;
+    let row = bsql::query!(
+        "INSERT INTO tickets (title, description, status, created_by_user_id)
+         VALUES ($title: &str, $desc: Option<&str>, 'new', $uid: i32)
+         RETURNING id, description"
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(row.description.is_none());
+
+    let id = row.id;
+    bsql::query!("DELETE FROM tickets WHERE id = $id: i32")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn fetch_all_then_fetch_one_interleaved() {
+    let pool = pool().await;
+    let users = bsql::query!("SELECT id, login FROM users ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(users.len(), 2);
+
+    let id = users[0].id;
+    let user = bsql::query!("SELECT id, login FROM users WHERE id = $id: i32")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(user.login, users[0].login);
+}
+
+#[tokio::test]
+async fn execute_multiple_tables_same_tx() {
+    let pool = pool().await;
+    let mut tx = pool.begin().await.unwrap();
+
+    let desc = "multi_table_tx";
+    let id = 1i32;
+    bsql::query!("UPDATE tickets SET description = $desc: &str WHERE id = $id: i32")
+        .execute(&mut tx)
+        .await
+        .unwrap();
+    bsql::query!("UPDATE users SET score = 99 WHERE id = $id: i32")
+        .execute(&mut tx)
+        .await
+        .unwrap();
+
+    tx.rollback().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency (non-stress, quick)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn concurrent_fetch_all_tokio_spawn() {
+    let pool = pool().await;
+    let pool = std::sync::Arc::new(pool);
+
+    let mut handles = vec![];
+    for _ in 0..5 {
+        let p = pool.clone();
+        handles.push(tokio::spawn(async move {
+            let rows = bsql::query!("SELECT id, login FROM users ORDER BY id")
+                .fetch_all(p.as_ref())
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 2);
+        }));
+    }
+
+    for h in handles {
+        h.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn concurrent_execute_different_rows() {
+    let pool = pool().await;
+    let pool = std::sync::Arc::new(pool);
+
+    // Insert temp rows
+    for i in 0..5i32 {
+        let title = format!("conc_exec_{i}");
+        let uid = 1i32;
+        bsql::query!(
+            "INSERT INTO tickets (title, status, created_by_user_id) VALUES ($title: &str, 'new', $uid: i32)"
+        )
+        .execute(pool.as_ref())
+        .await
+        .unwrap();
+    }
+
+    // Concurrently delete each
+    let mut handles = vec![];
+    for i in 0..5i32 {
+        let p = pool.clone();
+        handles.push(tokio::spawn(async move {
+            let title = format!("conc_exec_{i}");
+            bsql::query!("DELETE FROM tickets WHERE title = $title: &str")
+                .execute(p.as_ref())
+                .await
+                .unwrap();
+        }));
+    }
+
+    for h in handles {
+        h.await.unwrap();
+    }
+}
+
 // ===========================================================================
 // STRESS TESTS — run with: cargo test -- --ignored
 // ===========================================================================

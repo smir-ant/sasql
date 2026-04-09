@@ -3643,6 +3643,52 @@ fn stress_singleflight_contention() {
 }
 
 #[test]
+fn connection_returned_in_tx_state_is_discarded() {
+    let url = require_db!();
+    // If a connection is returned to pool while in transaction state,
+    // pool should discard it (not reuse with dangling tx)
+    let pool = Pool::builder().url(&url).max_size(1).build().unwrap();
+
+    {
+        let mut conn = pool.acquire().unwrap();
+        conn.simple_query("BEGIN").unwrap();
+        // Drop conn WITHOUT commit/rollback — pool should discard
+    }
+
+    // Next acquire should get a fresh connection (not in tx state)
+    let mut conn = pool.acquire().unwrap();
+    let result = conn.simple_query("SELECT 1");
+    assert!(
+        result.is_ok(),
+        "new connection should work after discarded tx connection"
+    );
+}
+
+#[test]
+fn pool_status_after_all_connections_used_and_returned() {
+    let url = require_db!();
+    let pool = Pool::builder().url(&url).max_size(3).build().unwrap();
+
+    // Acquire all 3
+    let c1 = pool.acquire().unwrap();
+    let c2 = pool.acquire().unwrap();
+    let c3 = pool.acquire().unwrap();
+
+    let status = pool.status();
+    assert_eq!(status.active, 3);
+    assert_eq!(status.idle, 0);
+
+    // Return all
+    drop(c1);
+    drop(c2);
+    drop(c3);
+
+    let status = pool.status();
+    assert_eq!(status.active, 0);
+    assert_eq!(status.idle, 3);
+}
+
+#[test]
 #[ignore] // stress: rapid acquire/release cycles
 fn stress_pool_acquire_release_cycles() {
     let url = require_db!();
