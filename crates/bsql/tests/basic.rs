@@ -450,6 +450,21 @@ async fn pool_acquire_and_use() {
 }
 
 #[tokio::test]
+async fn pool_acquire_execute() {
+    let pool = pool().await;
+    let mut conn = pool.acquire().await.unwrap();
+
+    let desc = "via conn";
+    let id = 1i32;
+    let affected =
+        bsql::query!("UPDATE tickets SET description = $desc: &str WHERE id = $id: i32")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    assert_eq!(affected, 1);
+}
+
+#[tokio::test]
 async fn pool_builder_bad_url_errors() {
     let result = Pool::builder().url("not_a_url").build().await;
     assert!(result.is_err());
