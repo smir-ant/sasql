@@ -111,6 +111,22 @@ async fn pg_enum_in_join_context() {
     assert_eq!(rows[0].status, "new");
 }
 
+#[tokio::test]
+async fn pg_enum_in_subquery() {
+    let pool = pool().await;
+    let rows = bsql::query!(
+        "SELECT id, status FROM (
+            SELECT id, status FROM tickets ORDER BY id LIMIT 2
+        ) sub ORDER BY id"
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].status, "new");
+    assert_eq!(rows[1].status, "in_progress");
+}
+
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "uuid")]

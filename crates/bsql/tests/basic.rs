@@ -1322,3 +1322,70 @@ async fn empty_string_array_param() {
     .unwrap();
     assert!(rows.is_empty(), "empty array should match no rows");
 }
+
+// ---------------------------------------------------------------------------
+// query_as! with nullable columns — struct must use Option<T>
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct TicketRow {
+    id: i32,
+    description: Option<String>, // nullable column → Option
+}
+
+#[tokio::test]
+async fn query_as_with_nullable_column() {
+    let pool = pool().await;
+    let id = 1i32;
+    let ticket = bsql::query_as!(
+        TicketRow,
+        "SELECT id, description FROM tickets WHERE id = $id: i32"
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(ticket.id, 1);
+    // description may or may not be set
+    let _ = ticket.description;
+}
+
+#[tokio::test]
+async fn query_as_fetch_all_with_nullable() {
+    let pool = pool().await;
+    let rows = bsql::query_as!(
+        TicketRow,
+        "SELECT id, description FROM tickets ORDER BY id LIMIT 2"
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// QueryError construction from user code
+// ---------------------------------------------------------------------------
+
+#[test]
+fn query_error_constructable_from_user_code() {
+    use std::borrow::Cow;
+    let err = BsqlError::Query(bsql::error::QueryError {
+        message: Cow::Borrowed("test error"),
+        pg_code: Some(Box::from("23505")),
+        source: None,
+    });
+    assert!(err.is_unique_violation());
+    assert!(err.to_string().contains("test error"));
+}
+
+#[test]
+fn query_error_with_source() {
+    use std::borrow::Cow;
+    let io_err = std::io::Error::new(std::io::ErrorKind::Other, "underlying");
+    let err = BsqlError::Query(bsql::error::QueryError {
+        message: Cow::Borrowed("wrapper"),
+        pg_code: None,
+        source: Some(Box::new(io_err)),
+    });
+    assert!(!err.is_unique_violation());
+}
