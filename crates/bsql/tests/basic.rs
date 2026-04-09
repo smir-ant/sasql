@@ -899,3 +899,88 @@ async fn cast_on_not_null_column_is_not_null() {
     assert!(!ticket.title_text.is_empty());
     assert_eq!(ticket.title, ticket.title_text);
 }
+
+// ---------------------------------------------------------------------------
+// JSONB auto-cast — &str transparently cast to jsonb
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn jsonb_insert_and_select() {
+    let pool = pool().await;
+
+    // INSERT &str into jsonb column — bsql auto-casts to ::jsonb
+    let data = r#"{"key": "value", "num": 42}"#;
+    let row = bsql::query!("INSERT INTO test_jsonb (data) VALUES ($data: &str) RETURNING id")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(row.id > 0);
+
+    // SELECT jsonb column — returns String
+    let id = row.id;
+    let row = bsql::query!("SELECT data FROM test_jsonb WHERE id = $id: i32")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(row.data.contains("key"));
+
+    // Clean up
+    bsql::query!("DELETE FROM test_jsonb WHERE id = $id: i32")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn jsonb_nullable_column() {
+    let pool = pool().await;
+
+    // meta is JSONB nullable — insert without it
+    let data = r#"{"test": true}"#;
+    let row = bsql::query!("INSERT INTO test_jsonb (data) VALUES ($data: &str) RETURNING id, meta")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    // meta should be None (Option<String>)
+    assert!(row.meta.is_none());
+
+    let id = row.id;
+    bsql::query!("DELETE FROM test_jsonb WHERE id = $id: i32")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn jsonb_invalid_json_returns_error() {
+    let pool = pool().await;
+
+    // Invalid JSON should produce PG error, not panic
+    let data = "not valid json {{{";
+    let result = bsql::query!("INSERT INTO test_jsonb (data) VALUES ($data: &str) RETURNING id")
+        .fetch_one(&pool)
+        .await;
+
+    assert!(result.is_err(), "invalid JSON should fail");
+}
+
+// ---------------------------------------------------------------------------
+// Array params — unnest and ANY
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn array_param_with_any() {
+    let pool = pool().await;
+
+    let ids = vec![1i32, 2];
+    let rows =
+        bsql::query!("SELECT id, login FROM users WHERE id = ANY($ids: Vec<i32>) ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].login, "alice");
+    assert_eq!(rows[1].login, "bob");
+}

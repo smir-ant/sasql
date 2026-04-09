@@ -2198,4 +2198,72 @@ mod tests {
         let result = replace_param_with_cast("WHERE x = $2", "$1", "$1::jsonb");
         assert_eq!(result, "WHERE x = $2");
     }
+
+    // --- is_safe_auto_cast ---
+
+    #[test]
+    fn safe_auto_cast_text_to_jsonb() {
+        assert!(is_safe_auto_cast(25, 3802)); // text → jsonb
+        assert!(is_safe_auto_cast(1043, 3802)); // varchar → jsonb
+    }
+
+    #[test]
+    fn safe_auto_cast_text_to_json() {
+        assert!(is_safe_auto_cast(25, 114)); // text → json
+        assert!(is_safe_auto_cast(1043, 114)); // varchar → json
+    }
+
+    #[test]
+    fn safe_auto_cast_text_to_xml() {
+        assert!(is_safe_auto_cast(25, 142)); // text → xml
+    }
+
+    #[test]
+    fn unsafe_auto_cast_text_to_int() {
+        assert!(!is_safe_auto_cast(25, 23)); // text → int4: UNSAFE
+        assert!(!is_safe_auto_cast(25, 20)); // text → int8: UNSAFE
+        assert!(!is_safe_auto_cast(25, 21)); // text → int2: UNSAFE
+    }
+
+    #[test]
+    fn unsafe_auto_cast_int_narrowing() {
+        assert!(!is_safe_auto_cast(23, 21)); // int4 → int2: UNSAFE
+        assert!(!is_safe_auto_cast(20, 23)); // int8 → int4: UNSAFE
+    }
+
+    #[test]
+    fn unsafe_auto_cast_bool_to_text() {
+        assert!(!is_safe_auto_cast(16, 25)); // bool → text: UNSAFE
+    }
+
+    #[test]
+    fn unsafe_auto_cast_jsonb_to_text() {
+        assert!(!is_safe_auto_cast(3802, 25)); // jsonb → text: UNSAFE (reverse)
+    }
+
+    #[test]
+    fn safe_auto_cast_same_oid_not_applicable() {
+        // Same OID never reaches is_safe_auto_cast (filtered before), but test anyway
+        assert!(!is_safe_auto_cast(25, 25)); // text → text: not in whitelist (not needed)
+    }
+
+    // --- rewrite_sql_with_casts safety: unsafe casts NOT rewritten ---
+
+    #[test]
+    fn rewrite_skips_unsafe_text_to_int() {
+        let sql = "SELECT * FROM t WHERE id = $1";
+        let rust_oids = [25]; // text
+        let pg_oids = [23]; // int4
+        let result = rewrite_sql_with_casts(sql, &rust_oids, &pg_oids);
+        assert_eq!(result, sql, "text→int4 should NOT be auto-cast");
+    }
+
+    #[test]
+    fn rewrite_skips_unsafe_int_narrowing() {
+        let sql = "SELECT * FROM t WHERE score = $1";
+        let rust_oids = [23]; // int4
+        let pg_oids = [21]; // int2
+        let result = rewrite_sql_with_casts(sql, &rust_oids, &pg_oids);
+        assert_eq!(result, sql, "int4→int2 should NOT be auto-cast");
+    }
 }
