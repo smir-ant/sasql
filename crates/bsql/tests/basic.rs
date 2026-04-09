@@ -1052,3 +1052,168 @@ async fn json_invalid_returns_error() {
 
     assert!(result.is_err(), "invalid JSON in json column should fail");
 }
+
+// ---------------------------------------------------------------------------
+// Auto-deref: String → &str, Vec<T> → &[T]
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn string_variable_accepted_as_str_param() {
+    let pool = pool().await;
+    // `login` is String, param declared as &str — auto-deref should work
+    let login: String = "alice".to_owned();
+    let user = bsql::query!("SELECT id, login FROM users WHERE login = $login: &str")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(user.login, "alice");
+}
+
+#[tokio::test]
+async fn vec_variable_accepted_as_slice_param() {
+    let pool = pool().await;
+    // `ids` is Vec<i32>, param declared as &[i32] — auto-deref should work
+    let ids: Vec<i32> = vec![1, 2];
+    let rows = bsql::query!("SELECT id, login FROM users WHERE id = ANY($ids: &[i32]) ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Option<T> nullable parameters
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn option_param_none_inserts_null() {
+    let pool = pool().await;
+    let data = r#"{"test": true}"#;
+    let meta: Option<&str> = None;
+    let row = bsql::query!(
+        "INSERT INTO test_jsonb (data, meta) VALUES ($data: &str, $meta: Option<&str>) RETURNING id, meta"
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(row.meta.is_none(), "None should insert NULL");
+
+    let id = row.id;
+    bsql::query!("DELETE FROM test_jsonb WHERE id = $id: i32")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn option_param_some_inserts_value() {
+    let pool = pool().await;
+    let data = r#"{"test": true}"#;
+    let meta: Option<&str> = Some(r#"{"source": "test"}"#);
+    let row = bsql::query!(
+        "INSERT INTO test_jsonb (data, meta) VALUES ($data: &str, $meta: Option<&str>) RETURNING id, meta"
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(row.meta.is_some(), "Some should insert value");
+    assert!(row.meta.unwrap().contains("source"));
+
+    let id = row.id;
+    bsql::query!("DELETE FROM test_jsonb WHERE id = $id: i32")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn option_i32_param_none_and_some() {
+    let pool = pool().await;
+    // description is nullable TEXT — test with Option<&str>
+    let desc: Option<&str> = None;
+    let id = 1i32;
+    let affected =
+        bsql::query!("UPDATE tickets SET description = $desc: Option<&str> WHERE id = $id: i32")
+            .execute(&pool)
+            .await
+            .unwrap();
+    assert_eq!(affected, 1);
+
+    // Verify NULL was set
+    let ticket = bsql::query!("SELECT description FROM tickets WHERE id = $id: i32")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(ticket.description.is_none());
+
+    // Now set a value
+    let desc: Option<&str> = Some("restored");
+    bsql::query!("UPDATE tickets SET description = $desc: Option<&str> WHERE id = $id: i32")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let ticket = bsql::query!("SELECT description FROM tickets WHERE id = $id: i32")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(ticket.description.as_deref(), Some("restored"));
+}
+
+// ---------------------------------------------------------------------------
+// raw_query_params — dynamic SQL with parameter binding
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn raw_query_params_basic() {
+    let pool = pool().await;
+    let rows = pool
+        .raw_query_params(
+            "SELECT id, login FROM users WHERE id = $1 ORDER BY id",
+            &[&1i32 as &(dyn bsql::driver::Encode + Sync)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get(1), Some("alice"));
+}
+
+#[tokio::test]
+async fn raw_query_params_multiple() {
+    let pool = pool().await;
+    let rows = pool
+        .raw_query_params(
+            "SELECT id FROM users WHERE id = ANY($1) ORDER BY id",
+            &[&vec![1i32, 2] as &(dyn bsql::driver::Encode + Sync)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+}
+
+#[tokio::test]
+async fn raw_query_params_no_params() {
+    let pool = pool().await;
+    let rows = pool.raw_query_params("SELECT 1 AS n", &[]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get(0), Some("1"));
+}
+
+// ---------------------------------------------------------------------------
+// &[String] as parameter
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn slice_of_string_as_param() {
+    let pool = pool().await;
+    let logins: Vec<String> = vec!["alice".to_owned(), "bob".to_owned()];
+    let rows = bsql::query!(
+        "SELECT id, login FROM users WHERE login = ANY($logins: &[String]) ORDER BY id"
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].login, "alice");
+    assert_eq!(rows[1].login, "bob");
+}
