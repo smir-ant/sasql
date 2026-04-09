@@ -564,8 +564,15 @@ bsql analyzes the SQL and infers NOT NULL for expressions that are guaranteed by
 | `EXISTS(subquery)` | `Option<bool>` | `bool` |
 | `CURRENT_TIMESTAMP` | `Option<...>` | `OffsetDateTime` |
 | `42` (literal) | `Option<i64>` | `i64` |
+| `ROW_NUMBER()` | `Option<i64>` | `i64` |
+| `NOW()` | `Option<...>` | `OffsetDateTime` |
+| `column::text` (NOT NULL source) | `Option<String>` | `String` |
+| `CASE WHEN ... THEN 1 ELSE 0 END` | `Option<i32>` | `i32` |
+| `LEFT JOIN` columns | varies | `Option<T>` (always) |
 
-No `!` override syntax, no user hints, no runtime panics. If the macro can prove NOT NULL — you get the bare type. If it can't — you get `Option<T>` (safe default).
+50+ SQL patterns recognized. No `!` override syntax, no user hints, no runtime panics. If the macro can prove NOT NULL -- you get the bare type. If it can't -- you get `Option<T>`.
+
+> **Safety philosophy: when in doubt, `Option<T>`.** A redundant `.unwrap()` is better than a runtime crash. bsql will never mark a column as NOT NULL unless it can prove it at compile time. LEFT/RIGHT/FULL JOIN columns are always `Option<T>` regardless of table constraints, because the join itself can produce NULLs that `pg_attribute` doesn't report.
 
 ### Test isolation
 
