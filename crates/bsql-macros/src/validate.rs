@@ -100,6 +100,18 @@ fn build_columns(
             if is_known_not_null(&col.name, expr) {
                 nullable_flags[i] = false;
             }
+            // Cast inference: `column::type` or `CAST(column AS type)` inherits
+            // nullability from the source column. If the source column is NOT NULL
+            // in this query, the cast result is also NOT NULL.
+            else if let Some(source_col) = extract_cast_source(expr) {
+                for (j, other) in pg_columns.iter().enumerate() {
+                    if j != i && !nullable_flags[j] && other.name.eq_ignore_ascii_case(&source_col)
+                    {
+                        nullable_flags[i] = false;
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -314,6 +326,47 @@ fn is_known_not_null(col_name: &str, select_expr: &str) -> bool {
     }
 
     false
+}
+
+/// Extract the source column name from a cast expression.
+///
+/// Returns `Some("col")` for:
+///   - `col::text`, `col::integer`, `col::bigint`, etc.
+///   - `CAST(col AS text)`, `cast(col as integer)`, etc.
+///
+/// Returns `None` if the expression is not a simple cast of a bare column name.
+fn extract_cast_source(expr: &str) -> Option<String> {
+    let lower = expr.trim().to_lowercase();
+
+    // PostgreSQL-style cast: `expr::type`
+    if let Some(idx) = lower.find("::") {
+        let source = lower[..idx].trim();
+        // Only match bare column names (no parens, no operators, no spaces)
+        if !source.is_empty()
+            && !source.contains('(')
+            && !source.contains(' ')
+            && !source.contains('\'')
+        {
+            return Some(source.to_owned());
+        }
+    }
+
+    // SQL-standard cast: `CAST(expr AS type)`
+    if lower.starts_with("cast(") && lower.ends_with(')') {
+        let inner = &lower[5..lower.len() - 1]; // strip "cast(" and ")"
+        if let Some(as_pos) = inner.rfind(" as ") {
+            let source = inner[..as_pos].trim();
+            if !source.is_empty()
+                && !source.contains('(')
+                && !source.contains(' ')
+                && !source.contains('\'')
+            {
+                return Some(source.to_owned());
+            }
+        }
+    }
+
+    None
 }
 
 /// Check if an expression is a literal value (numeric, string, or boolean).
@@ -1714,5 +1767,40 @@ mod tests {
     #[test]
     fn unknown_function_remains_nullable() {
         assert!(!is_known_not_null("x", "my_custom_func(col)"));
+    }
+
+    // --- extract_cast_source ---
+
+    #[test]
+    fn extract_cast_pg_style() {
+        assert_eq!(extract_cast_source("status::text"), Some("status".into()));
+        assert_eq!(extract_cast_source("id::bigint"), Some("id".into()));
+        assert_eq!(
+            extract_cast_source("created_at::date"),
+            Some("created_at".into())
+        );
+    }
+
+    #[test]
+    fn extract_cast_sql_style() {
+        assert_eq!(
+            extract_cast_source("CAST(status AS text)"),
+            Some("status".into())
+        );
+        assert_eq!(extract_cast_source("cast(id as bigint)"), Some("id".into()));
+    }
+
+    #[test]
+    fn extract_cast_complex_expression_returns_none() {
+        // Functions, subqueries, arithmetic — not bare column names
+        assert_eq!(extract_cast_source("lower(name)::text"), None);
+        assert_eq!(extract_cast_source("(a + b)::integer"), None);
+        assert_eq!(extract_cast_source("'hello'::text"), None);
+    }
+
+    #[test]
+    fn extract_cast_no_cast_returns_none() {
+        assert_eq!(extract_cast_source("plain_column"), None);
+        assert_eq!(extract_cast_source("count(*)"), None);
     }
 }
