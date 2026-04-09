@@ -22,7 +22,7 @@ use crate::stmt_cache::{build_bind_template, make_stmt_name, StmtCache, StmtInfo
 use crate::sync_io::Stream;
 use crate::types::{
     ColumnDesc, Config, Notification, PgDataRow, PrepareResult, QueryResult, SimpleRow, SslMode,
-    StartupAction,
+    StartupAction, StatementCacheMode,
 };
 use crate::DriverError;
 
@@ -112,6 +112,7 @@ pub struct Connection {
     pid: i32,
     secret: i32,
     max_stmt_cache_size: usize,
+    statement_cache_mode: StatementCacheMode,
     // Second cache line: buffers
     stream: Stream,
     write_buf: Vec<u8>,
@@ -253,6 +254,7 @@ impl Connection {
             pid: 0,
             secret: 0,
             max_stmt_cache_size: 256,
+            statement_cache_mode: config.statement_cache_mode,
             // Buffers
             stream,
             write_buf: Vec::with_capacity(4096),
@@ -490,6 +492,9 @@ impl Connection {
     ///
     /// If the statement is already cached, this is a no-op.
     pub fn prepare_only(&mut self, sql: &str, sql_hash: u64) -> Result<(), DriverError> {
+        if self.statement_cache_mode == StatementCacheMode::Disabled {
+            return Ok(()); // no-op in unnamed mode
+        }
         if self.stmts.contains_key(&sql_hash, sql) {
             return Ok(());
         }
@@ -526,8 +531,8 @@ impl Connection {
     /// Already-cached statements are skipped. If all statements are cached,
     /// no I/O is performed.
     pub fn prepare_batch(&mut self, sqls: &[(&str, u64)]) -> Result<(), DriverError> {
-        if sqls.is_empty() {
-            return Ok(());
+        if sqls.is_empty() || self.statement_cache_mode == StatementCacheMode::Disabled {
+            return Ok(()); // no-op in unnamed mode
         }
 
         // Count how many actually need preparing (not already cached).
@@ -742,6 +747,11 @@ impl Connection {
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> Result<u64, DriverError> {
+        // === Unnamed mode: Parse+Bind+Execute+Sync every time ===
+        if self.statement_cache_mode == StatementCacheMode::Disabled {
+            return self.execute_unnamed(sql, params);
+        }
+
         // === SEND PHASE (inline — no send_pipeline, no flush_write) ===
         self.write_buf.clear();
 
@@ -1095,6 +1105,141 @@ impl Connection {
         Ok(affected_rows)
     }
 
+    /// Execute with unnamed statements — no caching, pgbouncer-compatible.
+    ///
+    /// Sends Parse+Bind+Execute+Sync with empty statement name every time.
+    fn execute_unnamed(
+        &mut self,
+        sql: &str,
+        params: &[&(dyn Encode + Sync)],
+    ) -> Result<u64, DriverError> {
+        if params.len() > i16::MAX as usize {
+            return Err(DriverError::Protocol(format!(
+                "parameter count {} exceeds maximum {}",
+                params.len(),
+                i16::MAX
+            )));
+        }
+
+        self.write_buf.clear();
+        let param_oids: smallvec::SmallVec<[u32; 8]> =
+            params.iter().map(|p| p.type_oid()).collect();
+        proto::write_parse(&mut self.write_buf, b"", sql, &param_oids);
+        proto::write_bind_params(&mut self.write_buf, b"", b"", params);
+        self.write_buf.extend_from_slice(proto::EXECUTE_SYNC);
+        self.stream
+            .write_all(&self.write_buf)
+            .map_err(DriverError::Io)?;
+
+        // Read ParseComplete + BindComplete + CommandComplete + ReadyForQuery.
+        let mut affected_rows: u64 = 0;
+        'outer: loop {
+            loop {
+                let avail = self.stream_buf_end - self.stream_buf_pos;
+                if avail < 5 {
+                    break;
+                }
+
+                let msg_type = self.stream_buf[self.stream_buf_pos];
+                let raw_len = i32::from_be_bytes([
+                    self.stream_buf[self.stream_buf_pos + 1],
+                    self.stream_buf[self.stream_buf_pos + 2],
+                    self.stream_buf[self.stream_buf_pos + 3],
+                    self.stream_buf[self.stream_buf_pos + 4],
+                ]);
+
+                if raw_len < 4 {
+                    return Err(DriverError::Protocol(format!(
+                        "invalid message length {raw_len} for type '{}'",
+                        msg_type as char
+                    )));
+                }
+
+                let payload_len = (raw_len - 4) as usize;
+                let total_msg_len = 5 + payload_len;
+
+                if avail < total_msg_len {
+                    if total_msg_len > self.stream_buf.len() {
+                        let msg = self.read_one_message()?;
+                        match msg {
+                            BackendMessage::ParseComplete
+                            | BackendMessage::BindComplete
+                            | BackendMessage::DataRow { .. } => continue,
+                            BackendMessage::CommandComplete { tag } => {
+                                affected_rows = proto::parse_command_tag(tag);
+                                continue;
+                            }
+                            BackendMessage::EmptyQuery => continue,
+                            BackendMessage::ReadyForQuery { status } => {
+                                self.tx_status = status;
+                                break 'outer;
+                            }
+                            BackendMessage::NoticeResponse { .. } => continue,
+                            BackendMessage::ErrorResponse { data } => {
+                                let fields = proto::parse_error_response(data);
+                                self.drain_to_ready()?;
+                                return Err(self.make_server_error(fields));
+                            }
+                            other => {
+                                return Err(DriverError::Protocol(format!(
+                                    "unexpected message during unnamed execute: {other:?}"
+                                )));
+                            }
+                        }
+                    }
+                    break;
+                }
+
+                // Full message in stream_buf — parse inline.
+                if msg_type == b'1' || msg_type == b'2' || msg_type == b'I' {
+                    // ParseComplete / BindComplete / EmptyQuery — skip.
+                    self.stream_buf_pos += total_msg_len;
+                    continue;
+                } else if msg_type == b'C' {
+                    // CommandComplete
+                    let payload_start = self.stream_buf_pos + 5;
+                    let payload_end = payload_start + payload_len;
+                    affected_rows = proto::parse_command_tag_bytes(
+                        &self.stream_buf[payload_start..payload_end],
+                    );
+                    self.stream_buf_pos += total_msg_len;
+                    continue;
+                } else if msg_type == b'Z' {
+                    // ReadyForQuery
+                    let payload_start = self.stream_buf_pos + 5;
+                    let payload_end = payload_start + payload_len;
+                    if payload_end > payload_start {
+                        self.tx_status = self.stream_buf[payload_start];
+                    }
+                    self.stream_buf_pos += total_msg_len;
+                    break 'outer;
+                } else if msg_type == b'E' {
+                    // ErrorResponse
+                    let payload_start = self.stream_buf_pos + 5;
+                    let payload_end = payload_start + payload_len;
+                    let fields =
+                        proto::parse_error_response(&self.stream_buf[payload_start..payload_end]);
+                    self.stream_buf_pos += total_msg_len;
+                    self.drain_to_ready()?;
+                    return Err(self.make_server_error(fields));
+                } else if msg_type == b'N' || msg_type == b'D' {
+                    // NoticeResponse / DataRow — skip.
+                    self.stream_buf_pos += total_msg_len;
+                    continue;
+                } else {
+                    return Err(DriverError::Protocol(format!(
+                        "unexpected message type '{}' during unnamed execute",
+                        msg_type as char
+                    )));
+                }
+            }
+
+            self.refill_stream_buf()?;
+        }
+
+        Ok(affected_rows)
+    }
+
     /// Execute a query without result rows (INSERT/UPDATE/DELETE).
     ///
     /// Delegates to `execute_monolithic` which inlines the entire send + receive
@@ -1131,6 +1276,11 @@ impl Connection {
         }
 
         debug_assert_eq!(crate::types::hash_sql(sql), sql_hash, "sql_hash mismatch");
+
+        // Unnamed mode: Parse+Bind+Execute for each param set, then Sync.
+        if self.statement_cache_mode == StatementCacheMode::Disabled {
+            return self.execute_pipeline_unnamed(sql, param_sets);
+        }
 
         self.write_buf.clear();
 
@@ -1254,6 +1404,84 @@ impl Connection {
         Ok(results)
     }
 
+    /// Execute pipeline with unnamed statements — pgbouncer-compatible.
+    ///
+    /// For each parameter set, sends Parse+Bind+Execute (with unnamed statement).
+    /// Ends with a single Sync. Returns affected row count per param set.
+    fn execute_pipeline_unnamed(
+        &mut self,
+        sql: &str,
+        param_sets: &[&[&(dyn Encode + Sync)]],
+    ) -> Result<Vec<u64>, DriverError> {
+        let count = param_sets.len();
+        self.write_buf.clear();
+
+        for params in param_sets {
+            if params.len() > i16::MAX as usize {
+                return Err(DriverError::Protocol(format!(
+                    "parameter count {} exceeds maximum {}",
+                    params.len(),
+                    i16::MAX
+                )));
+            }
+            let param_oids: smallvec::SmallVec<[u32; 8]> =
+                params.iter().map(|p| p.type_oid()).collect();
+            proto::write_parse(&mut self.write_buf, b"", sql, &param_oids);
+            proto::write_bind_params(&mut self.write_buf, b"", b"", params);
+            self.write_buf.extend_from_slice(proto::EXECUTE_ONLY);
+        }
+
+        self.write_buf.extend_from_slice(proto::SYNC_ONLY);
+        self.flush_write()?;
+
+        // Read N x (ParseComplete + BindComplete + CommandComplete) + ReadyForQuery
+        let mut results = Vec::with_capacity(count);
+
+        'outer: loop {
+            while let Some((msg_type, start, end, total)) = self.peek_stream_msg()? {
+                if msg_type == b'1' || msg_type == b'2' {
+                    // ParseComplete / BindComplete — skip.
+                } else if msg_type == b'C' {
+                    let rows = proto::parse_command_tag_bytes(&self.stream_buf[start..end]);
+                    results.push(rows);
+                } else if msg_type == b'Z' {
+                    if end > start {
+                        self.tx_status = self.stream_buf[start];
+                    }
+                    self.advance_stream_msg(total);
+                    break 'outer;
+                } else if msg_type == b'I' {
+                    results.push(0);
+                } else if msg_type == b'D' || msg_type == b'N' {
+                    // DataRow / NoticeResponse — skip.
+                } else if msg_type == b'E' {
+                    let fields = proto::parse_error_response(&self.stream_buf[start..end]);
+                    self.advance_stream_msg(total);
+                    self.drain_to_ready()?;
+                    return Err(self.make_server_error(fields));
+                } else if msg_type == b'A' {
+                    let msg = proto::parse_backend_message(msg_type, &self.stream_buf[start..end])?;
+                    if let BackendMessage::NotificationResponse {
+                        pid,
+                        channel,
+                        payload,
+                    } = msg
+                    {
+                        let ch = channel.to_owned();
+                        let pl = payload.to_owned();
+                        self.buffer_notification(pid, &ch, &pl);
+                    }
+                }
+                self.advance_stream_msg(total);
+            }
+
+            self.refill_stream_buf()?;
+        }
+
+        self.shrink_buffers();
+        Ok(results)
+    }
+
     /// Ensure a statement is prepared and cached, doing a round-trip if needed.
     ///
     /// Returns the cached statement name. If the statement is already cached,
@@ -1265,6 +1493,11 @@ impl Connection {
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> Result<[u8; 18], DriverError> {
+        // In unnamed mode, nothing to prepare — return a zeroed name (unused).
+        if self.statement_cache_mode == StatementCacheMode::Disabled {
+            return Ok([0u8; 18]);
+        }
+
         if let Some(info) = self.stmts.get(&sql_hash, sql) {
             return Ok(info.name);
         }
@@ -1305,8 +1538,9 @@ impl Connection {
         Ok(name)
     }
 
-    /// Write Bind+Execute message bytes for a prepared statement into an
-    /// external buffer. Does NOT send anything on the wire.
+    /// Write Bind+Execute (or Parse+Bind+Execute in unnamed mode) message bytes
+    /// for a prepared statement into an external buffer. Does NOT send anything
+    /// on the wire.
     pub(crate) fn write_deferred_bind_execute(
         &self,
         sql: &str,
@@ -1314,6 +1548,16 @@ impl Connection {
         params: &[&(dyn Encode + Sync)],
         buf: &mut Vec<u8>,
     ) -> Result<(), DriverError> {
+        if self.statement_cache_mode == StatementCacheMode::Disabled {
+            // Unnamed mode: include Parse before each Bind+Execute.
+            let param_oids: smallvec::SmallVec<[u32; 8]> =
+                params.iter().map(|p| p.type_oid()).collect();
+            proto::write_parse(buf, b"", sql, &param_oids);
+            proto::write_bind_params(buf, b"", b"", params);
+            buf.extend_from_slice(proto::EXECUTE_ONLY);
+            return Ok(());
+        }
+
         let stmt_name = self
             .stmts
             .get(&sql_hash, sql)
@@ -1350,8 +1594,9 @@ impl Connection {
 
         'outer: loop {
             while let Some((msg_type, start, end, total)) = self.peek_stream_msg()? {
-                if msg_type == b'2' {
-                    // BindComplete — skip.
+                if msg_type == b'1' || msg_type == b'2' {
+                    // ParseComplete / BindComplete — skip.
+                    // ParseComplete appears in unnamed mode (each deferred chunk includes Parse).
                 } else if msg_type == b'C' {
                     // CommandComplete — parse affected rows, push result.
                     let rows = proto::parse_command_tag_bytes(&self.stream_buf[start..end]);
@@ -1533,6 +1778,11 @@ impl Connection {
     where
         F: FnMut(&[u8]) -> Result<(), DriverError>,
     {
+        // Unnamed mode: always go through the unnamed prepare path.
+        if self.statement_cache_mode == StatementCacheMode::Disabled {
+            return self.for_each_raw_unnamed(sql, params, f);
+        }
+
         // === SEND PHASE (inline — no send_pipeline, no flush_write) ===
         self.write_buf.clear();
 
@@ -1917,6 +2167,132 @@ impl Connection {
                         payload_end,
                         sql_hash,
                     )?;
+                }
+
+                self.stream_buf_pos += total_msg_len;
+            }
+
+            self.refill_stream_buf()?;
+        }
+
+        self.shrink_buffers();
+        Ok(())
+    }
+
+    /// for_each_raw with unnamed statements — pgbouncer-compatible.
+    fn for_each_raw_unnamed<F>(
+        &mut self,
+        sql: &str,
+        params: &[&(dyn Encode + Sync)],
+        mut f: F,
+    ) -> Result<(), DriverError>
+    where
+        F: FnMut(&[u8]) -> Result<(), DriverError>,
+    {
+        if params.len() > i16::MAX as usize {
+            return Err(DriverError::Protocol(format!(
+                "parameter count {} exceeds maximum {}",
+                params.len(),
+                i16::MAX
+            )));
+        }
+
+        let param_oids: smallvec::SmallVec<[u32; 8]> =
+            params.iter().map(|p| p.type_oid()).collect();
+
+        self.write_buf.clear();
+        proto::write_parse(&mut self.write_buf, b"", sql, &param_oids);
+        proto::write_describe(&mut self.write_buf, b'S', b"");
+        proto::write_bind_params(&mut self.write_buf, b"", b"", params);
+        self.write_buf.extend_from_slice(proto::EXECUTE_SYNC);
+        self.stream
+            .write_all(&self.write_buf)
+            .map_err(DriverError::Io)?;
+
+        self.expect_message(|m| matches!(m, BackendMessage::ParseComplete))?;
+        let _columns = self.read_column_description()?;
+        self.expect_message(|m| matches!(m, BackendMessage::BindComplete))?;
+
+        'outer: loop {
+            loop {
+                let avail = self.stream_buf_end - self.stream_buf_pos;
+                if avail < 5 {
+                    break;
+                }
+
+                let msg_type = self.stream_buf[self.stream_buf_pos];
+                let raw_len = i32::from_be_bytes([
+                    self.stream_buf[self.stream_buf_pos + 1],
+                    self.stream_buf[self.stream_buf_pos + 2],
+                    self.stream_buf[self.stream_buf_pos + 3],
+                    self.stream_buf[self.stream_buf_pos + 4],
+                ]);
+
+                if raw_len < 4 {
+                    return Err(DriverError::Protocol(format!(
+                        "invalid message length {raw_len} for type '{}'",
+                        msg_type as char
+                    )));
+                }
+
+                let payload_len = (raw_len - 4) as usize;
+                let total_msg_len = 5 + payload_len;
+
+                if avail < total_msg_len {
+                    if total_msg_len > self.stream_buf.len() {
+                        let msg = self.read_one_message()?;
+                        match msg {
+                            BackendMessage::DataRow { data } => {
+                                f(data)?;
+                                continue;
+                            }
+                            BackendMessage::CommandComplete { .. } | BackendMessage::EmptyQuery => {
+                                continue
+                            }
+                            BackendMessage::ReadyForQuery { status } => {
+                                self.tx_status = status;
+                                break 'outer;
+                            }
+                            BackendMessage::ErrorResponse { data } => {
+                                let fields = proto::parse_error_response(data);
+                                self.drain_to_ready()?;
+                                return Err(self.make_server_error(fields));
+                            }
+                            BackendMessage::NoticeResponse { .. } => continue,
+                            other => {
+                                return Err(DriverError::Protocol(format!(
+                                    "unexpected message during for_each_raw (unnamed): {other:?}"
+                                )));
+                            }
+                        }
+                    }
+                    break;
+                }
+
+                let payload_start = self.stream_buf_pos + 5;
+                let payload_end = payload_start + payload_len;
+
+                if msg_type == b'D' {
+                    f(&self.stream_buf[payload_start..payload_end])?;
+                } else if msg_type == b'Z' {
+                    if payload_len >= 1 {
+                        self.tx_status = self.stream_buf[payload_start];
+                    }
+                    self.stream_buf_pos += total_msg_len;
+                    break 'outer;
+                } else if msg_type == b'C' || msg_type == b'I' || msg_type == b'N' {
+                    // CommandComplete / EmptyQuery / NoticeResponse — skip.
+                } else if msg_type == b'E' {
+                    let fields =
+                        proto::parse_error_response(&self.stream_buf[payload_start..payload_end]);
+                    self.stream_buf_pos += total_msg_len;
+                    self.drain_to_ready()?;
+                    return Err(self.make_server_error(fields));
+                } else {
+                    return Err(DriverError::Protocol(format!(
+                        "unexpected message type '{}' during for_each_raw (unnamed)",
+                        msg_type as char
+                    )));
                 }
 
                 self.stream_buf_pos += total_msg_len;
@@ -2379,6 +2755,24 @@ impl Connection {
     ) -> Result<(Arc<[ColumnDesc]>, bool), DriverError> {
         self.write_buf.clear();
 
+        // Unnamed mode: Parse+Describe+Bind+Execute+Flush, no caching.
+        if self.statement_cache_mode == StatementCacheMode::Disabled {
+            let param_oids: smallvec::SmallVec<[u32; 8]> =
+                params.iter().map(|p| p.type_oid()).collect();
+            proto::write_parse(&mut self.write_buf, b"", sql, &param_oids);
+            proto::write_describe(&mut self.write_buf, b'S', b"");
+            proto::write_bind_params(&mut self.write_buf, b"", b"", params);
+            proto::write_execute(&mut self.write_buf, b"", chunk_size);
+            proto::write_flush(&mut self.write_buf);
+            self.flush_write()?;
+
+            self.expect_message(|m| matches!(m, BackendMessage::ParseComplete))?;
+            let columns = self.read_column_description()?;
+            self.expect_message(|m| matches!(m, BackendMessage::BindComplete))?;
+            self.streaming_active = true;
+            return Ok((columns, false));
+        }
+
         let columns = if let Some(info) = self.stmts.get_mut(&sql_hash, sql) {
             // Cache hit: try bind template, fall back to write_bind_params.
             self.query_counter += 1;
@@ -2678,6 +3072,30 @@ impl Connection {
         }
 
         self.write_buf.clear();
+
+        // Unnamed statement path: no caching, compatible with pgbouncer transaction mode.
+        if self.statement_cache_mode == StatementCacheMode::Disabled {
+            let param_oids: smallvec::SmallVec<[u32; 8]> =
+                params.iter().map(|p| p.type_oid()).collect();
+            proto::write_parse(&mut self.write_buf, b"", sql, &param_oids);
+            if need_columns {
+                proto::write_describe(&mut self.write_buf, b'S', b"");
+            }
+            proto::write_bind_params(&mut self.write_buf, b"", b"", params);
+            self.write_buf.extend_from_slice(proto::EXECUTE_SYNC);
+            self.flush_write()?;
+
+            self.expect_message(|m| matches!(m, BackendMessage::ParseComplete))?;
+            let columns = if need_columns {
+                Some(self.read_column_description()?)
+            } else {
+                None
+            };
+            if !skip_bind_complete {
+                self.expect_message(|m| matches!(m, BackendMessage::BindComplete))?;
+            }
+            return Ok(columns);
+        }
 
         let columns = if let Some(info) = self.stmts.get_mut(&sql_hash, sql) {
             // Cache hit: try bind template first, fall back to write_bind_params.

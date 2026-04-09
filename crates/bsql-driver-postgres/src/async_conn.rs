@@ -19,7 +19,9 @@ use crate::codec::Encode;
 use crate::conn::{acquire_resp_buf, parse_data_row_into_buf};
 use crate::proto::{self, BackendMessage};
 use crate::stmt_cache::{build_bind_template, make_stmt_name, StmtCache, StmtInfo};
-use crate::types::{ColumnDesc, Config, Notification, QueryResult, SslMode, StartupAction};
+use crate::types::{
+    ColumnDesc, Config, Notification, QueryResult, SslMode, StartupAction, StatementCacheMode,
+};
 use crate::DriverError;
 
 /// An async PostgreSQL connection over TCP or TLS.
@@ -40,6 +42,7 @@ pub struct AsyncConnection {
     pid: i32,
     secret: i32,
     max_stmt_cache_size: usize,
+    statement_cache_mode: StatementCacheMode,
     // Second cache line: buffers
     stream: AsyncStream,
     write_buf: Vec<u8>,
@@ -150,6 +153,7 @@ impl AsyncConnection {
             pid: 0,
             secret: 0,
             max_stmt_cache_size: 256,
+            statement_cache_mode: config.statement_cache_mode,
             // Buffers
             stream,
             write_buf: Vec::with_capacity(4096),
@@ -757,6 +761,28 @@ impl AsyncConnection {
         }
 
         self.write_buf.clear();
+
+        // Unnamed statement path: no caching, compatible with pgbouncer transaction mode.
+        if self.statement_cache_mode == StatementCacheMode::Disabled {
+            let param_oids: smallvec::SmallVec<[u32; 8]> =
+                params.iter().map(|p| p.type_oid()).collect();
+            proto::write_parse(&mut self.write_buf, b"", sql, &param_oids);
+            if need_columns {
+                proto::write_describe(&mut self.write_buf, b'S', b"");
+            }
+            proto::write_bind_params(&mut self.write_buf, b"", b"", params);
+            self.write_buf.extend_from_slice(proto::EXECUTE_SYNC);
+            self.flush_write().await?;
+
+            self.expect_message(|m| matches!(m, BackendMessage::ParseComplete))
+                .await?;
+            let columns = if need_columns {
+                Some(self.read_column_description().await?)
+            } else {
+                None
+            };
+            return Ok(columns);
+        }
 
         let columns = if let Some(info) = self.stmts.get_mut(&sql_hash, sql) {
             // Cache hit

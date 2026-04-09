@@ -1,10 +1,51 @@
 mod cache;
 mod migrate;
+mod verify;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    if args.len() < 4 || args[1] != "migrate" || args[2] != "--check" {
+    match args.get(1).map(|s| s.as_str()) {
+        Some("migrate") if args.get(2).map(|s| s.as_str()) == Some("--check") => {
+            cmd_migrate_check(&args);
+        }
+        Some("check") if args.get(2).map(|s| s.as_str()) == Some("--verify-cache") => {
+            cmd_verify_cache(&args);
+        }
+        _ => {
+            eprintln!("Usage:");
+            eprintln!(
+                "  bsql migrate --check <migration.sql> [--database-url URL] [--cache-dir DIR]"
+            );
+            eprintln!("  bsql check --verify-cache [--database-url URL] [--cache-dir DIR]");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn get_database_url(args: &[String]) -> String {
+    parse_flag(args, "--database-url")
+        .or_else(|| std::env::var("BSQL_DATABASE_URL").ok())
+        .or_else(|| std::env::var("DATABASE_URL").ok())
+        .unwrap_or_else(|| {
+            eprintln!("error: no database URL. Set BSQL_DATABASE_URL or use --database-url");
+            std::process::exit(2);
+        })
+}
+
+fn get_cache_dir(args: &[String]) -> std::path::PathBuf {
+    parse_flag(args, "--cache-dir")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            find_cache_dir().unwrap_or_else(|| {
+                eprintln!("error: .bsql/queries/ directory not found");
+                std::process::exit(2);
+            })
+        })
+}
+
+fn cmd_migrate_check(args: &[String]) {
+    if args.len() < 4 {
         eprintln!(
             "Usage: bsql migrate --check <migration.sql> [--database-url URL] [--cache-dir DIR]"
         );
@@ -12,32 +53,14 @@ fn main() {
     }
 
     let migration_path = &args[3];
+    let database_url = get_database_url(args);
+    let cache_dir = get_cache_dir(args);
 
-    // Parse optional flags.
-    let database_url = parse_flag(&args, "--database-url")
-        .or_else(|| std::env::var("BSQL_DATABASE_URL").ok())
-        .or_else(|| std::env::var("DATABASE_URL").ok())
-        .unwrap_or_else(|| {
-            eprintln!("error: no database URL. Set BSQL_DATABASE_URL or use --database-url");
-            std::process::exit(2);
-        });
-
-    let cache_dir = parse_flag(&args, "--cache-dir")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            find_cache_dir().unwrap_or_else(|| {
-                eprintln!("error: .bsql/queries/ directory not found");
-                std::process::exit(2);
-            })
-        });
-
-    // Read the migration file.
     let migration_sql = std::fs::read_to_string(migration_path).unwrap_or_else(|e| {
         eprintln!("error: cannot read {}: {}", migration_path, e);
         std::process::exit(2);
     });
 
-    // Read the offline cache.
     let queries = cache::read_cache_dir(&cache_dir).unwrap_or_else(|e| {
         eprintln!("error: cannot read cache: {}", e);
         std::process::exit(2);
@@ -56,14 +79,12 @@ fn main() {
         queries.len()
     );
 
-    // Run the migration check.
     let result =
         migrate::check_migration(&database_url, &migration_sql, &queries).unwrap_or_else(|e| {
             eprintln!("error: {}", e);
             std::process::exit(1);
         });
 
-    // Report results.
     if result.failed.is_empty() {
         println!("All {} queries passed.", result.total_queries);
         std::process::exit(0);
@@ -78,6 +99,52 @@ fn main() {
             println!("  Error: {}", f.error);
             println!();
         }
+        std::process::exit(1);
+    }
+}
+
+fn cmd_verify_cache(args: &[String]) {
+    let database_url = get_database_url(args);
+    let cache_dir = get_cache_dir(args);
+
+    let queries = cache::read_cache_dir(&cache_dir).unwrap_or_else(|e| {
+        eprintln!("error: cannot read cache: {}", e);
+        std::process::exit(2);
+    });
+
+    if queries.is_empty() {
+        println!(
+            "No cached queries found in {}. Nothing to verify.",
+            cache_dir.display()
+        );
+        std::process::exit(0);
+    }
+
+    println!(
+        "Verifying {} cached queries against live schema...",
+        queries.len()
+    );
+
+    let result = verify::verify_cache(&database_url, &queries).unwrap_or_else(|e| {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
+    });
+
+    if result.drifted.is_empty() {
+        println!("All {} queries match current schema.", result.total_queries);
+        std::process::exit(0);
+    } else {
+        println!(
+            "\n{} of {} queries have SCHEMA DRIFT:\n",
+            result.drifted.len(),
+            result.total_queries
+        );
+        for d in &result.drifted {
+            println!("  DRIFT [{:016x}]: {}", d.sql_hash, d.sql);
+            println!("  Reason: {}", d.reason);
+            println!();
+        }
+        eprintln!("Run `cargo build` with a live database connection to regenerate the cache.");
         std::process::exit(1);
     }
 }

@@ -67,7 +67,7 @@ pub use conn::Connection;
 pub use pool::{Pool, PoolBuilder, PoolGuard, PoolStatus, Transaction};
 pub use types::{
     hash_sql, ColumnDesc, Config, Notification, PgDataRow, PrepareResult, QueryResult, Row,
-    SimpleRow, SslMode,
+    SimpleRow, SslMode, StatementCacheMode,
 };
 
 // --- DriverError ---

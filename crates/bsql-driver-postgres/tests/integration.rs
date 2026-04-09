@@ -50,6 +50,7 @@ fn connect_wrong_port() {
         database: "nonexistent".into(),
         ssl: bsql_driver_postgres::SslMode::Disable,
         statement_timeout_secs: 30,
+        statement_cache_mode: bsql_driver_postgres::StatementCacheMode::Named,
     });
 
     assert!(result.is_err());
@@ -1861,6 +1862,7 @@ fn connect_bad_host_fails() {
         database: "nonexistent".into(),
         ssl: bsql_driver_postgres::SslMode::Disable,
         statement_timeout_secs: 5,
+        statement_cache_mode: bsql_driver_postgres::StatementCacheMode::Named,
     });
     assert!(result.is_err(), "connecting to bad host/port should fail");
 }
@@ -1875,6 +1877,7 @@ fn connect_bad_port_port1_fails() {
         database: "nonexistent".into(),
         ssl: bsql_driver_postgres::SslMode::Disable,
         statement_timeout_secs: 30,
+        statement_cache_mode: bsql_driver_postgres::StatementCacheMode::Named,
     });
     assert!(result.is_err());
     assert!(matches!(result, Err(DriverError::Io(_))));
@@ -2769,4 +2772,150 @@ fn copy_in_many_rows() {
         .simple_query_rows("SELECT count(*) FROM copy_many")
         .unwrap();
     assert_eq!(result[0][0].as_deref(), Some("1000"));
+}
+
+// =========================================================================
+// Unnamed statement mode (pgbouncer compatibility)
+// =========================================================================
+
+#[test]
+fn unnamed_statement_basic_query() {
+    let url = require_db!();
+    let mut config = Config::from_url(&url).unwrap();
+    config.statement_cache_mode = bsql_driver_postgres::StatementCacheMode::Disabled;
+    let mut conn = Connection::connect(&config).unwrap();
+
+    let h = hash_sql("SELECT 1 AS n");
+    let arena = Arena::new();
+    let result = conn.query("SELECT 1 AS n", h, &[]).unwrap();
+    let rows: Vec<_> = result.rows(&arena).collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get_i32(0), Some(1));
+}
+
+#[test]
+fn unnamed_statement_cache_stays_empty() {
+    let url = require_db!();
+    let mut config = Config::from_url(&url).unwrap();
+    config.statement_cache_mode = bsql_driver_postgres::StatementCacheMode::Disabled;
+    let mut conn = Connection::connect(&config).unwrap();
+
+    let h1 = hash_sql("SELECT 1");
+    conn.query("SELECT 1", h1, &[]).unwrap();
+
+    let h2 = hash_sql("SELECT 2");
+    conn.query("SELECT 2", h2, &[]).unwrap();
+
+    let h3 = hash_sql("SELECT 3");
+    conn.query("SELECT 3", h3, &[]).unwrap();
+
+    assert_eq!(
+        conn.stmt_cache_len(),
+        0,
+        "stmt cache must stay empty in disabled mode"
+    );
+}
+
+#[test]
+fn unnamed_statement_multiple_queries_same_sql() {
+    let url = require_db!();
+    let mut config = Config::from_url(&url).unwrap();
+    config.statement_cache_mode = bsql_driver_postgres::StatementCacheMode::Disabled;
+    let mut conn = Connection::connect(&config).unwrap();
+
+    let sql = "SELECT 42 AS answer";
+    let h = hash_sql(sql);
+    let arena = Arena::new();
+
+    // Run the same query multiple times — should succeed every time
+    // even without caching (each execution re-parses).
+    for _ in 0..5 {
+        let result = conn.query(sql, h, &[]).unwrap();
+        let rows: Vec<_> = result.rows(&arena).collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_i32(0), Some(42));
+    }
+}
+
+#[test]
+fn unnamed_statement_with_params() {
+    let url = require_db!();
+    let mut config = Config::from_url(&url).unwrap();
+    config.statement_cache_mode = bsql_driver_postgres::StatementCacheMode::Disabled;
+    let mut conn = Connection::connect(&config).unwrap();
+
+    let sql = "SELECT $1::int + $2::int AS sum";
+    let h = hash_sql(sql);
+    let arena = Arena::new();
+
+    let a: i32 = 10;
+    let b: i32 = 20;
+    let result = conn.query(sql, h, &[&a, &b]).unwrap();
+    let rows: Vec<_> = result.rows(&arena).collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get_i32(0), Some(30));
+}
+
+#[test]
+fn unnamed_statement_execute() {
+    let url = require_db!();
+    let mut config = Config::from_url(&url).unwrap();
+    config.statement_cache_mode = bsql_driver_postgres::StatementCacheMode::Disabled;
+    let mut conn = Connection::connect(&config).unwrap();
+
+    conn.simple_query("CREATE TEMP TABLE unnamed_exec_test (id int)")
+        .unwrap();
+
+    let sql = "INSERT INTO unnamed_exec_test VALUES ($1)";
+    let h = hash_sql(sql);
+    let val: i32 = 99;
+    let affected = conn.execute(sql, h, &[&val]).unwrap();
+    assert_eq!(affected, 1);
+
+    let arena = Arena::new();
+    let q = "SELECT id FROM unnamed_exec_test";
+    let hq = hash_sql(q);
+    let result = conn.query(q, hq, &[]).unwrap();
+    let rows: Vec<_> = result.rows(&arena).collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get_i32(0), Some(99));
+}
+
+#[test]
+fn unnamed_statement_url_parsing() {
+    let url = require_db!();
+    // Append statement_cache=disabled to the URL
+    let sep = if url.contains('?') { "&" } else { "?" };
+    let url_disabled = format!("{url}{sep}statement_cache=disabled");
+    let config = Config::from_url(&url_disabled).unwrap();
+    assert_eq!(
+        config.statement_cache_mode,
+        bsql_driver_postgres::StatementCacheMode::Disabled,
+    );
+
+    let mut conn = Connection::connect(&config).unwrap();
+    let h = hash_sql("SELECT 1");
+    let arena = Arena::new();
+    let result = conn.query("SELECT 1", h, &[]).unwrap();
+    let rows: Vec<_> = result.rows(&arena).collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(conn.stmt_cache_len(), 0);
+}
+
+#[test]
+fn unnamed_statement_pool_builder() {
+    let url = require_db!();
+    let pool = Pool::builder()
+        .url(&url)
+        .max_size(1)
+        .statement_cache_mode(bsql_driver_postgres::StatementCacheMode::Disabled)
+        .build()
+        .unwrap();
+
+    let mut conn = pool.acquire().unwrap();
+    let h = hash_sql("SELECT 1");
+    let arena = Arena::new();
+    let result = conn.query("SELECT 1", h, &[]).unwrap();
+    let rows: Vec<_> = result.rows(&arena).collect();
+    assert_eq!(rows.len(), 1);
 }

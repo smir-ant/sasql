@@ -13,7 +13,7 @@ use std::time::Duration;
 use crate::arena::Arena;
 use crate::codec::Encode;
 use crate::conn::Connection;
-use crate::types::{Config, PgDataRow, QueryResult, SimpleRow};
+use crate::types::{Config, PgDataRow, QueryResult, SimpleRow, StatementCacheMode};
 use crate::DriverError;
 
 #[cfg(feature = "async")]
@@ -593,6 +593,8 @@ pub struct PoolBuilder {
     max_stmt_cache_size: usize,
     /// Maximum idle duration before a connection is considered stale.
     stale_timeout: Duration,
+    /// Override statement cache mode (None = use Config value from URL).
+    statement_cache_mode: Option<StatementCacheMode>,
     /// Threshold for N+1 detection warnings.
     #[cfg(feature = "detect-n-plus-one")]
     n_plus_one_threshold: Option<u16>,
@@ -608,6 +610,7 @@ impl PoolBuilder {
             min_idle: 0,                                   // no minimum by default
             max_stmt_cache_size: 256,                      // LRU eviction at 256 stmts
             stale_timeout: Duration::from_secs(30),        // 30s default
+            statement_cache_mode: None,
             #[cfg(feature = "detect-n-plus-one")]
             n_plus_one_threshold: None,
         }
@@ -664,6 +667,19 @@ impl PoolBuilder {
         self
     }
 
+    /// Set the statement cache mode for all connections in this pool.
+    ///
+    /// - `StatementCacheMode::Named` (default): named prepared statements,
+    ///   cached and reused. Best performance for direct connections.
+    /// - `StatementCacheMode::Disabled`: unnamed statements only — compatible
+    ///   with pgbouncer/PgCat transaction pooling mode.
+    ///
+    /// This overrides the `?statement_cache=` URL parameter.
+    pub fn statement_cache_mode(mut self, mode: StatementCacheMode) -> Self {
+        self.statement_cache_mode = Some(mode);
+        self
+    }
+
     /// Set the threshold for N+1 detection warnings.
     ///
     /// When the same `sql_hash` fires more than this many times sequentially
@@ -680,7 +696,11 @@ impl PoolBuilder {
             .url
             .ok_or_else(|| DriverError::Pool("pool builder requires a URL".into()))?;
 
-        let config = Arc::new(Config::from_url(&url)?);
+        let mut config = Config::from_url(&url)?;
+        if let Some(mode) = self.statement_cache_mode {
+            config.statement_cache_mode = mode;
+        }
+        let config = Arc::new(config);
 
         let pool = Pool {
             inner: Arc::new(PoolInner {

@@ -29,6 +29,12 @@ pub struct Config {
     /// After connecting, the driver sends `SET statement_timeout = '{N}s'`.
     /// If a query exceeds this duration, PostgreSQL kills it and returns an error.
     pub statement_timeout_secs: u32,
+    /// Statement cache mode. Default: [`StatementCacheMode::Named`].
+    ///
+    /// Set to [`StatementCacheMode::Disabled`] for pgbouncer/PgCat transaction
+    /// pooling compatibility. When disabled, every query uses the unnamed
+    /// prepared statement — no server-side statement caching.
+    pub statement_cache_mode: StatementCacheMode,
 }
 
 /// Zeroize password on drop to minimize credential lifetime in memory.
@@ -48,6 +54,26 @@ pub enum SslMode {
     Prefer,
     /// Require TLS, fail if server says 'N'.
     Require,
+}
+
+/// Statement cache behavior.
+///
+/// Controls whether the driver caches prepared statements with server-side
+/// names (`s_{hash}`) or uses unnamed statements for every query.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StatementCacheMode {
+    /// Named prepared statements, cached and reused (default).
+    ///
+    /// Best performance for direct connections. Each unique SQL text is
+    /// prepared once and reused across subsequent calls.
+    #[default]
+    Named,
+    /// Unnamed statements only — compatible with pgbouncer transaction mode.
+    ///
+    /// Every query sends Parse+Bind+Execute with the unnamed statement (`""`).
+    /// Slightly slower (extra Parse per query) but works with connection
+    /// poolers that use transaction-level pooling (pgbouncer, PgCat).
+    Disabled,
 }
 
 impl Config {
@@ -92,6 +118,7 @@ impl Config {
 
         let mut ssl = SslMode::Prefer;
         let mut statement_timeout_secs: u32 = 30;
+        let mut statement_cache_mode = StatementCacheMode::Named;
         let mut host_override: Option<String> = None;
         for param in params.split('&') {
             if param.is_empty() {
@@ -111,6 +138,16 @@ impl Config {
                 };
             } else if let Some(val) = param.strip_prefix("statement_timeout=") {
                 statement_timeout_secs = val.parse::<u32>().unwrap_or(30);
+            } else if let Some(val) = param.strip_prefix("statement_cache=") {
+                statement_cache_mode = match val {
+                    "named" => StatementCacheMode::Named,
+                    "disabled" => StatementCacheMode::Disabled,
+                    _ => {
+                        return Err(DriverError::Protocol(format!(
+                            "unknown statement_cache mode: '{val}' (expected: named, disabled)"
+                        )));
+                    }
+                };
             } else if let Some(val) = param.strip_prefix("host=") {
                 host_override = Some(url_decode(val)?);
             }
@@ -136,6 +173,7 @@ impl Config {
             },
             ssl,
             statement_timeout_secs,
+            statement_cache_mode,
         };
         config.validate()?;
         Ok(config)
@@ -833,6 +871,7 @@ mod tests {
             database: "db".into(),
             ssl: SslMode::Disable,
             statement_timeout_secs: 30,
+            statement_cache_mode: StatementCacheMode::Named,
         };
         assert!(cfg.validate().is_err());
     }
@@ -848,6 +887,7 @@ mod tests {
             database: "db".into(),
             ssl: SslMode::Disable,
             statement_timeout_secs: 30,
+            statement_cache_mode: StatementCacheMode::Named,
         };
         assert!(cfg.validate().is_err());
     }
@@ -863,6 +903,7 @@ mod tests {
             database: String::new(),
             ssl: SslMode::Disable,
             statement_timeout_secs: 30,
+            statement_cache_mode: StatementCacheMode::Named,
         };
         assert!(cfg.validate().is_err());
     }
@@ -926,6 +967,56 @@ mod tests {
         assert_eq!(cfg.statement_timeout_secs, 30); // fallback
     }
 
+    // ===================================================================
+    // Statement cache mode tests
+    // ===================================================================
+
+    #[test]
+    fn parse_statement_cache_default() {
+        let cfg = Config::from_url("postgres://user:pass@localhost/db").unwrap();
+        assert_eq!(cfg.statement_cache_mode, StatementCacheMode::Named);
+    }
+
+    #[test]
+    fn parse_statement_cache_named() {
+        let cfg =
+            Config::from_url("postgres://user:pass@localhost/db?statement_cache=named").unwrap();
+        assert_eq!(cfg.statement_cache_mode, StatementCacheMode::Named);
+    }
+
+    #[test]
+    fn parse_statement_cache_disabled() {
+        let cfg =
+            Config::from_url("postgres://user:pass@localhost/db?statement_cache=disabled").unwrap();
+        assert_eq!(cfg.statement_cache_mode, StatementCacheMode::Disabled);
+    }
+
+    #[test]
+    fn parse_statement_cache_invalid() {
+        let result = Config::from_url("postgres://user:pass@localhost/db?statement_cache=off");
+        assert!(result.is_err(), "invalid value 'off' should be rejected");
+        let result = Config::from_url("postgres://user:pass@localhost/db?statement_cache=DISABLED");
+        assert!(result.is_err(), "uppercase should be rejected");
+        let result = Config::from_url("postgres://user:pass@localhost/db?statement_cache=bogus");
+        assert!(result.is_err(), "bogus value should be rejected");
+    }
+
+    #[test]
+    fn parse_statement_cache_with_other_params() {
+        let cfg = Config::from_url(
+            "postgres://user:pass@localhost/db?sslmode=disable&statement_cache=disabled&statement_timeout=60",
+        )
+        .unwrap();
+        assert_eq!(cfg.statement_cache_mode, StatementCacheMode::Disabled);
+        assert_eq!(cfg.ssl, SslMode::Disable);
+        assert_eq!(cfg.statement_timeout_secs, 60);
+    }
+
+    #[test]
+    fn statement_cache_mode_default_is_named() {
+        assert_eq!(StatementCacheMode::default(), StatementCacheMode::Named);
+    }
+
     #[test]
     fn config_uds_path_format() {
         let cfg = Config::from_url("postgres://user@localhost/db?host=/tmp").unwrap();
@@ -952,6 +1043,7 @@ mod tests {
             database: "db".into(),
             ssl: SslMode::Disable,
             statement_timeout_secs: 30,
+            statement_cache_mode: StatementCacheMode::Named,
         };
         assert!(cfg.host_is_uds());
         assert_eq!(cfg.uds_path(), "/tmp/.s.PGSQL.5432");
@@ -967,6 +1059,7 @@ mod tests {
             database: "db".into(),
             ssl: SslMode::Disable,
             statement_timeout_secs: 30,
+            statement_cache_mode: StatementCacheMode::Named,
         };
         assert!(cfg.host_is_uds());
         assert_eq!(cfg.uds_path(), "/var/run/postgresql/.s.PGSQL.5433");
@@ -982,6 +1075,7 @@ mod tests {
             database: "db".into(),
             ssl: SslMode::Disable,
             statement_timeout_secs: 30,
+            statement_cache_mode: StatementCacheMode::Named,
         };
         assert!(!cfg.host_is_uds());
     }
@@ -996,6 +1090,7 @@ mod tests {
             database: "db".into(),
             ssl: SslMode::Disable,
             statement_timeout_secs: 30,
+            statement_cache_mode: StatementCacheMode::Named,
         };
         assert!(!cfg.host_is_uds());
     }

@@ -139,6 +139,99 @@ pub const BASE_TYPE_MAP: &[TypeMapping] = &[
         rust_type: "String",
         is_array: false,
     },
+    // ── Text search types ─────────────────────────────────────────
+    TypeMapping {
+        pg_oid: 3614,
+        pg_name: "tsvector",
+        rust_type: "String",
+        is_array: false,
+    },
+    TypeMapping {
+        pg_oid: 3615,
+        pg_name: "tsquery",
+        rust_type: "String",
+        is_array: false,
+    },
+    // ── Geometric types ───────────────────────────────────────────
+    TypeMapping {
+        pg_oid: 600,
+        pg_name: "point",
+        rust_type: "String",
+        is_array: false,
+    },
+    TypeMapping {
+        pg_oid: 628,
+        pg_name: "line",
+        rust_type: "String",
+        is_array: false,
+    },
+    TypeMapping {
+        pg_oid: 601,
+        pg_name: "lseg",
+        rust_type: "String",
+        is_array: false,
+    },
+    TypeMapping {
+        pg_oid: 603,
+        pg_name: "box",
+        rust_type: "String",
+        is_array: false,
+    },
+    TypeMapping {
+        pg_oid: 602,
+        pg_name: "path",
+        rust_type: "String",
+        is_array: false,
+    },
+    TypeMapping {
+        pg_oid: 604,
+        pg_name: "polygon",
+        rust_type: "String",
+        is_array: false,
+    },
+    TypeMapping {
+        pg_oid: 718,
+        pg_name: "circle",
+        rust_type: "String",
+        is_array: false,
+    },
+    // ── Range types ───────────────────────────────────────────────
+    TypeMapping {
+        pg_oid: 3904,
+        pg_name: "int4range",
+        rust_type: "String",
+        is_array: false,
+    },
+    TypeMapping {
+        pg_oid: 3926,
+        pg_name: "int8range",
+        rust_type: "String",
+        is_array: false,
+    },
+    TypeMapping {
+        pg_oid: 3906,
+        pg_name: "numrange",
+        rust_type: "String",
+        is_array: false,
+    },
+    TypeMapping {
+        pg_oid: 3908,
+        pg_name: "tsrange",
+        rust_type: "String",
+        is_array: false,
+    },
+    TypeMapping {
+        pg_oid: 3910,
+        pg_name: "tstzrange",
+        rust_type: "String",
+        is_array: false,
+    },
+    TypeMapping {
+        pg_oid: 3912,
+        pg_name: "daterange",
+        rust_type: "String",
+        is_array: false,
+    },
     // ── Array types ───────────────────────────────────────────────
     TypeMapping {
         pg_oid: 1000,
@@ -206,6 +299,18 @@ pub const BASE_TYPE_MAP: &[TypeMapping] = &[
         rust_type: "Vec<String>",
         is_array: true,
     },
+    TypeMapping {
+        pg_oid: 3643,
+        pg_name: "_tsvector",
+        rust_type: "Vec<String>",
+        is_array: true,
+    },
+    TypeMapping {
+        pg_oid: 3645,
+        pg_name: "_tsquery",
+        rust_type: "Vec<String>",
+        is_array: true,
+    },
 ];
 
 /// Look up the Rust type for a PostgreSQL OID.
@@ -261,6 +366,24 @@ pub fn is_param_compatible(rust_type: &str, pg_oid: u32) -> bool {
         | ("&str", 869) | ("String", 869)     // inet
         | ("&str", 650) | ("String", 650)     // cidr
         | ("&str", 829) | ("String", 829)     // macaddr
+        // Text search types: accept &str and String
+        | ("&str", 3614) | ("String", 3614)   // tsvector
+        | ("&str", 3615) | ("String", 3615)   // tsquery
+        // Geometric types: accept &str and String
+        | ("&str", 600) | ("String", 600)     // point
+        | ("&str", 628) | ("String", 628)     // line
+        | ("&str", 601) | ("String", 601)     // lseg
+        | ("&str", 603) | ("String", 603)     // box
+        | ("&str", 602) | ("String", 602)     // path
+        | ("&str", 604) | ("String", 604)     // polygon
+        | ("&str", 718) | ("String", 718)     // circle
+        // Range types: accept &str and String
+        | ("&str", 3904) | ("String", 3904)   // int4range
+        | ("&str", 3926) | ("String", 3926)   // int8range
+        | ("&str", 3906) | ("String", 3906)   // numrange
+        | ("&str", 3908) | ("String", 3908)   // tsrange
+        | ("&str", 3910) | ("String", 3910)   // tstzrange
+        | ("&str", 3912) | ("String", 3912)   // daterange
         // Array params
         | ("&[bool]", 1000) | ("Vec<bool>", 1000)
         | ("&[i16]", 1005)  | ("Vec<i16>", 1005)
@@ -272,6 +395,8 @@ pub fn is_param_compatible(rust_type: &str, pg_oid: u32) -> bool {
         | ("&[&str]", 1015) | ("&[String]", 1015) | ("Vec<String>", 1015)
         | ("&[&str]", 199)  | ("&[String]", 199)  | ("Vec<String>", 199)   // json[]
         | ("&[&str]", 3807) | ("&[String]", 3807) | ("Vec<String>", 3807) // jsonb[]
+        | ("&[&str]", 3643) | ("&[String]", 3643) | ("Vec<String>", 3643) // tsvector[]
+        | ("&[&str]", 3645) | ("&[String]", 3645) | ("Vec<String>", 3645) // tsquery[]
     )
 }
 
@@ -573,5 +698,133 @@ mod tests {
         assert!(is_param_compatible("&str", 829));
         assert!(is_param_compatible("String", 829));
         assert!(!is_param_compatible("i32", 829));
+    }
+
+    // ── Text search types ──────────────────────────────────────────
+
+    #[test]
+    fn lookup_tsvector_type() {
+        assert_eq!(rust_type_for_oid(3614), Some("String"));
+        assert_eq!(pg_name_for_oid(3614), Some("tsvector"));
+    }
+
+    #[test]
+    fn lookup_tsquery_type() {
+        assert_eq!(rust_type_for_oid(3615), Some("String"));
+        assert_eq!(pg_name_for_oid(3615), Some("tsquery"));
+    }
+
+    #[test]
+    fn lookup_tsvector_array_type() {
+        assert_eq!(rust_type_for_oid(3643), Some("Vec<String>"));
+        assert_eq!(pg_name_for_oid(3643), Some("_tsvector"));
+    }
+
+    #[test]
+    fn lookup_tsquery_array_type() {
+        assert_eq!(rust_type_for_oid(3645), Some("Vec<String>"));
+        assert_eq!(pg_name_for_oid(3645), Some("_tsquery"));
+    }
+
+    #[test]
+    fn param_compatible_tsvector() {
+        assert!(is_param_compatible("&str", 3614));
+        assert!(is_param_compatible("String", 3614));
+        assert!(!is_param_compatible("i32", 3614));
+    }
+
+    #[test]
+    fn param_compatible_tsquery() {
+        assert!(is_param_compatible("&str", 3615));
+        assert!(is_param_compatible("String", 3615));
+        assert!(!is_param_compatible("i32", 3615));
+    }
+
+    #[test]
+    fn param_compatible_tsvector_array() {
+        assert!(is_param_compatible("&[&str]", 3643));
+        assert!(is_param_compatible("Vec<String>", 3643));
+        assert!(!is_param_compatible("Vec<i32>", 3643));
+    }
+
+    #[test]
+    fn param_compatible_tsquery_array() {
+        assert!(is_param_compatible("&[&str]", 3645));
+        assert!(is_param_compatible("Vec<String>", 3645));
+        assert!(!is_param_compatible("Vec<i32>", 3645));
+    }
+
+    // ── Geometric types ────────────────────────────────────────────
+
+    #[test]
+    fn lookup_geometric_types() {
+        assert_eq!(rust_type_for_oid(600), Some("String"));
+        assert_eq!(pg_name_for_oid(600), Some("point"));
+        assert_eq!(rust_type_for_oid(628), Some("String"));
+        assert_eq!(pg_name_for_oid(628), Some("line"));
+        assert_eq!(rust_type_for_oid(601), Some("String"));
+        assert_eq!(pg_name_for_oid(601), Some("lseg"));
+        assert_eq!(rust_type_for_oid(603), Some("String"));
+        assert_eq!(pg_name_for_oid(603), Some("box"));
+        assert_eq!(rust_type_for_oid(602), Some("String"));
+        assert_eq!(pg_name_for_oid(602), Some("path"));
+        assert_eq!(rust_type_for_oid(604), Some("String"));
+        assert_eq!(pg_name_for_oid(604), Some("polygon"));
+        assert_eq!(rust_type_for_oid(718), Some("String"));
+        assert_eq!(pg_name_for_oid(718), Some("circle"));
+    }
+
+    #[test]
+    fn param_compatible_geometric_types() {
+        for oid in [600, 628, 601, 603, 602, 604, 718] {
+            assert!(
+                is_param_compatible("&str", oid),
+                "&str should be compatible with OID {oid}"
+            );
+            assert!(
+                is_param_compatible("String", oid),
+                "String should be compatible with OID {oid}"
+            );
+            assert!(
+                !is_param_compatible("i32", oid),
+                "i32 should NOT be compatible with OID {oid}"
+            );
+        }
+    }
+
+    // ── Range types ────────────────────────────────────────────────
+
+    #[test]
+    fn lookup_range_types() {
+        assert_eq!(rust_type_for_oid(3904), Some("String"));
+        assert_eq!(pg_name_for_oid(3904), Some("int4range"));
+        assert_eq!(rust_type_for_oid(3926), Some("String"));
+        assert_eq!(pg_name_for_oid(3926), Some("int8range"));
+        assert_eq!(rust_type_for_oid(3906), Some("String"));
+        assert_eq!(pg_name_for_oid(3906), Some("numrange"));
+        assert_eq!(rust_type_for_oid(3908), Some("String"));
+        assert_eq!(pg_name_for_oid(3908), Some("tsrange"));
+        assert_eq!(rust_type_for_oid(3910), Some("String"));
+        assert_eq!(pg_name_for_oid(3910), Some("tstzrange"));
+        assert_eq!(rust_type_for_oid(3912), Some("String"));
+        assert_eq!(pg_name_for_oid(3912), Some("daterange"));
+    }
+
+    #[test]
+    fn param_compatible_range_types() {
+        for oid in [3904, 3926, 3906, 3908, 3910, 3912] {
+            assert!(
+                is_param_compatible("&str", oid),
+                "&str should be compatible with OID {oid}"
+            );
+            assert!(
+                is_param_compatible("String", oid),
+                "String should be compatible with OID {oid}"
+            );
+            assert!(
+                !is_param_compatible("i32", oid),
+                "i32 should NOT be compatible with OID {oid}"
+            );
+        }
     }
 }
