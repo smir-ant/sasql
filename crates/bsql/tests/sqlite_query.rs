@@ -728,3 +728,133 @@ fn sqlite_stress_for_each_100() {
         .execute(&pool)
         .unwrap();
 }
+
+// ===========================================================================
+// Parity with PG shared scenarios
+// ===========================================================================
+
+#[test]
+fn sqlite_select_multiple_types() {
+    let pool = pool();
+    let id = 1i64;
+    let user = bsql::query!("SELECT id, name, email, score, active FROM users WHERE id = $id: i64")
+        .fetch_one(&pool)
+        .unwrap();
+    // Verify all types are accessible
+    let _id: Option<i64> = user.id;
+    let _name: String = user.name;
+    let _email: Option<String> = user.email;
+    let _score: Option<i64> = user.score;
+    let _active: i64 = user.active;
+}
+
+#[test]
+fn sqlite_select_star() {
+    let pool = pool();
+    let rows = bsql::query!("SELECT * FROM users ORDER BY id")
+        .fetch_all(&pool)
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+}
+
+#[test]
+fn sqlite_select_count_expression() {
+    let pool = pool();
+    let row = bsql::query!("SELECT COUNT(*) AS cnt FROM users")
+        .fetch_one(&pool)
+        .unwrap();
+    // COUNT in SQLite is Option<i64>
+    assert!(row.cnt.is_some());
+}
+
+#[test]
+fn sqlite_for_each_closure_error_stops() {
+    let pool = pool();
+    let mut count = 0u32;
+    let result = bsql::query!("SELECT id, name FROM users ORDER BY id").for_each(&pool, |_row| {
+        count += 1;
+        if count >= 1 {
+            return Err(bsql::error::QueryError::row_count("test stop", 0));
+        }
+        Ok(())
+    });
+    assert!(result.is_err());
+    assert_eq!(count, 1, "should stop after first row");
+}
+
+#[test]
+fn sqlite_multiple_fetch_all_same_pool() {
+    let pool = pool();
+    let users = bsql::query!("SELECT id, name FROM users ORDER BY id")
+        .fetch_all(&pool)
+        .unwrap();
+    let items = bsql::query!("SELECT id, title FROM items ORDER BY id")
+        .fetch_all(&pool)
+        .unwrap();
+    assert_eq!(users.len(), 2);
+    assert_eq!(items.len(), 2);
+}
+
+#[test]
+fn sqlite_fetch_all_then_fetch_one() {
+    let pool = pool();
+    let users = bsql::query!("SELECT id, name FROM users ORDER BY id")
+        .fetch_all(&pool)
+        .unwrap();
+    assert_eq!(users.len(), 2);
+    let id = 1i64;
+    let user = bsql::query!("SELECT id, name FROM users WHERE id = $id: i64")
+        .fetch_one(&pool)
+        .unwrap();
+    assert_eq!(user.name, "alice");
+}
+
+#[test]
+fn sqlite_insert_verify_delete() {
+    let pool = pool();
+    let name = "roundtrip_test";
+    bsql::query!("INSERT INTO users (name) VALUES ($name: &str)")
+        .execute(&pool)
+        .unwrap();
+    let row = bsql::query!("SELECT name FROM users WHERE name = $name: &str")
+        .fetch_one(&pool)
+        .unwrap();
+    assert_eq!(row.name, "roundtrip_test");
+    bsql::query!("DELETE FROM users WHERE name = $name: &str")
+        .execute(&pool)
+        .unwrap();
+    let rows = bsql::query!("SELECT name FROM users WHERE name = $name: &str")
+        .fetch_all(&pool)
+        .unwrap();
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn sqlite_empty_string_param() {
+    let pool = pool();
+    let id = 1i64;
+    let desc = Some("".to_owned());
+    bsql::query!("UPDATE items SET description = $desc: Option<String> WHERE id = $id: i64")
+        .execute(&pool)
+        .unwrap();
+    let item = bsql::query!("SELECT description FROM items WHERE id = $id: i64")
+        .fetch_one(&pool)
+        .unwrap();
+    assert_eq!(item.description, Some(String::new()));
+    // Restore
+    let desc: Option<String> = None;
+    bsql::query!("UPDATE items SET description = $desc: Option<String> WHERE id = $id: i64")
+        .execute(&pool)
+        .unwrap();
+}
+
+#[test]
+fn sqlite_error_display_format() {
+    let pool = pool();
+    let id = 999i64;
+    let err = bsql::query!("SELECT name FROM users WHERE id = $id: i64")
+        .fetch_one(&pool)
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(!msg.is_empty(), "error display should not be empty");
+}
