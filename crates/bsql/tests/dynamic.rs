@@ -254,6 +254,42 @@ async fn optional_clause_execute() {
     assert_eq!(affected, 0);
 }
 
+#[tokio::test]
+async fn optional_clause_execute_via_transaction() {
+    let pool = pool().await;
+    let mut tx = pool.begin().await.unwrap();
+
+    let dept: Option<i32> = Some(999);
+    let affected = bsql::query!(
+        "UPDATE tickets SET description = 'tx_dyn'
+         WHERE deleted_at IS NULL
+         [AND department_id = $dept: Option<i32>]"
+    )
+    .execute(&mut tx)
+    .await
+    .unwrap();
+    assert_eq!(affected, 0);
+
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn optional_clause_execute_via_conn() {
+    let pool = pool().await;
+    let mut conn = pool.acquire().await.unwrap();
+
+    let dept: Option<i32> = Some(999);
+    let affected = bsql::query!(
+        "UPDATE tickets SET description = 'conn_dyn'
+         WHERE deleted_at IS NULL
+         [AND department_id = $dept: Option<i32>]"
+    )
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(affected, 0);
+}
+
 // --- Three optional clauses ---
 
 #[tokio::test]

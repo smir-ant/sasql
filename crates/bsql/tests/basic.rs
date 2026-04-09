@@ -501,6 +501,89 @@ async fn conn_execute_returns_zero_for_no_match() {
     assert_eq!(affected, 0);
 }
 
+// ---------------------------------------------------------------------------
+// .execute() — affected > 1
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn execute_update_multiple_rows() {
+    let pool = pool().await;
+
+    // Insert 3 tickets with a unique marker title
+    let title = "batch_multi_test";
+    let uid = 1i32;
+    for _ in 0..3 {
+        bsql::query!(
+            "INSERT INTO tickets (title, status, created_by_user_id)
+             VALUES ($title: &str, 'new', $uid: i32)"
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    // UPDATE all three at once
+    let title2 = "batch_multi_test";
+    let affected = bsql::query!(
+        "UPDATE tickets SET description = 'batched' WHERE title = $title2: &str"
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(affected, 3);
+
+    // DELETE all three at once
+    let title3 = "batch_multi_test";
+    let deleted = bsql::query!("DELETE FROM tickets WHERE title = $title3: &str")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(deleted, 3);
+}
+
+// ---------------------------------------------------------------------------
+// .execute() — constraint violations
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn execute_unique_constraint_violation() {
+    let pool = pool().await;
+
+    // "alice" already exists in seed data — UNIQUE on users.login
+    let login = "alice";
+    let result = bsql::query!(
+        "INSERT INTO users (login, first_name, last_name, email)
+         VALUES ($login: &str, 'Dup', 'User', 'dup@example.com')"
+    )
+    .execute(&pool)
+    .await;
+
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(err.is_unique_violation(), "expected unique violation, got: {err:?}");
+}
+
+#[tokio::test]
+async fn execute_foreign_key_violation() {
+    let pool = pool().await;
+
+    // user_id 999999 does not exist — FK on tickets.created_by_user_id
+    let bad_uid = 999999i32;
+    let result = bsql::query!(
+        "INSERT INTO tickets (title, status, created_by_user_id)
+         VALUES ('fk_test', 'new', $bad_uid: i32)"
+    )
+    .execute(&pool)
+    .await;
+
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        err.is_foreign_key_violation(),
+        "expected FK violation, got: {err:?}"
+    );
+}
+
 #[tokio::test]
 async fn pool_builder_bad_url_errors() {
     let result = Pool::builder().url("not_a_url").build().await;
