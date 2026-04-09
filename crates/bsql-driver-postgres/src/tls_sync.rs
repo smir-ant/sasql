@@ -255,52 +255,6 @@ mod tests {
         pem
     }
 
-    /// Generate a self-signed CA certificate and return (cert_pem, key_pem).
-    fn generate_ca() -> (String, String) {
-        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, "bsql-test-ca");
-        let key = rcgen::KeyPair::generate().unwrap();
-        let ca = params.self_signed(&key).unwrap();
-        let cert_pem = der_to_pem("CERTIFICATE", ca.der());
-        let key_pem = der_to_pem("PRIVATE KEY", key.serialize_der());
-        (cert_pem, key_pem)
-    }
-
-    /// Generate a client certificate signed by the given CA, returning
-    /// (cert_pem, key_pem).
-    fn generate_client_cert(ca_cert_pem: &str, ca_key_der: &[u8]) -> (String, String) {
-        // Reconstruct the CA key from DER
-        let ca_key = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
-            &rustls::pki_types::PrivatePkcs8KeyDer::from(ca_key_der.to_vec()),
-            &rcgen::PKCS_ECDSA_P256_SHA256,
-        )
-        .unwrap();
-
-        // Parse the CA cert PEM to get DER
-        let ca_cert_der: Vec<u8> = rustls_pemfile::certs(&mut ca_cert_pem.as_bytes())
-            .next()
-            .unwrap()
-            .unwrap()
-            .to_vec();
-        let ca_params = rcgen::CertificateParams::from_ca_cert_der(&ca_cert_der).unwrap();
-        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
-
-        let mut client_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-        client_params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, "bsql-test-client");
-        let client_key = rcgen::KeyPair::generate().unwrap();
-        let client_cert = client_params
-            .signed_by(&client_key, &ca_cert, &ca_key)
-            .unwrap();
-        let cert_pem = der_to_pem("CERTIFICATE", client_cert.der());
-        let key_pem = der_to_pem("PRIVATE KEY", client_key.serialize_der());
-        (cert_pem, key_pem)
-    }
-
     #[test]
     fn build_default_config_returns_global() {
         let cfg = default_config();
@@ -312,7 +266,16 @@ mod tests {
 
     #[test]
     fn custom_ca_config_builds() {
-        let (ca_pem, _ca_key_pem) = generate_ca();
+        // Generate a self-signed CA certificate
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "bsql-test-ca");
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_cert = params.self_signed(&ca_key).unwrap();
+        let ca_pem = der_to_pem("CERTIFICATE", ca_cert.der());
+
         let dir = std::env::temp_dir().join("bsql_tls_test_ca");
         std::fs::create_dir_all(&dir).unwrap();
         let ca_path = dir.join("ca.pem");
@@ -335,25 +298,34 @@ mod tests {
 
     #[test]
     fn client_cert_config_builds() {
-        let (ca_pem, _ca_key_pem) = generate_ca();
-        // For generate_client_cert we need the CA key DER. Generate a new CA
-        // and capture the key DER directly.
-        let ca_key = rcgen::KeyPair::generate().unwrap();
-        let ca_key_der = ca_key.serialize_der().to_vec();
+        // Generate a CA
         let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         ca_params
             .distinguished_name
-            .push(rcgen::DnType::CommonName, "bsql-test-ca-2");
+            .push(rcgen::DnType::CommonName, "bsql-test-ca");
+        let ca_key = rcgen::KeyPair::generate().unwrap();
         let ca_cert = ca_params.self_signed(&ca_key).unwrap();
-        let ca_pem = der_to_pem("CERTIFICATE", ca_cert.der());
-        let (client_pem, client_key_pem) = generate_client_cert(&ca_pem, &ca_key_der);
+
+        // Generate a client cert signed by the CA
+        let mut client_params =
+            rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        client_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "bsql-test-client");
+        let client_key = rcgen::KeyPair::generate().unwrap();
+        let client_cert = client_params
+            .signed_by(&client_key, &ca_cert, &ca_key)
+            .unwrap();
+
+        let client_cert_pem = der_to_pem("CERTIFICATE", client_cert.der());
+        let client_key_pem = der_to_pem("PRIVATE KEY", &client_key.serialize_der());
 
         let dir = std::env::temp_dir().join("bsql_tls_test_client");
         std::fs::create_dir_all(&dir).unwrap();
         let cert_path = dir.join("client.pem");
         let key_path = dir.join("client.key");
-        std::fs::write(&cert_path, &client_pem).unwrap();
+        std::fs::write(&cert_path, &client_cert_pem).unwrap();
         std::fs::write(&key_path, &client_key_pem).unwrap();
 
         let mut cfg = default_config();
