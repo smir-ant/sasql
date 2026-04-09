@@ -305,7 +305,7 @@ async fn independent_transactions_are_isolated() {
     // tx2 should NOT see the uncommitted row (default READ COMMITTED isolation).
     let search = "tx_isolated_test";
     let seen = bsql::query!("SELECT id FROM tickets WHERE title = $search: &str")
-        .fetch(&mut tx2)
+        .fetch_all(&mut tx2)
         .await
         .unwrap();
     assert!(seen.is_empty(), "tx2 should not see tx1's uncommitted row");
@@ -509,7 +509,7 @@ async fn transaction_defer_execute_commit() {
     // Verify rows were inserted (use existing cached query by id pattern)
     let search = "defer_commit_bsql";
     let rows = bsql::query!("SELECT id FROM tickets WHERE title = $search: &str")
-        .fetch(&pool)
+        .fetch_all(&pool)
         .await
         .unwrap();
     assert_eq!(rows.len(), 2);
@@ -566,7 +566,7 @@ async fn transaction_defer_execute_auto_flushes_before_read() {
     // SELECT triggers auto-flush, so we can read-your-writes
     let search = "defer_autoflush_bsql";
     let rows = bsql::query!("SELECT id FROM tickets WHERE title = $search: &str")
-        .fetch(&mut tx)
+        .fetch_all(&mut tx)
         .await
         .unwrap();
     assert_eq!(rows.len(), 1);
@@ -678,7 +678,7 @@ async fn savepoint_and_rollback_to() {
     // Verify the row does NOT exist within the transaction.
     let search = "sp_rollback_test";
     let found = bsql::query!("SELECT id FROM tickets WHERE title = $search: &str")
-        .fetch(&mut tx)
+        .fetch_all(&mut tx)
         .await
         .unwrap();
     assert!(
@@ -734,7 +734,7 @@ async fn nested_savepoints() {
     // A's insert should still be visible.
     let search_a = "nested_sp_a";
     let found_a = bsql::query!("SELECT id FROM tickets WHERE title = $search_a: &str")
-        .fetch(&mut tx)
+        .fetch_all(&mut tx)
         .await
         .unwrap();
     assert_eq!(
@@ -746,7 +746,7 @@ async fn nested_savepoints() {
     // B's insert should be gone.
     let search_b = "nested_sp_b";
     let found_b = bsql::query!("SELECT id FROM tickets WHERE title = $search_b: &str")
-        .fetch(&mut tx)
+        .fetch_all(&mut tx)
         .await
         .unwrap();
     assert!(
@@ -907,7 +907,7 @@ async fn multiple_flush_calls() {
     // All 6 rows should exist.
     let search = "multi_flush_test";
     let rows = bsql::query!("SELECT id FROM tickets WHERE title = $search: &str")
-        .fetch(&mut tx)
+        .fetch_all(&mut tx)
         .await
         .unwrap();
     assert_eq!(rows.len(), 6);

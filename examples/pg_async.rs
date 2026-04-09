@@ -25,7 +25,7 @@ async fn main() -> Result<(), BsqlError> {
 
     // Multiple rows
     let users = bsql::query!("SELECT id, login FROM users WHERE active = true ORDER BY id LIMIT 10")
-        .fetch(&pool).await?;
+        .fetch_all(&pool).await?;
     for r in &users {
         println!("  {} — {}", r.id, r.login);
     }

@@ -202,7 +202,7 @@ fn gen_query_as_executor_impls(
 
         let fetch_method = quote! {
             /// Fetch all rows, mapped into the target struct.
-            pub fn fetch(
+            pub fn fetch_all(
                 self,
                 pool: &::bsql_core::SqlitePool,
             ) -> ::bsql_core::BsqlResult<Vec<#target_type>> {
@@ -619,7 +619,7 @@ fn gen_executor_struct(parsed: &ParsedQuery) -> TokenStream {
         .collect();
 
     quote! {
-        #[must_use = "query is not executed until .fetch(), .execute(), or another execution method is called"]
+        #[must_use = "query is not executed until .fetch_all(), .execute(), or another execution method is called"]
         #[allow(non_camel_case_types)]
         struct #struct_name<'_bsql> {
             #(#fields,)*
@@ -881,7 +881,7 @@ fn gen_executor_impls(
             let decode_arena = wrap_validated_decode(&arena_name, &arena_decode);
             quote! {
                 /// Fetch all rows. Batch-validated text, zero unsafe.
-                pub fn fetch(
+                pub fn fetch_all(
                     self,
                     pool: &::bsql_core::SqlitePool,
                 ) -> ::bsql_core::BsqlResult<::bsql_core::driver_sqlite::ValidatedRows<#arena_name>> {
@@ -923,7 +923,7 @@ fn gen_executor_impls(
             let decode_all = wrap_decode_as_bsql(&result_name, &direct_decode);
             quote! {
                 /// Fetch all rows. Inline step loop — no cross-crate call overhead.
-                pub fn fetch(
+                pub fn fetch_all(
                     self,
                     pool: &::bsql_core::SqlitePool,
                 ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
@@ -1745,7 +1745,7 @@ fn gen_dynamic_executor_struct(parsed: &ParsedQuery) -> TokenStream {
     }
 
     quote! {
-        #[must_use = "query is not executed until .fetch(), .execute(), or another execution method is called"]
+        #[must_use = "query is not executed until .fetch_all(), .execute(), or another execution method is called"]
         #[allow(non_camel_case_types)]
         struct #struct_name<'_bsql> {
             #(#fields,)*
@@ -1891,7 +1891,7 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
                     }
                 });
             quote! {
-                pub fn fetch(
+                pub fn fetch_all(
                     self,
                     pool: &::bsql_core::SqlitePool,
                 ) -> ::bsql_core::BsqlResult<::bsql_core::driver_sqlite::ValidatedRows<#arena_name>> {
@@ -1923,7 +1923,7 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
                     }
                 });
             quote! {
-                pub fn fetch(
+                pub fn fetch_all(
                     self,
                     pool: &::bsql_core::SqlitePool,
                 ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
@@ -2323,7 +2323,7 @@ pub fn generate_sort_sqlite_query_code(
         .collect();
 
     let executor_struct = quote! {
-        #[must_use = "query is not executed until .fetch(), .execute(), or another execution method is called"]
+        #[must_use = "query is not executed until .fetch_all(), .execute(), or another execution method is called"]
         #[allow(non_camel_case_types)]
         struct #executor_name<'_bsql> {
             #(#param_fields,)*
@@ -2441,7 +2441,7 @@ pub fn generate_sort_sqlite_query_code(
         // Sort queries always use the direct decode path (safe from_utf8,
         // owned strings) since they go through pool indirection anyway.
         let fetch_method = quote! {
-            pub fn fetch(
+            pub fn fetch_all(
                 self,
                 pool: &::bsql_core::SqlitePool,
             ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {

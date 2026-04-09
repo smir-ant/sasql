@@ -120,7 +120,7 @@ mod tests {
             .execute(&pool).await.unwrap();
 
         let rows = bsql::query!("SELECT id FROM temp")
-            .fetch(&pool).await.unwrap();
+            .fetch_all(&pool).await.unwrap();
         assert_eq!(rows.len(), 1);
     }
 

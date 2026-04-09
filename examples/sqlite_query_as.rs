@@ -57,7 +57,7 @@ async fn main() -> Result<(), BsqlError> {
     let todos = bsql::query_as!(Todo,
         "SELECT id, title, done FROM todos ORDER BY id"
     )
-    .fetch(&pool)?;
+    .fetch_all(&pool)?;
 
     println!("All todos:");
     for t in &todos {
@@ -72,7 +72,7 @@ async fn main() -> Result<(), BsqlError> {
     let pending = bsql::query_as!(Todo,
         "SELECT id, title, done FROM todos WHERE done = $done: bool ORDER BY id"
     )
-    .fetch(&pool)?;
+    .fetch_all(&pool)?;
 
     println!("\nPending ({} items):", pending.len());
     for t in &pending {

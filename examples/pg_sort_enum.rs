@@ -73,7 +73,7 @@ async fn main() -> Result<(), BsqlError> {
          ORDER BY $[sort: TicketSort]
          LIMIT 20"
     )
-    .fetch(&pool).await?;
+    .fetch_all(&pool).await?;
 
     println!("Tickets sorted by {:?}:", sort);
     for t in &tickets {
@@ -90,7 +90,7 @@ async fn main() -> Result<(), BsqlError> {
          ORDER BY $[sort: TicketSort]
          LIMIT 20"
     )
-    .fetch(&pool).await?;
+    .fetch_all(&pool).await?;
 
     println!("\nTickets sorted by {:?}:", sort);
     for t in &tickets {
@@ -118,7 +118,7 @@ async fn main() -> Result<(), BsqlError> {
          ORDER BY $[sort: TicketSort]
          LIMIT $limit: i64"
     )
-    .fetch(&pool).await?;
+    .fetch_all(&pool).await?;
 
     println!("\nAPI response ({sort_param}, limit={limit}):");
     for t in &tickets {

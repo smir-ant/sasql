@@ -47,7 +47,7 @@ async fn main() -> Result<(), BsqlError> {
     // SELECT all — .fetch() returns Vec<Row>
     // ---------------------------------------------------------------
     let users = bsql::query!("SELECT id, name, email FROM users")
-        .fetch(&pool)?;
+        .fetch_all(&pool)?;
 
     for user in &users {
         println!("id={}, name={}, email={}", user.id, user.name, user.email);
@@ -61,7 +61,7 @@ async fn main() -> Result<(), BsqlError> {
     let user = bsql::query!(
         "SELECT id, name, email FROM users WHERE id = $id: i64 LIMIT 1"
     )
-    .fetch(&pool)?
+    .fetch_all(&pool)?
     .pop();
 
     if let Some(user) = user {

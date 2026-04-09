@@ -273,7 +273,7 @@ mod time_tests {
         // Query tickets created today
         let tickets =
             bsql::query!("SELECT id FROM tickets WHERE created_date = $today: time::Date")
-                .fetch(&pool)
+                .fetch_all(&pool)
                 .await
                 .unwrap();
 
@@ -334,7 +334,7 @@ async fn enum_string_as_param() {
     let status = "new";
     // Cast the enum column to text so &str param is accepted by PG.
     let tickets = bsql::query!("SELECT id FROM tickets WHERE status::text = $status: &str")
-        .fetch(&pool)
+        .fetch_all(&pool)
         .await
         .unwrap();
     assert!(!tickets.is_empty());

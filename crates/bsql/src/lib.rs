@@ -25,7 +25,7 @@
 //!     let id = 1i32;
 //!     let users = bsql::query!(
 //!         "SELECT id, login, active FROM users WHERE id = $id: i32"
-//!     ).fetch(&pool).await?;
+//!     ).fetch_all(&pool).await?;
 //!
 //!     let user = &users[0];
 //!     // user.id: i32, user.login: String, user.active: bool
@@ -38,7 +38,7 @@
 //!
 //! | Method | Returns | Use |
 //! |--------|---------|-----|
-//! | `.fetch(&pool).await` | `Vec<Row>` | SELECT queries |
+//! | `.fetch_all(&pool).await` | `Vec<Row>` | SELECT queries |
 //! | `.execute(&pool).await` | `u64` | INSERT, UPDATE, DELETE |
 //!
 //! Also: `fetch_one`, `fetch_optional`, `fetch_stream`, `for_each`, `defer` (for transactions).

@@ -22,7 +22,7 @@ let id = 42i32;
 // or `id` isn't an i32 -- this won't compile.
 let users = bsql::query!(
     "SELECT id, login, active FROM users WHERE id = $id: i32"
-).fetch(&pool).await?;
+).fetch_all(&pool).await?;
 let user = &users[0];
 
 // user.id: i32, user.login: String, user.active: bool
@@ -66,7 +66,7 @@ async fn main() -> Result<(), bsql::BsqlError> {
     let id = 1i32;
     let users = bsql::query!(
         "SELECT id, login, first_name FROM users WHERE id = $id: i32"
-    ).fetch(&pool).await?;
+    ).fetch_all(&pool).await?;
     let user = &users[0];
 
     println!("{} ({})", user.first_name, user.login);
@@ -105,7 +105,7 @@ async fn main() -> Result<(), bsql::BsqlError> {
     let id = 1i64;
     let users = bsql::query!(
         "SELECT id, login, active FROM users WHERE id = $id: i64"
-    ).fetch(&pool).await?;
+    ).fetch_all(&pool).await?;
     let user = &users[0];
 
     println!("{}: active={}", user.login, user.active);
@@ -199,7 +199,7 @@ let tickets = bsql::query!(
     "SELECT id, title FROM tickets WHERE deleted_at IS NULL
      [AND department_id = $dept: Option<i64>]
      [AND assignee_id = $assignee: Option<i64>]"
-).fetch(&pool).await?;
+).fetch_all(&pool).await?;
 ```
 
 No string concatenation. No runtime SQL assembly. 2 optional clauses = 4 variants, all validated at compile time.
@@ -213,7 +213,7 @@ No string concatenation. No runtime SQL assembly. 2 optional clauses = 4 variant
 
 | Method            | Returns      | Use                    |
 | ----------------- | ------------ | ---------------------- |
-| `.fetch(&pool).await` | `Vec<Row>` | SELECT queries         |
+| `.fetch_all(&pool).await` | `Vec<Row>` | SELECT queries         |
 | `.execute(&pool).await`   | `u64`      | INSERT, UPDATE, DELETE |
 | `.defer(&mut tx).await`   | `()`       | Buffer in transaction  |
 
@@ -312,7 +312,7 @@ Type-safe mapping between Rust enums and PostgreSQL enum types.
 ```rust
 let tickets = bsql::query!(
     "SELECT id, title FROM tickets ORDER BY $[sort: TicketSort] LIMIT $limit: i64"
-).fetch(&pool).await?;
+).fetch_all(&pool).await?;
 ```
 
 Each sort variant's SQL is validated at compile time. The enum is exhaustive -- no default case, no fallback.
@@ -360,7 +360,7 @@ let pool = Pool::builder()
     .build()?;
 
 // SELECT queries automatically route to the replica:
-let users = bsql::query!("SELECT id, login FROM users").fetch(&pool).await?;
+let users = bsql::query!("SELECT id, login FROM users").fetch_all(&pool).await?;
 
 // INSERT/UPDATE/DELETE always route to the primary:
 bsql::query!("INSERT INTO users (login) VALUES ($login: &str)").execute(&pool).await?;

@@ -78,7 +78,7 @@ async fn main() -> Result<(), BsqlError> {
     let users = bsql::query_as!(User,
         "SELECT id, login, email, active FROM users ORDER BY id"
     )
-    .fetch(&pool).await?;
+    .fetch_all(&pool).await?;
 
     for u in &users {
         println!("  {} ({}) — active={}", u.login, u.email, u.active);
@@ -95,7 +95,7 @@ async fn main() -> Result<(), BsqlError> {
          GROUP BY u.login
          ORDER BY order_count DESC"
     )
-    .fetch(&pool).await?;
+    .fetch_all(&pool).await?;
 
     for s in &summaries {
         println!("{}: {} orders", s.login, s.order_count);

@@ -54,7 +54,7 @@ async fn main() -> Result<(), BsqlError> {
     // Verify the inserts
     // ---------------------------------------------------------------
     let rows = bsql::query!("SELECT id, name, email FROM users")
-        .fetch(&pool).await?;
+        .fetch_all(&pool).await?;
 
     for row in &rows {
         println!("  id={}, name={}, email={}", row.id, row.name, row.email);

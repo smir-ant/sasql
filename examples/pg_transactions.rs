@@ -130,7 +130,7 @@ async fn main() -> Result<(), BsqlError> {
     let accounts = bsql::query!(
         "SELECT id, name, balance FROM accounts WHERE id = $account_id: i32"
     )
-    .fetch(&mut tx).await?;
+    .fetch_all(&mut tx).await?;
     let account = &accounts[0];
     println!(
         "Serializable read: account {} has balance {}",

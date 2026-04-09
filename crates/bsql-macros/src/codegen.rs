@@ -97,7 +97,7 @@ pub fn generate_sort_query_code(
         .collect();
 
     let executor_struct = quote! {
-        #[must_use = "query is not executed until .fetch(), .execute(), or another execution method is called"]
+        #[must_use = "query is not executed until .fetch_all(), .execute(), or another execution method is called"]
         #[allow(non_camel_case_types)]
         struct #executor_name<'_bsql> {
             #(#param_fields,)*
@@ -307,7 +307,7 @@ pub fn generate_sort_query_code(
                 }
 
                 ::bsql_core::__bsql_fn! {
-                    pub fn fetch(
+                    pub fn fetch_all(
                         self,
                         executor: impl Into<::bsql_core::QueryTarget<'_>>,
                     ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
@@ -506,7 +506,7 @@ fn gen_query_as_executor_impls(
             }
 
             ::bsql_core::__bsql_fn! {
-                pub fn fetch(
+                pub fn fetch_all(
                     self,
                     executor: impl Into<::bsql_core::QueryTarget<'_>>,
                 ) -> ::bsql_core::BsqlResult<Vec<#target_type>> {
@@ -631,7 +631,7 @@ fn gen_executor_struct(parsed: &ParsedQuery) -> TokenStream {
         .collect();
 
     quote! {
-        #[must_use = "query is not executed until .fetch(), .execute(), or another execution method is called"]
+        #[must_use = "query is not executed until .fetch_all(), .execute(), or another execution method is called"]
         #[allow(non_camel_case_types)]
         struct #struct_name<'_bsql> {
             #(#fields,)*
@@ -742,7 +742,7 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
             }
 
             ::bsql_core::__bsql_fn! {
-                pub fn fetch(
+                pub fn fetch_all(
                     self,
                     executor: impl Into<::bsql_core::QueryTarget<'_>>,
                 ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
@@ -916,7 +916,7 @@ fn gen_dynamic_executor_struct(parsed: &ParsedQuery) -> TokenStream {
     }
 
     quote! {
-        #[must_use = "query is not executed until .fetch(), .execute(), or another execution method is called"]
+        #[must_use = "query is not executed until .fetch_all(), .execute(), or another execution method is called"]
         #[allow(non_camel_case_types)]
         struct #struct_name<'_bsql> {
             #(#fields,)*
@@ -1034,7 +1034,7 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
             #owned_fetch_one_optional
 
             ::bsql_core::__bsql_fn! {
-                pub fn fetch(
+                pub fn fetch_all(
                     self,
                     executor: impl Into<::bsql_core::QueryTarget<'_>>,
                 ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
@@ -2799,12 +2799,12 @@ mod tests {
             "missing fetch_one: {code_str}"
         );
         assert!(
-            code_str.contains("fn fetch ("),
-            "missing fetch method: {code_str}"
+            code_str.contains("fn fetch_all"),
+            "missing fetch_all method: {code_str}"
         );
         assert!(
-            !code_str.contains("fetch_all"),
-            "fetch_all should be removed (renamed to fetch): {code_str}"
+            code_str.contains("fn fetch_all"),
+            "missing fetch_all (renamed to fetch): {code_str}"
         );
         assert!(
             code_str.contains("fetch_optional"),
@@ -3118,8 +3118,8 @@ mod tests {
         );
         // All methods return owned types
         assert!(
-            code_str.contains("fn fetch ("),
-            "missing fetch method: {code_str}"
+            code_str.contains("fn fetch_all"),
+            "missing fetch_all method: {code_str}"
         );
         assert!(
             code_str.contains("fn fetch_one"),
@@ -3312,12 +3312,8 @@ mod tests {
             "missing fetch_one: {code_str}"
         );
         assert!(
-            code_str.contains("fn fetch ("),
-            "missing fetch: {code_str}"
-        );
-        assert!(
-            !code_str.contains("fetch_all"),
-            "fetch_all should be removed: {code_str}"
+            code_str.contains("fn fetch_all"),
+            "missing fetch_all: {code_str}"
         );
         assert!(
             code_str.contains("fetch_optional"),

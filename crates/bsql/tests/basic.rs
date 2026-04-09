@@ -31,7 +31,7 @@ async fn select_fetch_one() {
 async fn select_fetch_all() {
     let pool = pool().await;
     let users = bsql::query!("SELECT id, login FROM users WHERE active = true ORDER BY id")
-        .fetch(&pool)
+        .fetch_all(&pool)
         .await
         .unwrap();
 
@@ -211,7 +211,7 @@ async fn select_with_cte() {
         )
         SELECT id, login FROM active_users ORDER BY id"
     )
-    .fetch(&pool)
+    .fetch_all(&pool)
     .await
     .unwrap();
     assert_eq!(results.len(), 2);
@@ -223,7 +223,7 @@ async fn fetch_all_empty_result() {
     let pool = pool().await;
     let login = "absolutely_nobody_has_this_login";
     let results = bsql::query!("SELECT id, login FROM users WHERE login = $login: &str")
-        .fetch(&pool)
+        .fetch_all(&pool)
         .await
         .unwrap();
     assert!(results.is_empty());
@@ -275,7 +275,7 @@ async fn delete_returning() {
 
     let id = ticket.id;
     let deleted = bsql::query!("DELETE FROM tickets WHERE id = $id: i32 RETURNING id, title")
-        .fetch(&pool)
+        .fetch_all(&pool)
         .await
         .unwrap();
     assert_eq!(deleted.len(), 1);
@@ -382,7 +382,7 @@ async fn pool_builder_url_method() {
         .unwrap();
 
     let users = bsql::query!("SELECT id, login FROM users ORDER BY id")
-        .fetch(&pool)
+        .fetch_all(&pool)
         .await
         .unwrap();
     assert!(users.len() >= 2);

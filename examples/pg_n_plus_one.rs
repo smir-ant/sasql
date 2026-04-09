@@ -67,7 +67,7 @@ async fn main() -> Result<(), BsqlError> {
     // orders. With 10 users, that's 1 + 10 = 11 queries.
     // After the threshold, bsql logs: "potential N+1 detected"
     let users = bsql::query!("SELECT id, login FROM users ORDER BY id LIMIT 10")
-        .fetch(&pool).await?;
+        .fetch_all(&pool).await?;
 
     println!("Fetching orders per user (N+1 pattern):");
     for user in &users {
@@ -77,7 +77,7 @@ async fn main() -> Result<(), BsqlError> {
         let orders = bsql::query!(
             "SELECT id, amount FROM orders WHERE user_id = $user_id: i32"
         )
-        .fetch(&pool).await?;
+        .fetch_all(&pool).await?;
         println!("  {}: {} orders", user.login, orders.len());
     }
 
@@ -93,7 +93,7 @@ async fn main() -> Result<(), BsqlError> {
          GROUP BY u.login
          ORDER BY u.login"
     )
-    .fetch(&pool).await?;
+    .fetch_all(&pool).await?;
 
     for row in &joined {
         println!("  {}: {} orders", row.login, row.order_count);

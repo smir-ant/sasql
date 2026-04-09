@@ -34,7 +34,7 @@ async fn singleflight_fetch_one_works() {
 async fn singleflight_fetch_all_works() {
     let pool = pool().await;
     let users = bsql::query!("SELECT id, login FROM users ORDER BY id")
-        .fetch(&pool)
+        .fetch_all(&pool)
         .await
         .unwrap();
 
@@ -61,7 +61,7 @@ async fn concurrent_identical_queries_all_succeed() {
         let pool = Arc::clone(&pool);
         handles.push(tokio::spawn(async move {
             bsql::query!("SELECT id, login FROM users ORDER BY id")
-                .fetch(pool.as_ref())
+                .fetch_all(pool.as_ref())
                 .await
         }));
     }
@@ -102,7 +102,7 @@ async fn transaction_queries_are_not_coalesced() {
     let mut txn = pool.begin().await.unwrap();
 
     let users = bsql::query!("SELECT id, login FROM users ORDER BY id")
-        .fetch(&mut txn)
+        .fetch_all(&mut txn)
         .await
         .unwrap();
     assert!(users.len() >= 2);
@@ -117,7 +117,7 @@ async fn pool_connection_queries_not_coalesced() {
     let mut conn = pool.acquire().await.unwrap();
 
     let users = bsql::query!("SELECT id, login FROM users ORDER BY id")
-        .fetch(&mut conn)
+        .fetch_all(&mut conn)
         .await
         .unwrap();
     assert!(users.len() >= 2);
@@ -152,7 +152,7 @@ async fn queries_work_after_concurrent_burst() {
         let pool = Arc::clone(&pool);
         handles.push(tokio::spawn(async move {
             bsql::query!("SELECT id, login FROM users ORDER BY id")
-                .fetch(pool.as_ref())
+                .fetch_all(pool.as_ref())
                 .await
         }));
     }
@@ -198,14 +198,14 @@ async fn different_queries_are_independent() {
     let pool1 = Arc::clone(&pool);
     let h1 = tokio::spawn(async move {
         bsql::query!("SELECT id, login FROM users ORDER BY id")
-            .fetch(pool1.as_ref())
+            .fetch_all(pool1.as_ref())
             .await
     });
 
     let pool2 = Arc::clone(&pool);
     let h2 = tokio::spawn(async move {
         bsql::query!("SELECT id FROM tickets ORDER BY id")
-            .fetch(pool2.as_ref())
+            .fetch_all(pool2.as_ref())
             .await
     });
 

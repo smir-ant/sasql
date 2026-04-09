@@ -1,7 +1,7 @@
 //! Basic PostgreSQL CRUD operations with bsql.
 //!
 //! Demonstrates the three core methods:
-//!   - `.fetch(&pool)` for SELECT (returns Vec<Row>)
+//!   - `.fetch_all(&pool)` for SELECT (returns Vec<Row>)
 //!   - `.execute(&pool)` for INSERT/UPDATE/DELETE (returns affected row count)
 //!   - `.pop()` on fetch results for single-row lookups
 //!
@@ -50,7 +50,7 @@ async fn main() -> Result<(), BsqlError> {
     // Each row is a generated struct with typed fields matching the columns.
     // user.id: i32, user.name: String, user.email: String
     let users = bsql::query!("SELECT id, name, email FROM users")
-        .fetch(&pool).await?;
+        .fetch_all(&pool).await?;
 
     for user in &users {
         println!("id={}, name={}, email={}", user.id, user.name, user.email);
@@ -64,7 +64,7 @@ async fn main() -> Result<(), BsqlError> {
     let user = bsql::query!(
         "SELECT id, name, email FROM users WHERE id = $id: i32 LIMIT 1"
     )
-    .fetch(&pool).await?
+    .fetch_all(&pool).await?
     .pop(); // Option<Row> — None if no match
 
     if let Some(user) = user {
