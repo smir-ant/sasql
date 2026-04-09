@@ -126,7 +126,7 @@ See [examples/](examples/) for more complete, runnable programs.
 - **PostgreSQL driver**: `#![forbid(unsafe_code)]` -- zero unsafe
 - **SQLite driver**: unsafe confined to FFI boundary calls (`ffi.rs`) -- every other file is safe Rust
 - **5 of 6 crates** enforce `#![forbid(unsafe_code)]` at compile time
-- **1,900+ tests** (unit, integration, compile-fail, and property-based)
+- **2,550+ tests** (unit, integration, compile-fail, property-based, and stress)
 
 <details>
 <summary>Requirements</summary>

@@ -68,7 +68,7 @@ psql -h localhost -U bsql -d bsql_test -f tests/setup.sql
 | CLI | ~46 | 75s | nothing | migrate, verify-cache, clean, cache format |
 | Doc tests | ~13 | 3s | nothing | Config::from_url, hash_sql |
 | Stress (#[ignore]) | ~6 | 30s+ | live PG | 10K rows, 16 threads, singleflight contention |
-| **TOTAL** | **~2,500+** | | | |
+| **TOTAL** | **~2,550+** | | | |
 
 ## Test file map
 
