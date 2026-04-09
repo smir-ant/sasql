@@ -91,6 +91,21 @@ fn bench_pg_fetch_many(c: &mut Criterion) {
             });
         });
 
+        // -- bsql_async (same pool, async path via tokio) --
+        group.bench_with_input(BenchmarkId::new("bsql_async", n), &n, |b, &n| {
+            b.iter(|| {
+                rt.block_on(async {
+                    let n = n;
+                    bsql::query!(
+                        "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $n: i64"
+                    )
+                    .for_each(&bsql_pool, |_row| Ok(()))
+                    .await
+                    .unwrap();
+                });
+            });
+        });
+
         // -- bsql_direct (no pool, same as C/Go — raw connection) --
         group.bench_with_input(BenchmarkId::new("bsql_direct", n), &n, |b, &n| {
             let n_param: i64 = n;

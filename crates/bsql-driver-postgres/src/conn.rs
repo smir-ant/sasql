@@ -202,7 +202,7 @@ impl Connection {
                     {
                         match crate::tls_sync::try_upgrade(
                             tcp,
-                            &config.host,
+                            &config,
                             config.ssl == SslMode::Require,
                         ) {
                             Ok(result) => {

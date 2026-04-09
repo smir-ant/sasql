@@ -65,6 +65,26 @@ fn bench_pg_join_aggregate(c: &mut Criterion) {
         });
     });
 
+    // -- bsql_async (async path via tokio) --
+    group.bench_function("bsql_async", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                bsql::query!(
+                    "SELECT u.name, COUNT(o.id) AS order_count, SUM(o.amount) AS total_amount
+                     FROM bench_users u
+                     JOIN bench_orders o ON u.id = o.user_id
+                     WHERE u.active = true
+                     GROUP BY u.name
+                     ORDER BY SUM(o.amount) DESC
+                     LIMIT 100"
+                )
+                .for_each(&bsql_pool, |_row| Ok(()))
+                .await
+                .unwrap();
+            });
+        });
+    });
+
     // -- sqlx (async — needs runtime) --
     group.bench_function("sqlx", |b| {
         b.iter(|| {

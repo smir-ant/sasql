@@ -46,6 +46,22 @@ fn bench_pg_insert_single(c: &mut Criterion) {
         });
     });
 
+    // -- bsql_async: single INSERT RETURNING (async path via tokio) --
+    group.bench_function("bsql_async", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let name = "bench_insert";
+                let email = "bench@example.com";
+                let _row = bsql::query!(
+                    "INSERT INTO bench_users (name, email, active, score) VALUES ($name: &str, $email: &str, true, 0.0) RETURNING id"
+                )
+                .fetch_one(&bsql_pool)
+                .await
+                .unwrap();
+            });
+        });
+    });
+
     // -- sqlx: single INSERT RETURNING (async — needs runtime) --
     group.bench_function("sqlx", |b| {
         b.iter(|| {

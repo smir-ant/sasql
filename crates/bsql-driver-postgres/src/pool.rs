@@ -2111,6 +2111,178 @@ mod tests {
         let result = Config::from_url("postgres://u%ZZ:p@h/d");
         assert!(result.is_err());
     }
+
+    // ===============================================================
+    // Pool acquire timeout — unit level (no DB required)
+    // ===============================================================
+
+    #[test]
+    fn pool_acquire_timeout_no_connections_available() {
+        // Pool with max_size=0 and acquire_timeout set — should wait then fail.
+        // max_size=0 means no slot can ever be claimed, so it hits the condvar
+        // path and times out.
+        let pool = PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .max_size(0)
+            .acquire_timeout(Some(Duration::from_millis(50)))
+            .build()
+            .unwrap();
+
+        let start = std::time::Instant::now();
+        let result = pool.acquire();
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err());
+        match result {
+            Err(DriverError::Pool(msg)) => {
+                assert!(msg.contains("exhausted"), "should say exhausted: {msg}");
+            }
+            Err(e) => panic!("expected Pool error, got: {e:?}"),
+            Ok(_) => panic!("expected error"),
+        }
+        // max_size=0 triggers immediate rejection (no wait), but verify it didn't hang
+        assert!(elapsed < Duration::from_secs(5));
+    }
+
+    // ===============================================================
+    // Pool max_lifetime configuration — structural test
+    // ===============================================================
+
+    #[test]
+    fn pool_max_lifetime_very_short() {
+        let pool = PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .max_lifetime(Some(Duration::from_millis(1)))
+            .build()
+            .unwrap();
+        assert_eq!(pool.inner.max_lifetime, Some(Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn pool_max_lifetime_zero_duration() {
+        // Zero lifetime means connections expire immediately on reuse.
+        let pool = PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .max_lifetime(Some(Duration::from_secs(0)))
+            .build()
+            .unwrap();
+        assert_eq!(pool.inner.max_lifetime, Some(Duration::ZERO));
+    }
+
+    // ===============================================================
+    // Pool status — structural consistency
+    // ===============================================================
+
+    #[test]
+    fn pool_status_open_equals_idle_plus_active() {
+        // Without any connections, idle + active should equal open (all zero).
+        let pool = PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .max_size(10)
+            .build()
+            .unwrap();
+
+        let status = pool.status();
+        assert_eq!(status.open, status.idle + status.active);
+        assert_eq!(status.open, 0);
+    }
+
+    // ===============================================================
+    // Pool close — concurrent close calls
+    // ===============================================================
+
+    #[test]
+    fn pool_close_idempotent() {
+        let pool = Pool::connect("postgres://user:pass@localhost/db").unwrap();
+        pool.close();
+        assert!(pool.is_closed());
+        pool.close(); // second close should not panic
+        assert!(pool.is_closed());
+    }
+
+    #[test]
+    fn pool_close_then_status_all_zero() {
+        let pool = PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .max_size(5)
+            .build()
+            .unwrap();
+        pool.close();
+        let status = pool.status();
+        assert_eq!(status.idle, 0);
+        assert_eq!(status.active, 0);
+        assert_eq!(status.open, 0);
+    }
+
+    // ===============================================================
+    // Pool builder — all options combined
+    // ===============================================================
+
+    #[test]
+    fn pool_builder_all_options_maximal() {
+        let pool = PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .max_size(100)
+            .max_lifetime(Some(Duration::from_secs(3600)))
+            .acquire_timeout(Some(Duration::from_secs(30)))
+            .min_idle(10)
+            .max_stmt_cache_size(1024)
+            .stale_timeout(Duration::from_secs(120))
+            .build()
+            .unwrap();
+        assert_eq!(pool.max_size(), 100);
+        assert_eq!(pool.inner.max_lifetime, Some(Duration::from_secs(3600)));
+        assert_eq!(pool.inner.acquire_timeout, Some(Duration::from_secs(30)));
+        assert_eq!(pool.inner.min_idle, 10);
+        assert_eq!(pool.inner.max_stmt_cache_size, 1024);
+        assert_eq!(pool.inner.stale_timeout, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn pool_builder_all_options_minimal() {
+        let pool = PoolBuilder::new()
+            .url("postgres://user:pass@localhost/db")
+            .max_size(1)
+            .max_lifetime(None)
+            .acquire_timeout(None)
+            .min_idle(0)
+            .max_stmt_cache_size(0)
+            .stale_timeout(Duration::ZERO)
+            .build()
+            .unwrap();
+        assert_eq!(pool.max_size(), 1);
+        assert_eq!(pool.inner.max_lifetime, None);
+        assert_eq!(pool.inner.acquire_timeout, None);
+        assert_eq!(pool.inner.min_idle, 0);
+        assert_eq!(pool.inner.max_stmt_cache_size, 0);
+        assert_eq!(pool.inner.stale_timeout, Duration::ZERO);
+    }
+
+    // ===============================================================
+    // Pool concurrent close + acquire race
+    // ===============================================================
+
+    #[test]
+    fn pool_close_concurrent_with_failed_acquire() {
+        let pool = std::sync::Arc::new(
+            PoolBuilder::new()
+                .url("postgres://user:pass@localhost/db")
+                .max_size(0)
+                .build()
+                .unwrap(),
+        );
+
+        let pool2 = pool.clone();
+        let handle = std::thread::spawn(move || {
+            // Try to acquire — will fail because max_size=0.
+            let result = pool2.acquire();
+            assert!(result.is_err());
+        });
+
+        pool.close();
+        handle.join().unwrap();
+        assert!(pool.is_closed());
+    }
 }
 
 // --- N+1 detector tests ---

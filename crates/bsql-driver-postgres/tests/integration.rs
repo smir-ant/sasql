@@ -51,6 +51,9 @@ fn connect_wrong_port() {
         ssl: bsql_driver_postgres::SslMode::Disable,
         statement_timeout_secs: 30,
         statement_cache_mode: bsql_driver_postgres::StatementCacheMode::Named,
+        ssl_root_cert: None,
+        ssl_cert: None,
+        ssl_key: None,
     });
 
     assert!(result.is_err());
@@ -1863,6 +1866,9 @@ fn connect_bad_host_fails() {
         ssl: bsql_driver_postgres::SslMode::Disable,
         statement_timeout_secs: 5,
         statement_cache_mode: bsql_driver_postgres::StatementCacheMode::Named,
+        ssl_root_cert: None,
+        ssl_cert: None,
+        ssl_key: None,
     });
     assert!(result.is_err(), "connecting to bad host/port should fail");
 }
@@ -1878,6 +1884,9 @@ fn connect_bad_port_port1_fails() {
         ssl: bsql_driver_postgres::SslMode::Disable,
         statement_timeout_secs: 30,
         statement_cache_mode: bsql_driver_postgres::StatementCacheMode::Named,
+        ssl_root_cert: None,
+        ssl_cert: None,
+        ssl_key: None,
     });
     assert!(result.is_err());
     assert!(matches!(result, Err(DriverError::Io(_))));
@@ -2918,4 +2927,405 @@ fn unnamed_statement_pool_builder() {
     let result = conn.query("SELECT 1", h, &[]).unwrap();
     let rows: Vec<_> = result.rows(&arena).collect();
     assert_eq!(rows.len(), 1);
+}
+
+// =========================================================================
+// Phase 7: Pool edge case and connection error recovery tests
+// =========================================================================
+
+// --- Pool concurrent acquire up to max_size ---
+
+#[test]
+fn pool_concurrent_acquire_up_to_max_size() {
+    let url = require_db!();
+    let pool = std::sync::Arc::new(
+        Pool::builder()
+            .url(&url)
+            .max_size(3)
+            .acquire_timeout(None) // fail-fast
+            .build()
+            .unwrap(),
+    );
+
+    // Acquire 3 connections — all should succeed.
+    let mut conn1 = pool.acquire().unwrap();
+    let mut conn2 = pool.acquire().unwrap();
+    let mut conn3 = pool.acquire().unwrap();
+
+    conn1.simple_query("SELECT 1").unwrap();
+    conn2.simple_query("SELECT 1").unwrap();
+    conn3.simple_query("SELECT 1").unwrap();
+
+    assert_eq!(pool.open_count(), 3);
+
+    // 4th acquire should fail immediately (fail-fast, no timeout).
+    let result = pool.acquire();
+    assert!(result.is_err());
+    match result {
+        Err(DriverError::Pool(msg)) => {
+            assert!(msg.contains("exhausted"), "expected exhausted error: {msg}");
+        }
+        Err(e) => panic!("expected Pool error, got: {e}"),
+        Ok(_) => panic!("4th acquire should fail with max_size=3"),
+    }
+
+    // Return all connections, pool should recover.
+    drop(conn1);
+    drop(conn2);
+    drop(conn3);
+
+    // Acquire again should succeed.
+    let mut conn = pool.acquire().unwrap();
+    conn.simple_query("SELECT 1").unwrap();
+}
+
+// --- Pool acquire timeout (with real connections) ---
+
+#[test]
+fn pool_acquire_timeout_with_held_connection() {
+    let url = require_db!();
+    let pool = Pool::builder()
+        .url(&url)
+        .max_size(1)
+        .acquire_timeout(Some(std::time::Duration::from_millis(100)))
+        .build()
+        .unwrap();
+
+    // Hold the single connection.
+    let _conn1 = pool.acquire().unwrap();
+
+    // Second acquire should block then timeout.
+    let start = std::time::Instant::now();
+    let result = pool.acquire();
+    let elapsed = start.elapsed();
+
+    assert!(result.is_err(), "second acquire should timeout");
+    match result {
+        Err(DriverError::Pool(msg)) => {
+            assert!(
+                msg.contains("timeout") || msg.contains("exhausted"),
+                "unexpected error: {msg}"
+            );
+        }
+        Err(e) => panic!("expected Pool error, got: {e}"),
+        Ok(_) => panic!("expected timeout error"),
+    }
+    // Verify it actually waited (at least ~50ms, not instant).
+    assert!(
+        elapsed >= std::time::Duration::from_millis(50),
+        "timeout fired too fast: {elapsed:?}"
+    );
+    // And didn't wait too long.
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "timeout took too long: {elapsed:?}"
+    );
+}
+
+// --- Pool max_lifetime causes connection replacement ---
+
+#[test]
+fn pool_max_lifetime_replaces_expired_connections() {
+    let url = require_db!();
+    let pool = Pool::builder()
+        .url(&url)
+        .max_size(1)
+        .max_lifetime(Some(std::time::Duration::from_millis(50)))
+        .stale_timeout(std::time::Duration::from_secs(60)) // don't stale-out
+        .build()
+        .unwrap();
+
+    // Acquire first connection, note its PID.
+    let mut conn = pool.acquire().unwrap();
+    conn.simple_query("SELECT 1").unwrap();
+    let pid1 = conn.pid();
+    drop(conn);
+
+    // Wait longer than max_lifetime so the connection expires.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // Next acquire should get a NEW connection (old one expired).
+    let mut conn2 = pool.acquire().unwrap();
+    conn2.simple_query("SELECT 1").unwrap();
+    let pid2 = conn2.pid();
+
+    // PIDs should differ because the old connection was discarded.
+    assert_ne!(
+        pid1, pid2,
+        "expected a new connection after max_lifetime expiry (pid1={pid1}, pid2={pid2})"
+    );
+}
+
+// --- Pool status under load ---
+
+#[test]
+fn pool_status_reflects_active_and_idle() {
+    let url = require_db!();
+    let pool = Pool::builder().url(&url).max_size(3).build().unwrap();
+
+    // Initially, everything is zero.
+    let s = pool.status();
+    assert_eq!(s.idle, 0);
+    assert_eq!(s.active, 0);
+    assert_eq!(s.open, 0);
+
+    // Acquire 2 connections — both active.
+    let mut c1 = pool.acquire().unwrap();
+    let mut c2 = pool.acquire().unwrap();
+    c1.simple_query("SELECT 1").unwrap();
+    c2.simple_query("SELECT 1").unwrap();
+
+    let s = pool.status();
+    assert_eq!(s.active, 2, "2 connections held = 2 active");
+    assert_eq!(s.idle, 0);
+    assert_eq!(s.open, 2);
+
+    // Return one connection — it becomes idle.
+    drop(c1);
+    let s = pool.status();
+    assert_eq!(s.active, 1, "1 connection held = 1 active");
+    assert_eq!(s.idle, 1, "1 connection returned = 1 idle");
+    assert_eq!(s.open, 2);
+
+    // Return the other.
+    drop(c2);
+    let s = pool.status();
+    assert_eq!(s.active, 0);
+    assert_eq!(s.idle, 2, "both returned = 2 idle");
+    assert_eq!(s.open, 2);
+    assert_eq!(s.max_size, 3);
+}
+
+// --- Server kill backend returns error ---
+
+#[test]
+fn server_kill_backend_returns_error() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+
+    // Open the "victim" connection.
+    let mut victim = Connection::connect(&config).unwrap();
+    victim.simple_query("SELECT 1").unwrap(); // verify it works
+
+    // Get the victim's backend PID via simple_query_rows.
+    let rows = victim.simple_query_rows("SELECT pg_backend_pid()").unwrap();
+    let pid_str = rows[0][0].as_deref().expect("pid should not be null");
+    let pid: i32 = pid_str.parse().expect("pid should be an integer");
+    assert!(pid > 0, "backend pid should be positive: {pid}");
+
+    // Open a second connection to terminate the victim.
+    let mut killer = Connection::connect(&config).unwrap();
+    let kill_sql = format!("SELECT pg_terminate_backend({pid})");
+    killer.simple_query(&kill_sql).unwrap();
+
+    // Give PG a moment to process the termination.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // The victim's next query should fail with an I/O error.
+    let result = victim.simple_query("SELECT 1");
+    assert!(
+        result.is_err(),
+        "query on terminated connection should fail"
+    );
+    match &result {
+        Err(DriverError::Io(_)) => {} // expected — socket closed
+        Err(DriverError::Server { code, .. }) => {
+            // PG may send an error response before closing (57P01 = admin_shutdown)
+            assert_eq!(
+                code,
+                b"57P01",
+                "expected admin_shutdown code, got: {}",
+                std::str::from_utf8(code).unwrap_or("???")
+            );
+        }
+        Err(e) => panic!("expected Io or Server(57P01) error, got: {e}"),
+        Ok(_) => panic!("expected error"),
+    }
+}
+
+// --- Statement timeout returns error ---
+
+#[test]
+fn statement_timeout_returns_error() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+
+    // Set a very short statement timeout (100ms).
+    conn.simple_query("SET statement_timeout = '100ms'")
+        .unwrap();
+
+    // Run a query that takes longer than the timeout.
+    let result = conn.simple_query("SELECT pg_sleep(5)");
+    assert!(
+        result.is_err(),
+        "pg_sleep(5) with 100ms timeout should fail"
+    );
+    match &result {
+        Err(DriverError::Server { code, .. }) => {
+            // 57014 = query_canceled
+            assert_eq!(
+                code,
+                b"57014",
+                "expected query_canceled (57014), got: {}",
+                std::str::from_utf8(code).unwrap_or("???")
+            );
+        }
+        Err(e) => panic!("expected Server(57014) error, got: {e}"),
+        Ok(_) => panic!("expected error"),
+    }
+}
+
+// --- Query after pg_terminate_backend returns error ---
+
+#[test]
+fn query_after_disconnect_returns_error() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+
+    // Open a connection and verify it works.
+    let mut conn = Connection::connect(&config).unwrap();
+    conn.simple_query("SELECT 1").unwrap();
+    assert!(conn.is_idle());
+
+    // Get the connection's own backend PID.
+    let rows = conn.simple_query_rows("SELECT pg_backend_pid()").unwrap();
+    let pid: i32 = rows[0][0].as_deref().unwrap().parse().unwrap();
+
+    // Terminate it from a separate connection.
+    let mut killer = Connection::connect(&config).unwrap();
+    let kill_sql = format!("SELECT pg_terminate_backend({pid})");
+    killer.simple_query(&kill_sql).unwrap();
+
+    // Give PG a moment to tear down the backend.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // Every subsequent query should fail.
+    let r1 = conn.simple_query("SELECT 1");
+    assert!(r1.is_err(), "first query after kill should fail");
+
+    // Connection should not magically recover — second attempt also fails.
+    let r2 = conn.simple_query("SELECT 2");
+    assert!(r2.is_err(), "second query after kill should also fail");
+}
+
+// --- Pool discards terminated connections and recovers ---
+
+#[test]
+fn pool_recovers_after_backend_terminated() {
+    let url = require_db!();
+    // Use stale_timeout=0 so the dead connection is immediately discarded
+    // when the pool tries to pop it (idle_duration >= 0 always).
+    let pool = Pool::builder()
+        .url(&url)
+        .max_size(1)
+        .stale_timeout(std::time::Duration::ZERO)
+        .build()
+        .unwrap();
+
+    // Acquire, use, get PID, return to pool.
+    let pid1;
+    {
+        let mut conn = pool.acquire().unwrap();
+        conn.simple_query("SELECT 1").unwrap();
+        pid1 = conn.pid();
+    }
+
+    // Kill the backend from a separate connection.
+    {
+        let config = Config::from_url(&url).unwrap();
+        let mut killer = Connection::connect(&config).unwrap();
+        killer
+            .simple_query(&format!("SELECT pg_terminate_backend({pid1})"))
+            .unwrap();
+    }
+
+    // Give PG a moment to process the termination.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // With stale_timeout=0, the pool discards the dead connection on pop
+    // (idle_duration >= 0 is always true), decrements open_count, and
+    // creates a fresh connection. The next acquire should succeed.
+    let mut conn = pool.acquire().unwrap();
+    conn.simple_query("SELECT 1").unwrap();
+    let pid2 = conn.pid();
+    assert_ne!(
+        pid1, pid2,
+        "should get a new connection after the old one was terminated"
+    );
+}
+
+// --- Pool concurrent acquire/release stress with status invariants ---
+
+#[test]
+fn pool_status_invariant_under_concurrent_load() {
+    let url = require_db!();
+    let pool = std::sync::Arc::new(
+        Pool::builder()
+            .url(&url)
+            .max_size(4)
+            .acquire_timeout(Some(std::time::Duration::from_secs(10)))
+            .build()
+            .unwrap(),
+    );
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let mut handles = Vec::new();
+
+    for _ in 0..8 {
+        let pool = pool.clone();
+        let barrier = barrier.clone();
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            for _ in 0..50 {
+                let mut conn = pool.acquire().unwrap();
+                conn.simple_query("SELECT 1").unwrap();
+                drop(conn);
+            }
+        }));
+    }
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // After all threads finish, open_count <= max_size.
+    assert!(pool.open_count() <= pool.max_size());
+
+    // All connections returned — active should be 0.
+    let status = pool.status();
+    assert_eq!(status.active, 0, "all connections should be idle");
+    assert!(
+        status.idle <= pool.max_size(),
+        "idle count should not exceed max_size"
+    );
+    assert_eq!(
+        status.open, status.idle,
+        "open should equal idle when no connections are active"
+    );
+}
+
+// --- Connection recovery after statement timeout ---
+
+#[test]
+fn connection_recovers_after_statement_timeout() {
+    let url = require_db!();
+    let config = Config::from_url(&url).unwrap();
+    let mut conn = Connection::connect(&config).unwrap();
+
+    // Set a short statement timeout.
+    conn.simple_query("SET statement_timeout = '100ms'")
+        .unwrap();
+
+    // Trigger a timeout.
+    let result = conn.simple_query("SELECT pg_sleep(5)");
+    assert!(result.is_err());
+
+    // The connection enters a failed transaction state or returns to idle
+    // depending on whether we were in a transaction. Without BEGIN, PG
+    // auto-rolls-back and the connection should be usable again.
+    // Reset timeout and verify recovery.
+    conn.simple_query("SET statement_timeout = '0'").unwrap();
+    conn.simple_query("SELECT 1").unwrap();
+    assert!(conn.is_idle(), "connection should be idle after recovery");
 }

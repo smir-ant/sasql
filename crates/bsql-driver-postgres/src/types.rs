@@ -35,6 +35,13 @@ pub struct Config {
     /// pooling compatibility. When disabled, every query uses the unnamed
     /// prepared statement — no server-side statement caching.
     pub statement_cache_mode: StatementCacheMode,
+    /// Path to PEM file containing CA certificate(s) for server verification.
+    /// When set, these CAs are used instead of the system defaults.
+    pub ssl_root_cert: Option<String>,
+    /// Path to PEM file containing client certificate for mTLS.
+    pub ssl_cert: Option<String>,
+    /// Path to PEM file containing client private key for mTLS.
+    pub ssl_key: Option<String>,
 }
 
 /// Zeroize password on drop to minimize credential lifetime in memory.
@@ -120,6 +127,9 @@ impl Config {
         let mut statement_timeout_secs: u32 = 30;
         let mut statement_cache_mode = StatementCacheMode::Named;
         let mut host_override: Option<String> = None;
+        let mut ssl_root_cert: Option<String> = None;
+        let mut ssl_cert: Option<String> = None;
+        let mut ssl_key: Option<String> = None;
         for param in params.split('&') {
             if param.is_empty() {
                 continue;
@@ -150,6 +160,12 @@ impl Config {
                 };
             } else if let Some(val) = param.strip_prefix("host=") {
                 host_override = Some(url_decode(val)?);
+            } else if let Some(val) = param.strip_prefix("sslrootcert=") {
+                ssl_root_cert = Some(url_decode(val)?);
+            } else if let Some(val) = param.strip_prefix("sslcert=") {
+                ssl_cert = Some(url_decode(val)?);
+            } else if let Some(val) = param.strip_prefix("sslkey=") {
+                ssl_key = Some(url_decode(val)?);
             }
         }
 
@@ -174,6 +190,9 @@ impl Config {
             ssl,
             statement_timeout_secs,
             statement_cache_mode,
+            ssl_root_cert,
+            ssl_cert,
+            ssl_key,
         };
         config.validate()?;
         Ok(config)
@@ -872,6 +891,9 @@ mod tests {
             ssl: SslMode::Disable,
             statement_timeout_secs: 30,
             statement_cache_mode: StatementCacheMode::Named,
+            ssl_root_cert: None,
+            ssl_cert: None,
+            ssl_key: None,
         };
         assert!(cfg.validate().is_err());
     }
@@ -888,6 +910,9 @@ mod tests {
             ssl: SslMode::Disable,
             statement_timeout_secs: 30,
             statement_cache_mode: StatementCacheMode::Named,
+            ssl_root_cert: None,
+            ssl_cert: None,
+            ssl_key: None,
         };
         assert!(cfg.validate().is_err());
     }
@@ -904,6 +929,9 @@ mod tests {
             ssl: SslMode::Disable,
             statement_timeout_secs: 30,
             statement_cache_mode: StatementCacheMode::Named,
+            ssl_root_cert: None,
+            ssl_cert: None,
+            ssl_key: None,
         };
         assert!(cfg.validate().is_err());
     }
@@ -1017,6 +1045,58 @@ mod tests {
         assert_eq!(StatementCacheMode::default(), StatementCacheMode::Named);
     }
 
+    // ===================================================================
+    // SSL certificate path parsing
+    // ===================================================================
+
+    #[test]
+    fn parse_ssl_root_cert() {
+        let cfg = Config::from_url("postgres://user:pass@localhost/db?sslrootcert=/path/to/ca.pem")
+            .unwrap();
+        assert_eq!(cfg.ssl_root_cert.as_deref(), Some("/path/to/ca.pem"));
+        assert_eq!(cfg.ssl_cert, None);
+        assert_eq!(cfg.ssl_key, None);
+    }
+
+    #[test]
+    fn parse_ssl_cert_and_key() {
+        let cfg = Config::from_url(
+            "postgres://user:pass@localhost/db?sslcert=/path/to/client.pem&sslkey=/path/to/client.key",
+        )
+        .unwrap();
+        assert_eq!(cfg.ssl_root_cert, None);
+        assert_eq!(cfg.ssl_cert.as_deref(), Some("/path/to/client.pem"));
+        assert_eq!(cfg.ssl_key.as_deref(), Some("/path/to/client.key"));
+    }
+
+    #[test]
+    fn parse_ssl_all_tls_params() {
+        let cfg = Config::from_url(
+            "postgres://user:pass@localhost/db?sslmode=require&sslrootcert=/ca.pem&sslcert=/client.pem&sslkey=/client.key",
+        )
+        .unwrap();
+        assert_eq!(cfg.ssl, SslMode::Require);
+        assert_eq!(cfg.ssl_root_cert.as_deref(), Some("/ca.pem"));
+        assert_eq!(cfg.ssl_cert.as_deref(), Some("/client.pem"));
+        assert_eq!(cfg.ssl_key.as_deref(), Some("/client.key"));
+    }
+
+    #[test]
+    fn parse_ssl_paths_percent_encoded() {
+        // %2F = '/'
+        let cfg = Config::from_url("postgres://user:pass@localhost/db?sslrootcert=%2Ftmp%2Fca.pem")
+            .unwrap();
+        assert_eq!(cfg.ssl_root_cert.as_deref(), Some("/tmp/ca.pem"));
+    }
+
+    #[test]
+    fn parse_ssl_params_default_none() {
+        let cfg = Config::from_url("postgres://user:pass@localhost/db").unwrap();
+        assert_eq!(cfg.ssl_root_cert, None);
+        assert_eq!(cfg.ssl_cert, None);
+        assert_eq!(cfg.ssl_key, None);
+    }
+
     #[test]
     fn config_uds_path_format() {
         let cfg = Config::from_url("postgres://user@localhost/db?host=/tmp").unwrap();
@@ -1044,6 +1124,9 @@ mod tests {
             ssl: SslMode::Disable,
             statement_timeout_secs: 30,
             statement_cache_mode: StatementCacheMode::Named,
+            ssl_root_cert: None,
+            ssl_cert: None,
+            ssl_key: None,
         };
         assert!(cfg.host_is_uds());
         assert_eq!(cfg.uds_path(), "/tmp/.s.PGSQL.5432");
@@ -1060,6 +1143,9 @@ mod tests {
             ssl: SslMode::Disable,
             statement_timeout_secs: 30,
             statement_cache_mode: StatementCacheMode::Named,
+            ssl_root_cert: None,
+            ssl_cert: None,
+            ssl_key: None,
         };
         assert!(cfg.host_is_uds());
         assert_eq!(cfg.uds_path(), "/var/run/postgresql/.s.PGSQL.5433");
@@ -1076,6 +1162,9 @@ mod tests {
             ssl: SslMode::Disable,
             statement_timeout_secs: 30,
             statement_cache_mode: StatementCacheMode::Named,
+            ssl_root_cert: None,
+            ssl_cert: None,
+            ssl_key: None,
         };
         assert!(!cfg.host_is_uds());
     }
@@ -1091,6 +1180,9 @@ mod tests {
             ssl: SslMode::Disable,
             statement_timeout_secs: 30,
             statement_cache_mode: StatementCacheMode::Named,
+            ssl_root_cert: None,
+            ssl_cert: None,
+            ssl_key: None,
         };
         assert!(!cfg.host_is_uds());
     }

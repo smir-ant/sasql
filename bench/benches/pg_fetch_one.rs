@@ -75,6 +75,20 @@ fn bench_pg_fetch_one(c: &mut Criterion) {
         });
     });
 
+    // -- bsql (async — same pool, uses tokio runtime) --
+    group.bench_function("bsql_async", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let id = 42i32;
+                let _user =
+                    bsql::query!("SELECT id, name, email FROM bench_users WHERE id = $id: i32")
+                        .fetch_one(&bsql_pool)
+                        .await
+                        .unwrap();
+            });
+        });
+    });
+
     // -- sqlx (async — needs runtime) --
     group.bench_function("sqlx", |b| {
         b.iter(|| {
