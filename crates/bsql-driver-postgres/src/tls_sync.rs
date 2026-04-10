@@ -8,40 +8,30 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use crate::proto;
+use crate::tls_common::{build_client_config, default_client_config};
 use crate::types::Config;
 use crate::DriverError;
-
-/// Cached TLS client config for the default case (webpki roots, no client auth).
-/// Built once, reused for all connections that don't specify custom CA/client certs.
-static DEFAULT_TLS_CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
-
-fn init_default_tls_config() -> Arc<rustls::ClientConfig> {
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    Arc::new(
-        rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth(),
-    )
-}
 
 /// Build a per-connection TLS config when custom CA or client certs are specified.
 ///
 /// - If `ssl_root_cert` is set: reads PEM, parses certs, uses them as the root store
 ///   instead of the system/webpki defaults.
 /// - If `ssl_cert` + `ssl_key` are both set: reads PEMs, configures mTLS client auth.
-/// - Otherwise: returns the global default config.
+/// - Otherwise: returns the process-wide default config from [`default_client_config`].
+///
+/// All code paths — default and custom — route through [`build_client_config`]
+/// in `tls_common`, which pins the rustls crypto provider to `ring` and
+/// bypasses the process-level `CryptoProvider` auto-selection that panics
+/// under cargo feature unification.
 fn build_tls_config(config: &Config) -> Result<Arc<rustls::ClientConfig>, DriverError> {
     let needs_custom =
         config.ssl_root_cert.is_some() || (config.ssl_cert.is_some() && config.ssl_key.is_some());
 
     if !needs_custom {
-        return Ok(DEFAULT_TLS_CONFIG
-            .get_or_init(init_default_tls_config)
-            .clone());
+        return Ok(default_client_config());
     }
 
     // Build root cert store: custom CA or default webpki roots.
@@ -71,10 +61,9 @@ fn build_tls_config(config: &Config) -> Result<Arc<rustls::ClientConfig>, Driver
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     }
 
-    let builder = rustls::ClientConfig::builder().with_root_certificates(root_store);
-
-    // Client certificate auth (mTLS) if both cert and key are provided.
-    let tls_config =
+    // Load the client certificate/key pair if both are provided, then
+    // delegate to the shared builder which pins the crypto provider.
+    let client_auth =
         if let (Some(ref cert_path), Some(ref key_path)) = (&config.ssl_cert, &config.ssl_key) {
             let cert_pem = std::fs::read(cert_path).map_err(|e| {
                 DriverError::Protocol(format!("failed to read ssl_cert '{cert_path}': {e}"))
@@ -106,14 +95,12 @@ fn build_tls_config(config: &Config) -> Result<Arc<rustls::ClientConfig>, Driver
                     DriverError::Protocol(format!("no private key found in ssl_key '{key_path}'"))
                 })?;
 
-            builder.with_client_auth_cert(certs, key).map_err(|e| {
-                DriverError::Protocol(format!("failed to configure client certificate auth: {e}"))
-            })?
+            Some((certs, key))
         } else {
-            builder.with_no_client_auth()
+            None
         };
 
-    Ok(Arc::new(tls_config))
+    Ok(Arc::new(build_client_config(root_store, client_auth)?))
 }
 
 /// Result of a successful TLS upgrade, carrying both the encrypted stream
@@ -215,13 +202,10 @@ mod tests {
 
     #[test]
     fn tls_sync_default_config_cached() {
-        // Verify the OnceLock TLS config is accessible and reusable
-        let c1 = DEFAULT_TLS_CONFIG
-            .get_or_init(init_default_tls_config)
-            .clone();
-        let c2 = DEFAULT_TLS_CONFIG
-            .get_or_init(init_default_tls_config)
-            .clone();
+        // The default config now lives in `tls_common::default_client_config`.
+        // Two calls must return the same Arc (cached via OnceLock).
+        let c1 = default_client_config();
+        let c2 = default_client_config();
         assert!(Arc::ptr_eq(&c1, &c2));
     }
 
@@ -288,9 +272,7 @@ mod tests {
         assert!(tls.is_ok(), "custom CA config should build: {tls:?}");
 
         // Should NOT be the global default (it's a custom config)
-        let default = DEFAULT_TLS_CONFIG
-            .get_or_init(init_default_tls_config)
-            .clone();
+        let default = default_client_config();
         assert!(!Arc::ptr_eq(&tls.unwrap(), &default));
 
         std::fs::remove_dir_all(&dir).ok();

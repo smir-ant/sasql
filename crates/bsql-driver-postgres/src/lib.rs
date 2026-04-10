@@ -51,6 +51,8 @@ mod proto;
 mod stmt_cache;
 mod sync_io;
 #[cfg(feature = "tls")]
+mod tls_common;
+#[cfg(feature = "tls")]
 mod tls_sync;
 
 #[cfg(feature = "async")]

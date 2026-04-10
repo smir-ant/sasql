@@ -10,13 +10,35 @@ description = "PostgreSQL wire protocol driver for bsql — binary protocol, are
 
 [features]
 default = []
-tls = ["dep:rustls", "dep:webpki-roots", "dep:tokio-rustls", "dep:rustls-pemfile"]
+# TLS via rustls. The `ring` crypto provider is hard-pinned on both
+# `rustls` and `tokio-rustls`: all `ClientConfig`s in bsql are built
+# through `tls_common::build_client_config`, which passes the provider
+# explicitly via `builder_with_provider` and never touches rustls's
+# process-level auto-selection. Pinning the feature here guarantees the
+# `rustls::crypto::ring` module is always in scope when the `tls`
+# feature is on, even if a downstream user disables workspace defaults.
+tls = [
+    "dep:rustls",
+    "rustls/ring",
+    "dep:webpki-roots",
+    "dep:tokio-rustls",
+    "tokio-rustls/ring",
+    "dep:rustls-pemfile",
+]
 async = ["dep:tokio"]
 detect-n-plus-one = ["dep:log"]
 time = ["dep:time"]
 chrono = ["dep:chrono"]
 uuid = ["dep:uuid"]
 decimal = ["dep:rust_decimal"]
+
+# Dev-only feature enabling the feature-unification regression test in
+# tls_common. When on, it brings in rustls with `aws-lc-rs` alongside
+# bsql's `ring`, simulating the exact cargo feature unification scenario
+# that would panic a naive `ClientConfig::builder()`. The test asserts
+# bsql's code path survives and the legacy builder panics — proof that
+# the repro is real and the fix is not a false-green.
+feature-unification-repro = []
 
 [dependencies]
 bsql-arena = { workspace = true }
@@ -59,4 +81,10 @@ rust_decimal = { workspace = true, optional = true }
 proptest = "1"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 rcgen = { workspace = true }
+# Activate the aws-lc-rs crypto provider for the feature-unification
+# regression test. At runtime, cargo's feature unification sees both
+# `ring` (from bsql's `tls` feature) and `aws-lc-rs` (from this dev-dep)
+# enabled on `rustls`, which is exactly the scenario that panics the
+# legacy `ClientConfig::builder()`.
+rustls = { workspace = true, features = ["aws-lc-rs"] }
 

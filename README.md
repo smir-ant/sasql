@@ -487,6 +487,8 @@ bsql implements the PostgreSQL extended query protocol. The following PG feature
 Supported authentication: cleartext password, MD5, SCRAM-SHA-256, SCRAM-SHA-256-PLUS (channel binding).
 Supported transports: TCP, Unix domain sockets, TLS (via rustls).
 
+**TLS crypto provider.** bsql hard-pins [`ring`](https://briansmith.org/rustls-docs/rustls/crypto/ring/index.html) as the rustls crypto provider and passes it explicitly to every `ClientConfig::builder_with_provider` call. This bypasses rustls 0.23's process-level `CryptoProvider` auto-selection, which panics at runtime (`"Could not automatically determine the process-level CryptoProvider from Rustls crate features"`) when cargo feature unification pulls in BOTH `ring` and `aws-lc-rs` — for example, if another dependency in your workspace (reqwest, etc.) enables `aws-lc-rs` on rustls. You get panic-free TLS regardless of downstream feature flags. The choice lives in one function in `bsql-driver-postgres/src/tls_common.rs`; if you need `aws-lc-rs` or a custom provider, open an issue.
+
 </details>
 
 ---

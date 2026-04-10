@@ -1286,14 +1286,11 @@ async fn async_tls_upgrade(
                     DriverError::Protocol(format!("invalid TLS server name '{host}': {e}"))
                 })?;
 
-            // Reuse the same TLS config as sync (root certs, no client auth)
-            let mut root_store = rustls::RootCertStore::empty();
-            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            let tls_config = Arc::new(
-                rustls::ClientConfig::builder()
-                    .with_root_certificates(root_store)
-                    .with_no_client_auth(),
-            );
+            // Share the cached default config with the sync TLS path. This
+            // routes through `tls_common::build_client_config`, which pins
+            // the rustls crypto provider to `ring` so the builder cannot
+            // panic under cargo feature unification (see tls_common docs).
+            let tls_config = crate::tls_common::default_client_config();
 
             let connector = tokio_rustls::TlsConnector::from(tls_config);
             let tls_stream = connector

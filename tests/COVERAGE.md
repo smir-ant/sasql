@@ -636,6 +636,33 @@ Living document — grows with each bug report and edge case discovery.
 - Client certificate (mTLS)
 - sslmode=prefer → fallback to non-TLS
 
+### TLS — crypto provider (`tls_common` tests)
+- `ring_provider()` returns the same `Arc<CryptoProvider>` across calls
+  (cached via `OnceLock`, guards the hot-path zero-alloc invariant)
+- `default_client_config()` returns the same `Arc<ClientConfig>` across
+  calls (shared between sync and async TLS paths)
+- `build_client_config()` with webpki roots and no client auth succeeds
+  and does not panic under any feature combination
+- **Regression for the rustls 0.23 runtime panic** ("Could not
+  automatically determine the process-level CryptoProvider from Rustls
+  crate features"): under the `feature-unification-repro` dev feature,
+  `rustls` is compiled with BOTH `ring` and `aws-lc-rs` enabled —
+  reproducing exactly the cargo feature unification scenario that was
+  hitting users in the wild.
+  - **Positive**: `build_client_config()` via `builder_with_provider`
+    survives feature unification and builds a valid `ClientConfig`.
+  - **Negative** (`legacy_builder_panics_under_feature_unification`):
+    the legacy `rustls::ClientConfig::builder()` entry point is caught
+    via `std::panic::catch_unwind` and MUST panic. If it stops
+    panicking, the test environment is no longer reproducing the
+    conflict and the positive test above would be silently
+    false-green — the negative assertion fails loudly in that case.
+- `tls_sync` integration: `build_tls_config` routes through
+  `tls_common::build_client_config` for both the default (webpki,
+  no-auth) path and the custom path (ssl_root_cert / mTLS), so every
+  TLS config in the process is constructed with the pinned `ring`
+  provider via exactly one codepath.
+
 ### Dynamic SQL
 - raw_query_params: SELECT with params → rows
 - raw_query_params: INSERT with params
