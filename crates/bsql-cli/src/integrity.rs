@@ -3,11 +3,15 @@
 //! Unlike `verify.rs` (which checks cached queries against a live schema),
 //! this module checks that the cache directory itself is self-consistent:
 //!
-//! 1. Every hash listed in `.manifest` / `.manifest.canonical` has a
-//!    corresponding `.bitcode` file on disk.
-//! 2. Every `.bitcode` file on disk decodes cleanly (correct envelope,
+//! 1. Every hash listed in `.manifest` has a corresponding `.bitcode`
+//!    file on disk.
+//! 2. Every `.bitcode` file on disk has a matching entry in `.manifest`.
+//!    In 0.26.4+ this is a hard error — orphans indicate an interrupted
+//!    build or legacy residue from 0.26.3. Run `cargo build` (or this
+//!    command with `--migrate-legacy`) to repair.
+//! 3. Every `.bitcode` file on disk decodes cleanly (correct envelope,
 //!    valid inner payload, matching cache format version).
-//! 3. Every `.bitcode` file's name matches the hash encoded in the payload.
+//! 4. Every `.bitcode` file's name matches the hash encoded in the payload.
 //!
 //! Used by `bsql verify` as a pre-commit / pre-push check — if this fails,
 //! the cache is broken and will fail at compile time in offline mode.
@@ -16,6 +20,48 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::cache;
+
+/// Read the manifest (0.26.4 layout), union with any legacy `.manifest.canonical`
+/// sidecar (0.26.3 residue) so verify works on both old and new checkouts.
+fn read_manifested_hashes(cache_dir: &Path) -> HashSet<String> {
+    let manifest = read_hash_set(&cache_dir.join(".manifest"));
+    let legacy_canonical = read_hash_set(&cache_dir.join(".manifest.canonical"));
+    manifest.union(&legacy_canonical).cloned().collect()
+}
+
+/// One-shot migration from 0.26.3 layout: union legacy `.manifest.canonical`
+/// into `.manifest`, delete legacy sidecar files. Mirrors the macro's own
+/// migration so `bsql verify --migrate-legacy` can repair a cache before
+/// any rebuild runs.
+///
+/// Returns the number of hashes promoted from the canonical sidecar.
+pub fn migrate_legacy_layout(cache_dir: &Path) -> std::io::Result<usize> {
+    let canonical = cache_dir.join(".manifest.canonical");
+    let generation = cache_dir.join(".generation");
+    if !canonical.exists() && !generation.exists() {
+        return Ok(0);
+    }
+
+    let legacy_canonical = read_hash_set(&canonical);
+    let current = read_hash_set(&cache_dir.join(".manifest"));
+    let union: HashSet<String> = legacy_canonical.union(&current).cloned().collect();
+    let promoted = union.len().saturating_sub(current.len());
+
+    if !union.is_empty() {
+        let mut lines: Vec<&String> = union.iter().collect();
+        lines.sort();
+        let mut out = String::with_capacity(lines.len() * 17);
+        for l in lines {
+            out.push_str(l);
+            out.push('\n');
+        }
+        std::fs::write(cache_dir.join(".manifest"), out)?;
+    }
+
+    let _ = std::fs::remove_file(&canonical);
+    let _ = std::fs::remove_file(&generation);
+    Ok(promoted)
+}
 
 #[derive(Debug, Default)]
 pub struct IntegrityReport {
@@ -36,10 +82,15 @@ pub struct IntegrityReport {
 }
 
 impl IntegrityReport {
-    /// True when the cache is consistent enough for offline mode to succeed.
-    /// Orphan files are ignored (they're not a build-breaker).
+    /// True when the cache is consistent for offline mode.
+    ///
+    /// Missing bitcode is always fatal (offline lookup fails at compile time).
+    /// Orphans are fatal too in 0.26.4+: under append-only manifest semantics
+    /// an orphan indicates an interrupted build or legacy 0.26.3 residue, and
+    /// should be repaired rather than silently ignored.
     pub fn is_ok(&self) -> bool {
         self.missing_bitcode.is_empty()
+            && self.orphan_bitcode.is_empty()
             && self.corrupt_files.is_empty()
             && self.filename_mismatch.is_empty()
     }
@@ -65,9 +116,7 @@ pub fn check(cache_dir: &Path) -> Result<IntegrityReport, String> {
         ));
     }
 
-    let manifest = read_hash_set(&cache_dir.join(".manifest"));
-    let canonical = read_hash_set(&cache_dir.join(".manifest.canonical"));
-    let manifested: HashSet<String> = manifest.union(&canonical).cloned().collect();
+    let manifested = read_manifested_hashes(cache_dir);
 
     let mut on_disk: HashSet<String> = HashSet::new();
     let mut report = IntegrityReport {
@@ -230,13 +279,19 @@ mod tests {
     }
 
     #[test]
-    fn check_detects_orphans_as_warning() {
+    fn check_detects_orphans_as_fatal() {
         let dir = tempfile::tempdir().unwrap();
         write_valid_bitcode(dir.path(), 0xdead);
         // Manifest is empty — the bitcode file is an orphan
 
         let report = check(dir.path()).unwrap();
-        assert!(report.is_ok()); // orphans don't make the report fail
+        // 0.26.4+: orphans are fatal. In the append-only model an orphan
+        // means either an interrupted build or unreplayed legacy residue —
+        // either way it should fail verify so the user takes action.
+        assert!(
+            !report.is_ok(),
+            "orphans must fail verify under append-only semantics"
+        );
         assert_eq!(report.orphan_bitcode.len(), 1);
     }
 

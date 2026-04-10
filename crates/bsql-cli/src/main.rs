@@ -163,6 +163,23 @@ fn cmd_verify_cache(args: &[String]) {
 fn cmd_verify_integrity(args: &[String]) {
     let cache_dir = get_cache_dir(args);
 
+    // Optional one-shot migration from 0.26.3 layout. If the user passes
+    // `--migrate-legacy`, fold `.manifest.canonical` into `.manifest` and
+    // delete the legacy sidecar files before checking integrity. Useful for
+    // repairing a cache produced by the 0.26.3 bug without rebuilding.
+    if args.iter().any(|a| a == "--migrate-legacy") {
+        match integrity::migrate_legacy_layout(&cache_dir) {
+            Ok(0) => {}
+            Ok(n) => {
+                println!("Migrated legacy cache: promoted {n} hashes from .manifest.canonical")
+            }
+            Err(e) => {
+                eprintln!("error: migration failed: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+
     let report = integrity::check(&cache_dir).unwrap_or_else(|e| {
         eprintln!("error: {e}");
         std::process::exit(2);
