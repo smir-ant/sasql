@@ -28,9 +28,9 @@ use bsql::{BsqlError, SqlitePool};
 
 #[tokio::main]
 async fn main() -> Result<(), BsqlError> {
-    // SqlitePool::open() opens a pool with 1 writer + 4 reader connections.
+    // SqlitePool::connect() opens a pool with 1 writer + 4 reader connections.
     // WAL mode, mmap, and page cache are configured automatically.
-    let pool = SqlitePool::open("./myapp.db")?;
+    let pool = SqlitePool::connect("./myapp.db")?;
 
     // ---------------------------------------------------------------
     // INSERT — .execute() returns affected row count, same as PostgreSQL

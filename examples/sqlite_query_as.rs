@@ -49,7 +49,7 @@ struct TodoStats {
 
 #[tokio::main]
 async fn main() -> Result<(), BsqlError> {
-    let pool = SqlitePool::open("./myapp.db")?;
+    let pool = SqlitePool::connect("./myapp.db")?;
 
     // ---------------------------------------------------------------
     // Fetch all todos into Vec<Todo>

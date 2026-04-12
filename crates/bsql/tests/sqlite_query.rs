@@ -12,7 +12,7 @@
 use bsql::SqlitePool;
 
 fn pool() -> SqlitePool {
-    SqlitePool::open("/tmp/bsql_test.db").unwrap()
+    SqlitePool::connect("/tmp/bsql_test.db").unwrap()
 }
 
 // ---------------------------------------------------------------------------

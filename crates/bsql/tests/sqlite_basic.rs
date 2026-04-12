@@ -7,7 +7,7 @@
 use bsql::SqlitePool;
 
 fn setup_db() -> SqlitePool {
-    let pool = SqlitePool::open(":memory:").unwrap();
+    let pool = SqlitePool::connect(":memory:").unwrap();
     pool.raw_execute(
         "CREATE TABLE users (
             id INTEGER PRIMARY KEY,
@@ -26,7 +26,7 @@ fn setup_db() -> SqlitePool {
 
 #[test]
 fn sqlite_open_memory() {
-    let _pool = SqlitePool::open(":memory:").unwrap();
+    let _pool = SqlitePool::connect(":memory:").unwrap();
 }
 
 #[test]
@@ -62,8 +62,8 @@ fn sqlite_nullable_column_returns_none() {
 
 #[test]
 fn sqlite_in_memory_isolation() {
-    let pool1 = SqlitePool::open(":memory:").unwrap();
-    let pool2 = SqlitePool::open(":memory:").unwrap();
+    let pool1 = SqlitePool::connect(":memory:").unwrap();
+    let pool2 = SqlitePool::connect(":memory:").unwrap();
 
     pool1
         .raw_execute("CREATE TABLE isolated (id INTEGER)")
@@ -145,7 +145,7 @@ fn sqlite_multiple_readers() {
 #[test]
 fn sqlite_open_nonexistent_readonly_fails() {
     // Opening a nonexistent path for read should fail gracefully
-    let result = SqlitePool::open("/nonexistent/path/to/db.sqlite");
+    let result = SqlitePool::connect("/nonexistent/path/to/db.sqlite");
     assert!(result.is_err());
 }
 

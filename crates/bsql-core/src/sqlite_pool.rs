@@ -11,7 +11,7 @@ use crate::error::{BsqlError, BsqlResult};
 
 /// A SQLite connection pool.
 ///
-/// Created via [`SqlitePool::open`] or [`SqlitePool::builder`]. Uses a single
+/// Created via [`SqlitePool::connect`] or [`SqlitePool::builder`]. Uses a single
 /// writer connection plus N reader connections (default 4). All operations are
 /// synchronous -- no async runtime required.
 ///
@@ -24,7 +24,7 @@ use crate::error::{BsqlError, BsqlResult};
 /// use bsql::SqlitePool;
 ///
 /// // Simple: open with defaults (4 readers)
-/// let pool = SqlitePool::open("./myapp.db")?;
+/// let pool = SqlitePool::connect("./myapp.db")?;
 ///
 /// // Advanced: configure via builder
 /// let pool = SqlitePool::builder()
@@ -88,27 +88,15 @@ impl SqlitePool {
         &self.inner
     }
 
-    /// Open a SQLite pool with default settings (4 reader connections).
+    /// Connect to a SQLite database with default settings (4 reader connections).
     ///
-    /// Alias: [`open`](Self::open) — same behavior, friendlier name for file-backed databases.
+    /// URL formats: `sqlite:./relative/path`, `sqlite:///absolute/path`, `sqlite::memory:`
     pub fn connect(path: &str) -> BsqlResult<Self> {
         let inner =
             bsql_driver_sqlite::pool::SqlitePool::connect(path).map_err(BsqlError::from_sqlite)?;
         Ok(SqlitePool {
             inner: Arc::new(inner),
         })
-    }
-
-    /// Open a SQLite pool with default settings (4 reader connections).
-    ///
-    /// Identical to [`connect`](Self::connect). Provided because `open` reads
-    /// more naturally for file-backed databases:
-    ///
-    /// ```rust,ignore
-    /// let pool = SqlitePool::open("./data.db")?;
-    /// ```
-    pub fn open(path: &str) -> BsqlResult<Self> {
-        Self::connect(path)
     }
 
     /// Create a pool builder for custom configuration.
@@ -120,6 +108,7 @@ impl SqlitePool {
     }
 
     /// Execute a read-only query, returning the `QueryResult` and its `Arena`.
+    #[doc(hidden)]
     pub fn query_readonly(
         &self,
         sql: &str,
@@ -132,6 +121,7 @@ impl SqlitePool {
     }
 
     /// Execute a read-write query, returning the `QueryResult` and its `Arena`.
+    #[doc(hidden)]
     pub fn query_readwrite(
         &self,
         sql: &str,
@@ -144,6 +134,7 @@ impl SqlitePool {
     }
 
     /// Execute a write statement (INSERT/UPDATE/DELETE), return affected row count.
+    #[doc(hidden)]
     pub fn execute_sql(
         &self,
         sql: &str,
@@ -158,6 +149,7 @@ impl SqlitePool {
     /// Fetch exactly one row via direct decode — zero arena overhead.
     ///
     /// The `decode` closure reads columns directly from the stepped statement.
+    #[doc(hidden)]
     #[inline]
     pub fn fetch_one_direct<F, T>(
         &self,
@@ -178,6 +170,7 @@ impl SqlitePool {
     }
 
     /// Fetch zero or one row via direct decode — zero arena overhead.
+    #[doc(hidden)]
     #[inline]
     pub fn fetch_optional_direct<F, T>(
         &self,
@@ -201,6 +194,7 @@ impl SqlitePool {
     ///
     /// The `decode` closure reads columns directly from the stepped statement
     /// for each row. This is the fastest path for multi-row queries.
+    #[doc(hidden)]
     #[inline]
     pub fn fetch_all_direct<F, T>(
         &self,
@@ -220,6 +214,7 @@ impl SqlitePool {
 
     /// Fetch all rows into an arena-backed result — zero per-row heap allocation
     /// for text/blob columns. See [`bsql_driver_sqlite::conn::SqliteConnection::fetch_all_arena`].
+    #[doc(hidden)]
     #[inline]
     pub fn fetch_all_arena<F, T>(
         &self,
@@ -242,6 +237,7 @@ impl SqlitePool {
 
     /// Process each row in-place via a closure. Zero-copy -- text columns
     /// borrow directly from SQLite's internal buffer.
+    #[doc(hidden)]
     #[inline]
     pub fn for_each<F>(
         &self,
@@ -262,6 +258,7 @@ impl SqlitePool {
     }
 
     /// Process each row in-place, collecting results into a `Vec`.
+    #[doc(hidden)]
     #[inline]
     pub fn for_each_collect<F, T>(
         &self,
@@ -284,6 +281,7 @@ impl SqlitePool {
     /// Execute a statement via direct param binding — zero arena/ParamValue overhead.
     ///
     /// Takes `&[&dyn SqliteEncode]` directly instead of `SmallVec<ParamValue>`.
+    #[doc(hidden)]
     #[inline]
     pub fn execute_direct(
         &self,
@@ -300,6 +298,7 @@ impl SqlitePool {
     ///
     /// Acquires the writer once for the entire batch. Returns the total
     /// number of affected rows across all executions.
+    #[doc(hidden)]
     pub fn execute_batch(
         &self,
         sql: &str,
@@ -324,7 +323,6 @@ impl SqlitePool {
         self.inner.raw_execute(sql).map_err(BsqlError::from_sqlite)
     }
 
-
     /// Begin a transaction on the writer connection.
     ///
     /// Returns a `SqliteTransaction` that must be committed or rolled back.
@@ -343,6 +341,7 @@ impl SqlitePool {
     /// Execute a read-only streaming query.
     ///
     /// Returns the first chunk and a `SqliteStreamingQuery` to continue.
+    #[doc(hidden)]
     pub fn query_streaming(
         &self,
         sql: &str,
@@ -366,6 +365,7 @@ impl SqlitePool {
     }
 
     /// Pre-prepare statements on all connections (warmup).
+    #[doc(hidden)]
     pub fn warmup(&self, sqls: &[&str]) {
         self.inner.warmup(sqls);
     }
@@ -404,7 +404,7 @@ impl SqlitePool {
 /// ```rust,ignore
 /// use bsql::SqlitePool;
 ///
-/// let pool = SqlitePool::open("./myapp.db")?;
+/// let pool = SqlitePool::connect("./myapp.db")?;
 /// let tx = pool.begin()?;
 ///
 /// // Execute writes within the transaction...
@@ -456,6 +456,7 @@ impl SqliteTransaction {
     }
 
     /// Execute a write query within the transaction.
+    #[doc(hidden)]
     pub fn execute_sql(
         &self,
         sql: &str,
@@ -471,6 +472,7 @@ impl SqliteTransaction {
     /// within the transaction.
     ///
     /// Holds the writer for the entire batch. Returns the total affected rows.
+    #[doc(hidden)]
     pub fn execute_batch(
         &self,
         sql: &str,
@@ -483,6 +485,7 @@ impl SqliteTransaction {
     }
 
     /// Execute a query within the transaction (writer connection).
+    #[doc(hidden)]
     pub fn query_readwrite(
         &self,
         sql: &str,
@@ -637,20 +640,6 @@ mod tests {
         let dir = std::env::temp_dir();
         let pid = std::process::id();
         format!("{}/bsql_test_sqlite_pool_{}_{}.db", dir.display(), pid, id)
-    }
-
-    // --- SqlitePool::open alias ---
-
-    #[test]
-    fn open_is_alias_for_connect() {
-        let path = temp_db_path();
-        let pool = SqlitePool::open(&path).unwrap();
-        pool.raw_execute("CREATE TABLE t (id INTEGER NOT NULL)")
-            .unwrap();
-        // Verify the pool is usable
-        assert_eq!(pool.reader_count(), 4);
-        pool.close();
-        let _ = std::fs::remove_file(&path);
     }
 
     // --- Transaction tests ---

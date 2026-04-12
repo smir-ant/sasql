@@ -41,7 +41,7 @@ enum TicketSort {
 
 #[tokio::main]
 async fn main() -> Result<(), BsqlError> {
-    let pool = SqlitePool::open("./myapp.db")?;
+    let pool = SqlitePool::connect("./myapp.db")?;
 
     // ---------------------------------------------------------------
     // Optional WHERE clauses — same syntax as PostgreSQL

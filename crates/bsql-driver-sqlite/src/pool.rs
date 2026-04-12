@@ -242,7 +242,6 @@ impl SqlitePool {
         conn.exec(sql)
     }
 
-
     /// Fetch exactly one row via direct decode — zero arena overhead.
     ///
     /// The `decode` closure reads columns directly from the stepped statement.

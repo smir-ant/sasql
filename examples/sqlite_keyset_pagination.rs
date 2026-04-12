@@ -26,7 +26,7 @@
 use bsql::{BsqlError, SqlitePool};
 
 fn main() -> Result<(), BsqlError> {
-    let pool = SqlitePool::open(":memory:")?;
+    let pool = SqlitePool::connect(":memory:")?;
 
     // Schema + seed data. DDL and multi-row inserts go through
     // `raw_execute` — runtime SQL, no compile-time validation,
