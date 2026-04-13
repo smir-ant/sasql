@@ -1809,66 +1809,87 @@ fn gen_pg_for_each_raw_decode(validation: &ValidationResult) -> (TokenStream, To
 /// Generate direct-access decode for a fixed-size NOT NULL column at a
 /// compile-time-known byte offset within the DataRow payload.
 ///
-/// Emits code that reads directly via literal indices — no length prefix
-/// read, no NULL check, no `_bsql_pos` tracking.
+/// Reads the 4-byte length prefix at `len_offset` to validate the column
+/// is not NULL and has the expected wire size. Then reads data at
+/// `data_offset` via literal indices — no `_bsql_pos` tracking.
 fn gen_pg_raw_fixed_decode(
     field_name: &proc_macro2::Ident,
     rust_type: &str,
     data_offset: usize,
 ) -> TokenStream {
+    let len_offset = data_offset - 4;
+    let wire_size = pg_wire_size(rust_type).unwrap() as i32;
+    let field_str = field_name.to_string();
+    let type_str = rust_type;
+    let lo = len_offset;
+    let do_ = data_offset;
+
+    // Validate length prefix: catches NULL (-1) and protocol anomalies.
+    let validate = quote! {
+        {
+            let _len = i32::from_be_bytes([
+                _bsql_data[#lo], _bsql_data[#lo + 1],
+                _bsql_data[#lo + 2], _bsql_data[#lo + 3],
+            ]);
+            if _len != #wire_size {
+                return Err(::bsql_core::error::DecodeError::with_source(
+                    #field_str, #type_str,
+                    if _len < 0 { "NULL for NOT NULL column" } else { "unexpected wire size" },
+                    ::std::io::Error::new(::std::io::ErrorKind::InvalidData,
+                        concat!("expected NOT NULL ", #type_str)),
+                ));
+            }
+        }
+    };
+
     match rust_type {
-        "bool" => {
-            let o = data_offset;
-            quote! { let #field_name = _bsql_data[#o] != 0; }
-        }
-        "i16" => {
-            let o0 = data_offset;
-            let o1 = data_offset + 1;
-            quote! { let #field_name = i16::from_be_bytes([_bsql_data[#o0], _bsql_data[#o1]]); }
-        }
-        "i32" => {
-            let o0 = data_offset;
-            let o1 = data_offset + 1;
-            let o2 = data_offset + 2;
-            let o3 = data_offset + 3;
-            quote! { let #field_name = i32::from_be_bytes([_bsql_data[#o0], _bsql_data[#o1], _bsql_data[#o2], _bsql_data[#o3]]); }
-        }
-        "i64" => {
-            let o0 = data_offset;
-            let o1 = data_offset + 1;
-            let o2 = data_offset + 2;
-            let o3 = data_offset + 3;
-            let o4 = data_offset + 4;
-            let o5 = data_offset + 5;
-            let o6 = data_offset + 6;
-            let o7 = data_offset + 7;
-            quote! { let #field_name = i64::from_be_bytes([_bsql_data[#o0], _bsql_data[#o1], _bsql_data[#o2], _bsql_data[#o3], _bsql_data[#o4], _bsql_data[#o5], _bsql_data[#o6], _bsql_data[#o7]]); }
-        }
-        "f32" => {
-            let o0 = data_offset;
-            let o1 = data_offset + 1;
-            let o2 = data_offset + 2;
-            let o3 = data_offset + 3;
-            quote! { let #field_name = f32::from_be_bytes([_bsql_data[#o0], _bsql_data[#o1], _bsql_data[#o2], _bsql_data[#o3]]); }
-        }
-        "f64" => {
-            let o0 = data_offset;
-            let o1 = data_offset + 1;
-            let o2 = data_offset + 2;
-            let o3 = data_offset + 3;
-            let o4 = data_offset + 4;
-            let o5 = data_offset + 5;
-            let o6 = data_offset + 6;
-            let o7 = data_offset + 7;
-            quote! { let #field_name = f64::from_be_bytes([_bsql_data[#o0], _bsql_data[#o1], _bsql_data[#o2], _bsql_data[#o3], _bsql_data[#o4], _bsql_data[#o5], _bsql_data[#o6], _bsql_data[#o7]]); }
-        }
-        "u32" => {
-            let o0 = data_offset;
-            let o1 = data_offset + 1;
-            let o2 = data_offset + 2;
-            let o3 = data_offset + 3;
-            quote! { let #field_name = i32::from_be_bytes([_bsql_data[#o0], _bsql_data[#o1], _bsql_data[#o2], _bsql_data[#o3]]) as u32; }
-        }
+        "bool" => quote! {
+            #validate
+            let #field_name = _bsql_data[#do_] != 0;
+        },
+        "i16" => quote! {
+            #validate
+            let #field_name = i16::from_be_bytes([_bsql_data[#do_], _bsql_data[#do_ + 1]]);
+        },
+        "i32" => quote! {
+            #validate
+            let #field_name = i32::from_be_bytes([
+                _bsql_data[#do_], _bsql_data[#do_ + 1],
+                _bsql_data[#do_ + 2], _bsql_data[#do_ + 3],
+            ]);
+        },
+        "i64" => quote! {
+            #validate
+            let #field_name = i64::from_be_bytes([
+                _bsql_data[#do_], _bsql_data[#do_ + 1],
+                _bsql_data[#do_ + 2], _bsql_data[#do_ + 3],
+                _bsql_data[#do_ + 4], _bsql_data[#do_ + 5],
+                _bsql_data[#do_ + 6], _bsql_data[#do_ + 7],
+            ]);
+        },
+        "f32" => quote! {
+            #validate
+            let #field_name = f32::from_be_bytes([
+                _bsql_data[#do_], _bsql_data[#do_ + 1],
+                _bsql_data[#do_ + 2], _bsql_data[#do_ + 3],
+            ]);
+        },
+        "f64" => quote! {
+            #validate
+            let #field_name = f64::from_be_bytes([
+                _bsql_data[#do_], _bsql_data[#do_ + 1],
+                _bsql_data[#do_ + 2], _bsql_data[#do_ + 3],
+                _bsql_data[#do_ + 4], _bsql_data[#do_ + 5],
+                _bsql_data[#do_ + 6], _bsql_data[#do_ + 7],
+            ]);
+        },
+        "u32" => quote! {
+            #validate
+            let #field_name = u32::from_be_bytes([
+                _bsql_data[#do_], _bsql_data[#do_ + 1],
+                _bsql_data[#do_ + 2], _bsql_data[#do_ + 3],
+            ]);
+        },
         _ => unreachable!("gen_pg_raw_fixed_decode called with non-fixed type: {rust_type}"),
     }
 }

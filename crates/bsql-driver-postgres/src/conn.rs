@@ -47,12 +47,12 @@ pub(crate) fn acquire_resp_buf() -> Vec<u8> {
 
 /// Return a response buffer to the thread-local pool for reuse.
 ///
-/// Pool capped at 16 buffers — matches typical connection pool size per
-/// thread. Excess buffers are dropped, returning memory to the allocator.
+/// Pool capped at 8 buffers per thread (2x typical connection pool size).
+/// Excess buffers are dropped, returning memory to the allocator.
 pub fn release_resp_buf(buf: Vec<u8>) {
     RESP_BUF_POOL.with(|pool| {
         let mut pool = pool.borrow_mut();
-        if pool.len() < 16 {
+        if pool.len() < 8 {
             pool.push(buf);
         }
     });
@@ -71,7 +71,7 @@ pub(crate) fn acquire_col_offsets() -> Vec<(usize, i32)> {
 pub fn release_col_offsets(buf: Vec<(usize, i32)>) {
     COL_OFFSETS_POOL.with(|pool| {
         let mut pool = pool.borrow_mut();
-        if pool.len() < 16 {
+        if pool.len() < 8 {
             pool.push(buf);
         }
     });
@@ -4024,8 +4024,9 @@ pub(crate) fn parse_data_row_into_buf(
     // impossible. On 32-bit this is still safe: 256 MB < 4 GB.
     let col_data = &data[2..];
 
-    // Upfront minimum: each column has at least a 4-byte length prefix.
-    // This proves all length reads in the loop are in-bounds.
+    // Upfront minimum: rejects obviously truncated messages before
+    // allocating into buf. The per-column check inside the loop is
+    // still needed because column data pushes pos forward.
     if col_data.len() < num_cols * 4 {
         return Err(DriverError::Protocol("DataRow truncated".into()));
     }
@@ -4036,6 +4037,9 @@ pub(crate) fn parse_data_row_into_buf(
     // Walk columns within the buffer — no copying, just record offsets.
     let mut pos: usize = 0;
     for _ in 0..num_cols {
+        if pos + 4 > col_data.len() {
+            return Err(DriverError::Protocol("DataRow truncated".into()));
+        }
         let col_len = i32::from_be_bytes([
             col_data[pos],
             col_data[pos + 1],

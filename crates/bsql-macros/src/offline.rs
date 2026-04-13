@@ -68,8 +68,7 @@ static SEEN_HASHES: LazyLock<Mutex<std::collections::HashSet<u64>>> =
 /// holds for the duration of a single `write(2)` of ~17 bytes.
 fn append_to_manifest(dir: &std::path::Path, hash: u64) {
     // Per-process dedup — a pure optimization, independent of correctness.
-    let seen = &*SEEN_HASHES;
-    if let Ok(mut s) = seen.lock() {
+    if let Ok(mut s) = SEEN_HASHES.lock() {
         if !s.insert(hash) {
             return;
         }

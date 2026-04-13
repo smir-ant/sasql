@@ -719,9 +719,9 @@ impl<'a> PgDataRow<'a> {
         }
         let num_cols = num_cols as usize;
 
-        // Upfront minimum size: 2-byte header + 4-byte length prefix per column.
-        // This proves all length-prefix reads are in-bounds, eliminating per-column
-        // bounds checks in the loop below.
+        // Upfront minimum: rejects obviously truncated messages before
+        // entering the loop. The per-column check is still needed because
+        // column data pushes pos forward past the minimum.
         let min_size = 2 + num_cols * 4;
         if data.len() < min_size {
             return Err(DriverError::Protocol("DataRow truncated".into()));
