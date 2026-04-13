@@ -2650,6 +2650,158 @@ impl Connection {
         }
     }
 
+    /// Bulk copy data INTO a table using PostgreSQL binary COPY protocol.
+    ///
+    /// 5-10x faster than pipelined INSERT for large data sets because PG
+    /// bypasses per-row SQL parsing, planning, and executor overhead.
+    ///
+    /// Each row is a slice of `&dyn Encode` values — the same trait used
+    /// by `query!` parameters. Values are binary-encoded via
+    /// `Encode::encode_binary`, matching PG's native binary format.
+    ///
+    /// # Wire format
+    ///
+    /// ```text
+    /// COPY table(cols) FROM STDIN WITH (FORMAT binary)
+    /// → CopyData(header: PGCOPY\n\xff\r\n\0 + flags + ext)
+    /// → CopyData(tuple: field_count + [length + data]*)  // per row
+    /// → CopyData(trailer: -1 as i16)
+    /// → CopyDone
+    /// ```
+    pub fn copy_in_binary(
+        &mut self,
+        table: &str,
+        columns: &[&str],
+        rows: &[&[&(dyn Encode + Sync)]],
+    ) -> Result<u64, DriverError> {
+        // Build: COPY "table"("col1","col2") FROM STDIN WITH (FORMAT binary)
+        let quoted_table = proto::quote_ident(table);
+        let quoted_cols: Vec<String> = columns.iter().map(|c| proto::quote_ident(c)).collect();
+        let sql = format!(
+            "COPY {}({}) FROM STDIN WITH (FORMAT binary)",
+            quoted_table,
+            quoted_cols.join(",")
+        );
+
+        // Send as simple query
+        self.write_buf.clear();
+        proto::write_simple_query(&mut self.write_buf, &sql);
+        self.flush_write()?;
+
+        // Read CopyInResponse
+        loop {
+            let msg = self.read_one_message()?;
+            match msg {
+                BackendMessage::CopyInResponse { .. } => break,
+                BackendMessage::ErrorResponse { data } => {
+                    let fields = proto::parse_error_response(data);
+                    self.drain_to_ready()?;
+                    return Err(self.make_server_error(fields));
+                }
+                BackendMessage::NoticeResponse { .. } | BackendMessage::ParameterStatus { .. } => {}
+                other => {
+                    return Err(DriverError::Protocol(format!(
+                        "expected CopyInResponse, got: {other:?}"
+                    )));
+                }
+            }
+        }
+
+        // Binary COPY header (19 bytes)
+        // Signature: PGCOPY\n\377\r\n\0 (11 bytes)
+        // Flags: 0 (4 bytes, no OID inclusion)
+        // Header extension area length: 0 (4 bytes)
+        self.write_buf.clear();
+        {
+            let header: &[u8] = b"PGCOPY\n\xff\r\n\0";
+            let mut hdr_buf = Vec::with_capacity(19);
+            hdr_buf.extend_from_slice(header);
+            hdr_buf.extend_from_slice(&0i32.to_be_bytes()); // flags
+            hdr_buf.extend_from_slice(&0i32.to_be_bytes()); // extension length
+                                                            // Send header as CopyData
+            self.write_buf.push(b'd');
+            let msg_len = (4 + hdr_buf.len()) as i32;
+            self.write_buf.extend_from_slice(&msg_len.to_be_bytes());
+            self.write_buf.extend_from_slice(&hdr_buf);
+        }
+
+        // Send binary tuples
+        let mut tuple_buf = Vec::with_capacity(256);
+        let num_cols = columns.len() as i16;
+
+        for row in rows {
+            if row.len() != columns.len() {
+                return Err(DriverError::Protocol(format!(
+                    "binary COPY: row has {} columns but expected {}",
+                    row.len(),
+                    columns.len()
+                )));
+            }
+
+            tuple_buf.clear();
+            tuple_buf.extend_from_slice(&num_cols.to_be_bytes());
+            for col in *row {
+                if col.is_null() {
+                    tuple_buf.extend_from_slice(&(-1i32).to_be_bytes());
+                } else {
+                    let len_pos = tuple_buf.len();
+                    tuple_buf.extend_from_slice(&[0u8; 4]); // length placeholder
+                    col.encode_binary(&mut tuple_buf);
+                    let data_len = (tuple_buf.len() - len_pos - 4) as i32;
+                    tuple_buf[len_pos..len_pos + 4].copy_from_slice(&data_len.to_be_bytes());
+                }
+            }
+
+            // Wrap in CopyData message
+            self.write_buf.push(b'd');
+            let msg_len = (4 + tuple_buf.len()) as i32;
+            self.write_buf.extend_from_slice(&msg_len.to_be_bytes());
+            self.write_buf.extend_from_slice(&tuple_buf);
+
+            // Flush when buffer exceeds 64 KB
+            if self.write_buf.len() > 65536 {
+                self.flush_write()?;
+                self.write_buf.clear();
+            }
+        }
+
+        // Binary COPY trailer: field count = -1 (i16)
+        self.write_buf.push(b'd');
+        self.write_buf.extend_from_slice(&6i32.to_be_bytes()); // 4 + 2
+        self.write_buf.extend_from_slice(&(-1i16).to_be_bytes());
+
+        // CopyDone
+        proto::write_copy_done(&mut self.write_buf);
+        self.flush_write()?;
+        self.write_buf.clear();
+
+        // Read CommandComplete + ReadyForQuery
+        let mut count: u64 = 0;
+        loop {
+            let msg = self.read_one_message()?;
+            match msg {
+                BackendMessage::CommandComplete { tag } => {
+                    count = proto::parse_command_tag(tag);
+                }
+                BackendMessage::ReadyForQuery { status } => {
+                    self.tx_status = status;
+                    return Ok(count);
+                }
+                BackendMessage::ErrorResponse { data } => {
+                    let fields = proto::parse_error_response(data);
+                    self.drain_to_ready()?;
+                    return Err(self.make_server_error(fields));
+                }
+                BackendMessage::NoticeResponse { .. } | BackendMessage::ParameterStatus { .. } => {}
+                other => {
+                    return Err(DriverError::Protocol(format!(
+                        "unexpected message during binary copy_in completion: {other:?}"
+                    )));
+                }
+            }
+        }
+    }
+
     /// Bulk copy data OUT of a table or query result to a writer.
     ///
     /// The query is wrapped in `COPY (...) TO STDOUT` and data is streamed

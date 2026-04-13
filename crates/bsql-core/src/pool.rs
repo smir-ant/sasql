@@ -486,6 +486,31 @@ impl PgPool {
             .map_err(BsqlError::from_driver_query)
     }
 
+    /// Bulk copy data INTO a table using PostgreSQL binary COPY protocol.
+    ///
+    /// 5-10x faster than pipelined INSERT for large data sets. Each row
+    /// is a slice of `&dyn Encode` values — same trait used by `query!`.
+    /// Values are binary-encoded directly, no text conversion.
+    ///
+    /// ```rust,ignore
+    /// let rows: Vec<Vec<&dyn Encode>> = data.iter().map(|d| {
+    ///     vec![&d.id as &dyn Encode, &d.name as &dyn Encode]
+    /// }).collect();
+    /// let refs: Vec<&[&dyn Encode]> = rows.iter().map(|r| r.as_slice()).collect();
+    /// pool.copy_in_binary("events", &["id", "name"], &refs).await?;
+    /// ```
+    pub async fn copy_in_binary(
+        &self,
+        table: &str,
+        columns: &[&str],
+        rows: &[&[&(dyn bsql_driver_postgres::codec::Encode + Sync)]],
+    ) -> BsqlResult<u64> {
+        let mut guard = self.inner.acquire().map_err(BsqlError::from)?;
+        guard
+            .copy_in_binary(table, columns, rows)
+            .map_err(BsqlError::from_driver_query)
+    }
+
     /// Bulk copy data OUT of a table or query result to a writer.
     ///
     /// Data is written in PostgreSQL's text format (tab-separated columns,

@@ -1045,6 +1045,16 @@ impl PoolGuard {
         self.sync_conn_mut()?.copy_in(table, columns, rows)
     }
 
+    /// Binary COPY INTO. 5-10x faster than INSERT for bulk data.
+    pub fn copy_in_binary(
+        &mut self,
+        table: &str,
+        columns: &[&str],
+        rows: &[&[&(dyn crate::codec::Encode + Sync)]],
+    ) -> Result<u64, DriverError> {
+        self.sync_conn_mut()?.copy_in_binary(table, columns, rows)
+    }
+
     /// Bulk copy data OUT of a table/query to a writer.
     ///
     /// Writes TSV-formatted rows. Returns the row count.

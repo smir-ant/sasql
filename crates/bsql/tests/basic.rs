@@ -2455,3 +2455,92 @@ async fn option_param_is_null_or_pattern() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Binary COPY — bulk insert via PG binary protocol
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn copy_in_binary_basic() {
+    let pool = pool().await;
+
+    // Create temp table
+    pool.raw_execute("CREATE TEMP TABLE _copy_bin_test (id int4 NOT NULL, score int4 NOT NULL)")
+        .await
+        .unwrap();
+
+    // Bulk insert 3 rows via binary COPY
+    let rows: Vec<Vec<&(dyn bsql::driver::Encode + Sync)>> = vec![
+        vec![&1i32 as &(dyn bsql::driver::Encode + Sync), &100i32],
+        vec![&2i32, &200i32],
+        vec![&3i32, &300i32],
+    ];
+    let row_refs: Vec<&[&(dyn bsql::driver::Encode + Sync)]> =
+        rows.iter().map(|r| r.as_slice()).collect();
+
+    let count = pool
+        .copy_in_binary("_copy_bin_test", &["id", "score"], &row_refs)
+        .await
+        .unwrap();
+    assert_eq!(count, 3, "should insert 3 rows");
+
+    // Verify data
+    let result = pool
+        .raw_query("SELECT id, score FROM _copy_bin_test ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(result.len(), 3);
+    assert_eq!(result[0].get(0), Some("1"));
+    assert_eq!(result[0].get(1), Some("100"));
+    assert_eq!(result[1].get(0), Some("2"));
+    assert_eq!(result[1].get(1), Some("200"));
+    assert_eq!(result[2].get(0), Some("3"));
+    assert_eq!(result[2].get(1), Some("300"));
+}
+
+#[tokio::test]
+async fn copy_in_binary_empty() {
+    let pool = pool().await;
+
+    pool.raw_execute("CREATE TEMP TABLE _copy_bin_empty (id int4 NOT NULL)")
+        .await
+        .unwrap();
+
+    let rows: Vec<&[&(dyn bsql::driver::Encode + Sync)]> = vec![];
+    let count = pool
+        .copy_in_binary("_copy_bin_empty", &["id"], &rows)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "empty COPY should insert 0 rows");
+}
+
+#[tokio::test]
+async fn copy_in_binary_with_text() {
+    let pool = pool().await;
+
+    pool.raw_execute("CREATE TEMP TABLE _copy_bin_text (id int4 NOT NULL, name text NOT NULL)")
+        .await
+        .unwrap();
+
+    let name1 = "alice";
+    let name2 = "bob";
+    let rows: Vec<Vec<&(dyn bsql::driver::Encode + Sync)>> = vec![
+        vec![&1i32 as &(dyn bsql::driver::Encode + Sync), &name1],
+        vec![&2i32, &name2],
+    ];
+    let row_refs: Vec<&[&(dyn bsql::driver::Encode + Sync)]> =
+        rows.iter().map(|r| r.as_slice()).collect();
+
+    let count = pool
+        .copy_in_binary("_copy_bin_text", &["id", "name"], &row_refs)
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
+
+    let result = pool
+        .raw_query("SELECT name FROM _copy_bin_text ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(result[0].get(0), Some("alice"));
+    assert_eq!(result[1].get(0), Some("bob"));
+}
