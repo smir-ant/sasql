@@ -123,7 +123,7 @@ fn binary_col_to_text(row: &bsql_driver_postgres::Row<'_>, idx: usize, type_oid:
 /// ```
 pub struct PgPool {
     pub(crate) inner: bsql_driver_postgres::Pool,
-    /// Optional read replica pool. When present, `query_raw_readonly` routes here.
+    /// Optional read replica pool. When present, read-only queries route here.
     pub(crate) read_pool: Option<bsql_driver_postgres::Pool>,
 }
 
@@ -151,7 +151,7 @@ pub struct PoolBuilder {
     max_lifetime: Option<Option<Duration>>,
     acquire_timeout: Option<Option<Duration>>,
     min_idle: Option<usize>,
-    /// Optional URL for a read replica. When set, `query_raw_readonly`
+    /// Optional URL for a read replica. When set, read-only queries
     /// routes to this pool instead of the primary.
     replica_url: Option<String>,
     /// Max pool size for the replica pool. Defaults to same as `max_size`.
@@ -205,7 +205,7 @@ impl PoolBuilder {
 
     /// Set a read replica URL for read/write splitting.
     ///
-    /// When configured, `query_raw_readonly` (used by SELECT queries)
+    /// When configured, read-only queries (used by SELECT queries)
     /// routes to the replica pool. All writes go to the primary.
     /// When no replica is configured, all queries use the primary.
     pub fn replica_url(mut self, url: &str) -> Self {

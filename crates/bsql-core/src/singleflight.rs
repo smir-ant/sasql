@@ -15,7 +15,7 @@
 //!
 //! # Limitations
 //!
-//! - Only coalesces `query_raw` and `query_raw_readonly` (not `execute_raw`).
+//! - Only coalesces read-only `query` calls (not writes).
 //!   Writes must not be coalesced.
 //! - The result is `Arc`-shared, so callers receive the same data (no mutations).
 //! - Large result sets are shared by reference, reducing memory for hot reads.

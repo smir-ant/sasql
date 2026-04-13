@@ -129,7 +129,7 @@ impl<'a> From<&'a mut Transaction> for QueryTarget<'a> {
 impl<'a> QueryTarget<'a> {
     /// Execute a query and return all rows.
     #[inline]
-    #[doc(hidden)]
+
     pub async fn query(
         &mut self,
         sql: crate::Sql<'_>,
@@ -162,7 +162,7 @@ impl<'a> QueryTarget<'a> {
 
     /// Execute a query and return the number of affected rows.
     #[inline]
-    #[doc(hidden)]
+
     pub async fn execute(
         &mut self,
         sql: crate::Sql<'_>,
@@ -204,7 +204,7 @@ impl<'a> QueryTarget<'a> {
 impl<'a> QueryTarget<'a> {
     /// Execute a query and return all rows.
     #[inline]
-    #[doc(hidden)]
+
     pub fn query(
         &mut self,
         sql: crate::Sql<'_>,
@@ -236,7 +236,7 @@ impl<'a> QueryTarget<'a> {
 
     /// Execute a query and return the number of affected rows.
     #[inline]
-    #[doc(hidden)]
+
     pub fn execute(
         &mut self,
         sql: crate::Sql<'_>,

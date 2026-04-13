@@ -552,7 +552,7 @@ impl<'a> Row<'a> {
     /// Create a Row view from raw data bytes and pre-parsed column offsets.
     ///
     /// Used to bridge PgDataRow (streaming path) → Row (decode path) so
-    /// that PgQuerySpec::decode_row works for both batch and streaming
+    /// that the same decode logic works for both batch and streaming
     /// execution without duplication.
     ///
     /// The `arena` and `columns` fields are set to empty — `get_raw()`

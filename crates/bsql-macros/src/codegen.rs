@@ -437,7 +437,7 @@ pub fn generate_query_as_code(
 
 /// Generate executor impls for `query_as!` — maps results into `#target_type`.
 ///
-/// Uses PgQuerySpec trait, same as query! codegen. The only difference:
+/// Uses the same Sql-based codegen pattern as query!. The only difference:
 /// `type Row = #target_type` (user-defined struct) instead of a generated anonymous struct.
 fn gen_query_as_executor_impls(
     parsed: &ParsedQuery,
