@@ -67,7 +67,7 @@ static SEEN_HASHES: LazyLock<Mutex<std::collections::HashSet<u64>>> =
 /// on undocumented kernel behavior. Contention is a non-issue: each lock
 /// holds for the duration of a single `write(2)` of ~17 bytes.
 fn append_to_manifest(dir: &std::path::Path, hash: u64) {
-    // Per-process dedup — a pure optimization, independent of correctness.
+    // Per-process dedup — skip if we already wrote this hash in this rustc run.
     if let Ok(mut s) = SEEN_HASHES.lock() {
         if !s.insert(hash) {
             return;
@@ -75,22 +75,42 @@ fn append_to_manifest(dir: &std::path::Path, hash: u64) {
     }
 
     let manifest = dir.join(".manifest");
-    let line = format!("{hash:016x}\n");
+    let line = format!("{hash:016x}");
 
-    let Ok(mut file) = std::fs::OpenOptions::new()
+    // Lock the manifest, read existing hashes, add if missing, write back.
+    // Uses write-to-temp + rename for atomic replacement.
+    let file = match std::fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .read(true)
+        .write(true)
         .open(&manifest)
-    else {
-        return;
+    {
+        Ok(f) => f,
+        Err(_) => return,
     };
 
-    // Fully qualified path on both methods because Rust 1.89 promoted
-    // `lock`/`unlock` to inherent `File` methods (MSRV is 1.75 here). Calling
-    // `file.lock_exclusive()` would resolve via autoderef to the inherent
-    // method on newer toolchains and fail the MSRV lint.
     if fs2::FileExt::lock_exclusive(&file).is_ok() {
-        let _ = std::io::Write::write_all(&mut file, line.as_bytes());
+        let mut contents = String::new();
+        let _ = std::io::Read::read_to_string(&mut &file, &mut contents);
+
+        // Check if hash already present — skip rewrite if so.
+        if contents.lines().any(|l| l == line) {
+            let _ = fs2::FileExt::unlock(&file);
+            return;
+        }
+
+        // Collect unique hashes, add new one, write atomically.
+        let mut hashes: Vec<&str> = contents.lines().collect();
+        hashes.push(&line);
+        hashes.sort_unstable();
+        hashes.dedup();
+
+        let tmp = manifest.with_extension(".tmp");
+        let output = hashes.join("\n") + "\n";
+        if std::fs::write(&tmp, &output).is_ok() {
+            let _ = std::fs::rename(&tmp, &manifest);
+        }
+
         let _ = fs2::FileExt::unlock(&file);
     }
 }
