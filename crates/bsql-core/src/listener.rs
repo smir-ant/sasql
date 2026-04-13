@@ -359,9 +359,13 @@ macro_rules! listener_io_methods {
 }
 
 #[cfg(feature = "async")]
-impl Listener { listener_io_methods!(async); }
+impl Listener {
+    listener_io_methods!(async);
+}
 #[cfg(not(feature = "async"))]
-impl Listener { listener_io_methods!(); }
+impl Listener {
+    listener_io_methods!();
+}
 
 /// Quote a PostgreSQL identifier: wrap in double quotes, double any internal quotes.
 fn quote_ident(name: &str) -> BsqlResult<String> {

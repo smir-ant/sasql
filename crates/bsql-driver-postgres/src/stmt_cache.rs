@@ -60,9 +60,11 @@ impl StmtCache {
 
     #[inline]
     pub(crate) fn insert(&mut self, hash: u64, info: StmtInfo) {
-        if let Some(entry) = self.entries.iter_mut().find(|(h, existing)| {
-            *h == hash && existing.sql == info.sql
-        }) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|(h, existing)| *h == hash && existing.sql == info.sql)
+        {
             entry.1 = info;
         } else {
             self.entries.push((hash, info));

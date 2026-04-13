@@ -81,6 +81,7 @@ fn append_to_manifest(dir: &std::path::Path, hash: u64) {
     // Uses write-to-temp + rename for atomic replacement.
     let file = match std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&manifest)

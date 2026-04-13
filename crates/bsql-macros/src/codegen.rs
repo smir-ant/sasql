@@ -328,10 +328,16 @@ pub fn generate_sort_query_code(
         let column_check = gen_column_count_check(validation);
 
         let fetch_chunk_call = maybe_await(quote! { self.inner.fetch_next_chunk() });
-        let query_call_limited = maybe_await(quote! { target.query(::bsql_core::Sql::precomputed(sql, sql_hash, #readonly_val), #params_slice) });
-        let query_call = maybe_await(quote! { target.query(::bsql_core::Sql::precomputed(sql, sql_hash, #readonly_val), #params_slice) });
+        let query_call_limited = maybe_await(
+            quote! { target.query(::bsql_core::Sql::precomputed(sql, sql_hash, #readonly_val), #params_slice) },
+        );
+        let query_call = maybe_await(
+            quote! { target.query(::bsql_core::Sql::precomputed(sql, sql_hash, #readonly_val), #params_slice) },
+        );
         let stream_call = maybe_await(quote! { pool.query_stream(sql, sql_hash, #params_slice) });
-        let execute_call = maybe_await(quote! { target.execute(::bsql_core::Sql::precomputed(sql, sql_hash, false), #params_slice) });
+        let execute_call = maybe_await(
+            quote! { target.execute(::bsql_core::Sql::precomputed(sql, sql_hash, false), #params_slice) },
+        );
         let defer_call = maybe_await(quote! { tx.defer_execute(sql, sql_hash, #params_slice) });
 
         quote! {
@@ -442,7 +448,9 @@ pub fn generate_sort_query_code(
         }
     } else {
         // Execute-only (no result columns)
-        let execute_call = maybe_await(quote! { target.execute(::bsql_core::Sql::precomputed(sql, sql_hash, false), #params_slice) });
+        let execute_call = maybe_await(
+            quote! { target.execute(::bsql_core::Sql::precomputed(sql, sql_hash, false), #params_slice) },
+        );
         let defer_call = maybe_await(quote! { tx.defer_execute(sql, sql_hash, #params_slice) });
         quote! {
             #[allow(non_camel_case_types)]
@@ -578,7 +586,8 @@ fn gen_query_as_executor_impls(
     let query_limited_call = maybe_await(quote! { target.query(#limited_sql_ctor, #params_slice) });
     let query_call = maybe_await(quote! { target.query(#sql_ctor, #params_slice) });
     let execute_call = maybe_await(quote! { target.execute(#sql_ctor, #params_slice) });
-    let defer_call = maybe_await(quote! { tx.defer_execute(#sql_lit, #sql_hash_val, #params_slice) });
+    let defer_call =
+        maybe_await(quote! { tx.defer_execute(#sql_lit, #sql_hash_val, #params_slice) });
 
     let fetch_methods = if has_columns {
         quote! {
@@ -814,9 +823,11 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
     let async_kw = maybe_async_kw();
     let query_limited_call = maybe_await(quote! { target.query(#limited_sql_ctor, #params_slice) });
     let query_call = maybe_await(quote! { target.query(#sql_ctor, #params_slice) });
-    let stream_call = maybe_await(quote! { pool.query_stream(#sql_lit, #sql_hash_val, #params_slice) });
+    let stream_call =
+        maybe_await(quote! { pool.query_stream(#sql_lit, #sql_hash_val, #params_slice) });
     let execute_call = maybe_await(quote! { target.execute(#sql_ctor, #params_slice) });
-    let defer_call = maybe_await(quote! { tx.defer_execute(#sql_lit, #sql_hash_val, #params_slice) });
+    let defer_call =
+        maybe_await(quote! { tx.defer_execute(#sql_lit, #sql_hash_val, #params_slice) });
 
     let fetch_methods = if has_columns {
         let result_name = result_struct_name(parsed);
@@ -1069,7 +1080,9 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
 
         let owned_fetch_one_optional = {
             let fetch_one_dispatcher = gen_runtime_dispatcher(parsed, needs_limit, |_| {
-                let query_call = maybe_await(quote! { target.query(::bsql_core::Sql::precomputed(&_bsql_sql, _bsql_hash, #readonly_val), &_bsql_params[..]) });
+                let query_call = maybe_await(
+                    quote! { target.query(::bsql_core::Sql::precomputed(&_bsql_sql, _bsql_hash, #readonly_val), &_bsql_params[..]) },
+                );
                 quote! {
                     let mut target = executor.into(); let owned = #query_call?;
                     if owned.len() != 1 {
@@ -1085,7 +1098,9 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
             });
 
             let fetch_optional_dispatcher = gen_runtime_dispatcher(parsed, needs_limit, |_| {
-                let query_call = maybe_await(quote! { target.query(::bsql_core::Sql::precomputed(&_bsql_sql, _bsql_hash, #readonly_val), &_bsql_params[..]) });
+                let query_call = maybe_await(
+                    quote! { target.query(::bsql_core::Sql::precomputed(&_bsql_sql, _bsql_hash, #readonly_val), &_bsql_params[..]) },
+                );
                 quote! {
                     let mut target = executor.into(); let owned = #query_call?;
                     match owned.len() {
@@ -1121,7 +1136,9 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
         };
 
         let fetch_dispatcher = gen_runtime_dispatcher(parsed, false, |_| {
-            let query_call = maybe_await(quote! { target.query(::bsql_core::Sql::precomputed(&_bsql_sql, _bsql_hash, #readonly_val), &_bsql_params[..]) });
+            let query_call = maybe_await(
+                quote! { target.query(::bsql_core::Sql::precomputed(&_bsql_sql, _bsql_hash, #readonly_val), &_bsql_params[..]) },
+            );
             quote! {
                 let mut target = executor.into(); let owned = #query_call?;
                 owned.iter().map(|row| {
@@ -1132,7 +1149,9 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
         });
 
         let fetch_stream_dispatcher = gen_runtime_dispatcher(parsed, false, |_| {
-            let stream_call = maybe_await(quote! { pool.query_stream(&_bsql_sql, _bsql_hash, &_bsql_params[..]) });
+            let stream_call = maybe_await(
+                quote! { pool.query_stream(&_bsql_sql, _bsql_hash, &_bsql_params[..]) },
+            );
             quote! {
                 let inner = #stream_call?;
                 Ok(#stream_name { inner })
@@ -1170,7 +1189,9 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
     };
 
     let execute_dispatcher = gen_runtime_dispatcher(parsed, false, |_| {
-        let execute_call = maybe_await(quote! { target.execute(::bsql_core::Sql::precomputed(&_bsql_sql, _bsql_hash, false), &_bsql_params[..]) });
+        let execute_call = maybe_await(
+            quote! { target.execute(::bsql_core::Sql::precomputed(&_bsql_sql, _bsql_hash, false), &_bsql_params[..]) },
+        );
         quote! {
             let mut target = executor.into(); #execute_call
         }
@@ -1186,7 +1207,8 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
     };
 
     let defer_dispatcher = gen_runtime_dispatcher(parsed, false, |_| {
-        let defer_call = maybe_await(quote! { tx.defer_execute(&_bsql_sql, _bsql_hash, &_bsql_params[..]) });
+        let defer_call =
+            maybe_await(quote! { tx.defer_execute(&_bsql_sql, _bsql_hash, &_bsql_params[..]) });
         quote! {
             #defer_call
         }
@@ -1657,8 +1679,10 @@ fn gen_pg_for_each_row_struct(parsed: &ParsedQuery, validation: &ValidationResul
     // Check if any column actually uses the 'a lifetime.
     let needs_lifetime = validation.columns.iter().any(|col| {
         let rt = &col.rust_type;
-        matches!(rt.as_str(), "String" | "Vec<u8>" | "Vec<String>" | "Vec<Vec<u8>>")
-            || rt.starts_with("Option<String>")
+        matches!(
+            rt.as_str(),
+            "String" | "Vec<u8>" | "Vec<String>" | "Vec<Vec<u8>>"
+        ) || rt.starts_with("Option<String>")
             || rt.starts_with("Option<Vec<u8>>")
     });
 
@@ -1756,7 +1780,11 @@ fn gen_pg_for_each_raw_decode(validation: &ValidationResult) -> (TokenStream, To
         for (i, (data_offset, _ws)) in fixed_offsets.iter().enumerate() {
             let field_name = format_ident!("{}", deduped_names[i]);
             let col = &validation.columns[i];
-            decode_stmts.push(gen_pg_raw_fixed_decode(&field_name, &col.rust_type, *data_offset));
+            decode_stmts.push(gen_pg_raw_fixed_decode(
+                &field_name,
+                &col.rust_type,
+                *data_offset,
+            ));
         }
     }
 
@@ -1768,7 +1796,10 @@ fn gen_pg_for_each_raw_decode(validation: &ValidationResult) -> (TokenStream, To
             let mut _bsql_pos: usize = #init_pos;
         });
 
-        for (name, col) in deduped_names[remaining_start..].iter().zip(&validation.columns[remaining_start..]) {
+        for (name, col) in deduped_names[remaining_start..]
+            .iter()
+            .zip(&validation.columns[remaining_start..])
+        {
             let field_name = format_ident!("{}", name);
             decode_stmts.push(gen_pg_raw_column_decode(&field_name, &col.rust_type));
         }
@@ -1786,8 +1817,10 @@ fn gen_pg_for_each_raw_decode(validation: &ValidationResult) -> (TokenStream, To
 
     let needs_lifetime = validation.columns.iter().any(|col| {
         let rt = &col.rust_type;
-        matches!(rt.as_str(), "String" | "Vec<u8>" | "Vec<String>" | "Vec<Vec<u8>>")
-            || rt.starts_with("Option<String>")
+        matches!(
+            rt.as_str(),
+            "String" | "Vec<u8>" | "Vec<String>" | "Vec<Vec<u8>>"
+        ) || rt.starts_with("Option<String>")
             || rt.starts_with("Option<Vec<u8>>")
     });
 

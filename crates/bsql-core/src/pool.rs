@@ -235,7 +235,6 @@ impl PoolBuilder {
         self.max_stmt_cache_size = Some(size);
         self
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -295,9 +294,13 @@ macro_rules! builder_io_methods {
 }
 
 #[cfg(feature = "async")]
-impl PoolBuilder { builder_io_methods!(async); }
+impl PoolBuilder {
+    builder_io_methods!(async);
+}
 #[cfg(not(feature = "async"))]
-impl PoolBuilder { builder_io_methods!(); }
+impl PoolBuilder {
+    builder_io_methods!();
+}
 
 // ---------------------------------------------------------------------------
 // PgPool methods
@@ -699,9 +702,13 @@ macro_rules! pool_io_methods {
 }
 
 #[cfg(feature = "async")]
-impl PgPool { pool_io_methods!(async); }
+impl PgPool {
+    pool_io_methods!(async);
+}
 #[cfg(not(feature = "async"))]
-impl PgPool { pool_io_methods!(); }
+impl PgPool {
+    pool_io_methods!();
+}
 
 impl Clone for PgPool {
     fn clone(&self) -> Self {

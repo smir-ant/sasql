@@ -79,8 +79,7 @@ struct MacroConnection {
 }
 
 /// The global shared PG connection. Initialized on first access.
-static MACRO_CONN: LazyLock<Result<MacroConnection, String>> =
-    LazyLock::new(init_macro_conn);
+static MACRO_CONN: LazyLock<Result<MacroConnection, String>> = LazyLock::new(init_macro_conn);
 
 fn init_macro_conn() -> Result<MacroConnection, String> {
     let database_url = std::env::var("BSQL_DATABASE_URL")

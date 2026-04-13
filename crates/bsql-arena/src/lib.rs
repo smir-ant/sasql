@@ -1614,7 +1614,10 @@ mod tests {
         let mut arena = Arena::empty();
         let offset = arena.alloc_copy(b"hello");
         assert_eq!(arena.get(offset, 5), b"hello");
-        assert!(!arena.chunks.is_empty(), "alloc on empty arena must create a chunk");
+        assert!(
+            !arena.chunks.is_empty(),
+            "alloc on empty arena must create a chunk"
+        );
     }
 
     #[test]

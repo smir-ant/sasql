@@ -3600,7 +3600,10 @@ mod tests {
     fn decode_array_str_borrowed_all_nulls() {
         let wire = build_text_array_wire(&[None, None]);
         let result = decode_array_str_borrowed(&wire).unwrap();
-        assert!(result.is_empty(), "all-NULL array should decode to empty vec");
+        assert!(
+            result.is_empty(),
+            "all-NULL array should decode to empty vec"
+        );
     }
 
     #[test]
@@ -3666,7 +3669,10 @@ mod tests {
     fn decode_array_bytea_borrowed_all_nulls() {
         let wire = build_bytea_array_wire(&[None, None, None]);
         let result = decode_array_bytea_borrowed(&wire).unwrap();
-        assert!(result.is_empty(), "all-NULL bytea array should decode to empty vec");
+        assert!(
+            result.is_empty(),
+            "all-NULL bytea array should decode to empty vec"
+        );
     }
 
     #[test]

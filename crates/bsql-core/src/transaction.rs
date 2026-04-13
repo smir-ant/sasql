@@ -313,9 +313,13 @@ macro_rules! tx_io_methods {
 }
 
 #[cfg(feature = "async")]
-impl Transaction { tx_io_methods!(async); }
+impl Transaction {
+    tx_io_methods!(async);
+}
 #[cfg(not(feature = "async"))]
-impl Transaction { tx_io_methods!(); }
+impl Transaction {
+    tx_io_methods!();
+}
 
 impl fmt::Debug for Transaction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
