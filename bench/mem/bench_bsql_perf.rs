@@ -53,17 +53,16 @@ async fn main() -> Result<(), BsqlError> {
         let _ = bsql::query!(
             "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $limit: i64"
         )
-        .fetch(&pool).await?;
+        .fetch_all(&pool).await?;
 
         let start = Instant::now();
         for _ in 0..iters {
             let rows = bsql::query!(
                 "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $limit: i64"
             )
-            .fetch(&pool).await?;
+            .fetch_all(&pool).await?;
             // Read all columns to match C's PQgetvalue loop (prevent dead-code elimination)
-            for row in rows.iter() {
-                let r = row.unwrap();
+            for r in rows.iter() {
                 std::hint::black_box((&r.id, &r.name, &r.email, &r.active, &r.score));
             }
         }
@@ -132,7 +131,7 @@ async fn main() -> Result<(), BsqlError> {
              FROM bench_users u JOIN bench_orders o ON u.id = o.user_id \
              WHERE u.active = true GROUP BY u.name ORDER BY total_amount DESC LIMIT 10"
         )
-        .fetch(&pool).await?;
+        .fetch_all(&pool).await?;
 
         let start = Instant::now();
         for _ in 0..ITERATIONS_JOIN {
@@ -141,7 +140,7 @@ async fn main() -> Result<(), BsqlError> {
                  FROM bench_users u JOIN bench_orders o ON u.id = o.user_id \
                  WHERE u.active = true GROUP BY u.name ORDER BY total_amount DESC LIMIT 10"
             )
-            .fetch(&pool).await?;
+            .fetch_all(&pool).await?;
         }
         let elapsed = start.elapsed();
         println!(
@@ -184,13 +183,13 @@ async fn main() -> Result<(), BsqlError> {
         let active = true;
         let _ = bsql::query!(
             "SELECT id, name, email FROM bench_users WHERE active = $active: bool ORDER BY id LIMIT 100"
-        ).fetch(&pool).await?;
+        ).fetch_all(&pool).await?;
 
         let start = Instant::now();
         for _ in 0..ITERATIONS {
             let _ = bsql::query!(
                 "SELECT id, name, email FROM bench_users WHERE active = $active: bool ORDER BY id LIMIT 100"
-            ).fetch(&pool).await?;
+            ).fetch_all(&pool).await?;
         }
         let static_elapsed = start.elapsed();
 
@@ -207,7 +206,7 @@ async fn main() -> Result<(), BsqlError> {
              [AND active = $active_filter: Option<bool>] \
              [AND email LIKE $email_filter: Option<&str>] \
              ORDER BY id LIMIT 100"
-        ).fetch(&pool).await?;
+        ).fetch_all(&pool).await?;
 
         let start = Instant::now();
         for _ in 0..ITERATIONS {
@@ -218,7 +217,7 @@ async fn main() -> Result<(), BsqlError> {
                  [AND active = $active_filter: Option<bool>] \
                  [AND email LIKE $email_filter: Option<&str>] \
                  ORDER BY id LIMIT 100"
-            ).fetch(&pool).await?;
+            ).fetch_all(&pool).await?;
         }
         let dynamic_elapsed = start.elapsed();
 
@@ -268,7 +267,7 @@ async fn main() -> Result<(), BsqlError> {
             let rows = bsql::query!(
                 "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $limit: i64"
             )
-            .fetch(&pool).await?;
+            .fetch_all(&pool).await?;
             std::hint::black_box(&rows);
         }
         let fetch_elapsed = start.elapsed();

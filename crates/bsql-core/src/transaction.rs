@@ -98,6 +98,10 @@ impl Transaction {
         })
     }
 
+    // NOTE: Transaction methods are `pub async fn` without internal `.await`
+    // for the same reason as PgPool — see comment in pool.rs. Generated code
+    // calls these via `__bsql_call!()` which adds `.await` in async mode.
+
     /// Commit the transaction and return the connection to the pool.
     ///
     /// Consumes `self` — the transaction cannot be used after commit.

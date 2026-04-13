@@ -338,9 +338,9 @@ pub fn generate_sort_query_code(
             #[allow(non_camel_case_types)]
             impl<'_bsql> #executor_name<'_bsql> {
                 ::bsql_core::__bsql_fn! {
-                    pub fn fetch_one(
+                    pub fn fetch_one<'e>(
                         self,
-                        executor: impl Into<::bsql_core::QueryTarget<'_>>,
+                        executor: impl Into<::bsql_core::QueryTarget<'e>>,
                     ) -> ::bsql_core::BsqlResult<#result_name> {
                         #build_limited_sql
                         let mut target = executor.into(); let owned = ::bsql_core::__bsql_call!(target.query(::bsql_core::Sql::precomputed(sql, sql_hash, #readonly_val), #params_slice))?;
@@ -357,9 +357,9 @@ pub fn generate_sort_query_code(
                 }
 
                 ::bsql_core::__bsql_fn! {
-                    pub fn fetch_optional(
+                    pub fn fetch_optional<'e>(
                         self,
-                        executor: impl Into<::bsql_core::QueryTarget<'_>>,
+                        executor: impl Into<::bsql_core::QueryTarget<'e>>,
                     ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
                         #build_limited_sql
                         let mut target = executor.into(); let owned = ::bsql_core::__bsql_call!(target.query(::bsql_core::Sql::precomputed(sql, sql_hash, #readonly_val), #params_slice))?;
@@ -379,9 +379,9 @@ pub fn generate_sort_query_code(
                 }
 
                 ::bsql_core::__bsql_fn! {
-                    pub fn fetch_all(
+                    pub fn fetch_all<'e>(
                         self,
-                        executor: impl Into<::bsql_core::QueryTarget<'_>>,
+                        executor: impl Into<::bsql_core::QueryTarget<'e>>,
                     ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
                         #build_sql
                         let mut target = executor.into(); let owned = ::bsql_core::__bsql_call!(target.query(::bsql_core::Sql::precomputed(sql, sql_hash, #readonly_val), #params_slice))?;
@@ -404,9 +404,9 @@ pub fn generate_sort_query_code(
                 }
 
                 ::bsql_core::__bsql_fn! {
-                    pub fn execute(
+                    pub fn execute<'e>(
                         self,
-                        executor: impl Into<::bsql_core::QueryTarget<'_>>,
+                        executor: impl Into<::bsql_core::QueryTarget<'e>>,
                     ) -> ::bsql_core::BsqlResult<u64> {
                         #build_sql
                         let mut target = executor.into(); ::bsql_core::__bsql_call!(target.execute(::bsql_core::Sql::precomputed(sql, sql_hash, false), #params_slice))
@@ -429,9 +429,9 @@ pub fn generate_sort_query_code(
             #[allow(non_camel_case_types)]
             impl<'_bsql> #executor_name<'_bsql> {
                 ::bsql_core::__bsql_fn! {
-                    pub fn execute(
+                    pub fn execute<'e>(
                         self,
-                        executor: impl Into<::bsql_core::QueryTarget<'_>>,
+                        executor: impl Into<::bsql_core::QueryTarget<'e>>,
                     ) -> ::bsql_core::BsqlResult<u64> {
                         #build_sql
                         let mut target = executor.into(); ::bsql_core::__bsql_call!(target.execute(::bsql_core::Sql::precomputed(sql, sql_hash, false), #params_slice))
@@ -562,9 +562,9 @@ fn gen_query_as_executor_impls(
     let fetch_methods = if has_columns {
         quote! {
             ::bsql_core::__bsql_fn! {
-                pub fn fetch_one(
+                pub fn fetch_one<'e>(
                     self,
-                    executor: impl Into<::bsql_core::QueryTarget<'_>>,
+                    executor: impl Into<::bsql_core::QueryTarget<'e>>,
                 ) -> ::bsql_core::BsqlResult<#target_type> {
                     let mut target = executor.into();
                     let owned = ::bsql_core::__bsql_call!(target.query(#limited_sql_ctor, #params_slice))?;
@@ -582,9 +582,9 @@ fn gen_query_as_executor_impls(
             }
 
             ::bsql_core::__bsql_fn! {
-                pub fn fetch_all(
+                pub fn fetch_all<'e>(
                     self,
-                    executor: impl Into<::bsql_core::QueryTarget<'_>>,
+                    executor: impl Into<::bsql_core::QueryTarget<'e>>,
                 ) -> ::bsql_core::BsqlResult<Vec<#target_type>> {
                     let mut target = executor.into();
                     let owned = ::bsql_core::__bsql_call!(target.query(#sql_ctor, #params_slice))?;
@@ -597,9 +597,9 @@ fn gen_query_as_executor_impls(
             }
 
             ::bsql_core::__bsql_fn! {
-                pub fn fetch_optional(
+                pub fn fetch_optional<'e>(
                     self,
-                    executor: impl Into<::bsql_core::QueryTarget<'_>>,
+                    executor: impl Into<::bsql_core::QueryTarget<'e>>,
                 ) -> ::bsql_core::BsqlResult<Option<#target_type>> {
                     let mut target = executor.into();
                     let owned = ::bsql_core::__bsql_call!(target.query(#limited_sql_ctor, #params_slice))?;
@@ -625,9 +625,9 @@ fn gen_query_as_executor_impls(
 
     let execute_method = quote! {
         ::bsql_core::__bsql_fn! {
-            pub fn execute(
+            pub fn execute<'e>(
                 self,
-                executor: impl Into<::bsql_core::QueryTarget<'_>>,
+                executor: impl Into<::bsql_core::QueryTarget<'e>>,
             ) -> ::bsql_core::BsqlResult<u64> {
                 let mut target = executor.into();
                 ::bsql_core::__bsql_call!(target.execute(#sql_ctor, #params_slice))
@@ -806,9 +806,9 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
 
         quote! {
             ::bsql_core::__bsql_fn! {
-                pub fn fetch_one(
+                pub fn fetch_one<'e>(
                     self,
-                    executor: impl Into<::bsql_core::QueryTarget<'_>>,
+                    executor: impl Into<::bsql_core::QueryTarget<'e>>,
                 ) -> ::bsql_core::BsqlResult<#result_name> {
                     let mut target = executor.into();
                     let owned = ::bsql_core::__bsql_call!(target.query(#limited_sql_ctor, #params_slice))?;
@@ -825,9 +825,9 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
             }
 
             ::bsql_core::__bsql_fn! {
-                pub fn fetch_optional(
+                pub fn fetch_optional<'e>(
                     self,
-                    executor: impl Into<::bsql_core::QueryTarget<'_>>,
+                    executor: impl Into<::bsql_core::QueryTarget<'e>>,
                 ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
                     let mut target = executor.into();
                     let owned = ::bsql_core::__bsql_call!(target.query(#limited_sql_ctor, #params_slice))?;
@@ -847,9 +847,9 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
             }
 
             ::bsql_core::__bsql_fn! {
-                pub fn fetch_all(
+                pub fn fetch_all<'e>(
                     self,
-                    executor: impl Into<::bsql_core::QueryTarget<'_>>,
+                    executor: impl Into<::bsql_core::QueryTarget<'e>>,
                 ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
                     let mut target = executor.into();
                     let owned = ::bsql_core::__bsql_call!(target.query(#sql_ctor, #params_slice))?;
@@ -885,9 +885,9 @@ fn gen_executor_impls(parsed: &ParsedQuery, validation: &ValidationResult) -> To
 
     let execute_method = quote! {
         ::bsql_core::__bsql_fn! {
-            pub fn execute(
+            pub fn execute<'e>(
                 self,
-                executor: impl Into<::bsql_core::QueryTarget<'_>>,
+                executor: impl Into<::bsql_core::QueryTarget<'e>>,
             ) -> ::bsql_core::BsqlResult<u64> {
                 let mut target = executor.into();
                 ::bsql_core::__bsql_call!(target.execute(#sql_ctor, #params_slice))
@@ -1095,18 +1095,18 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
 
             quote! {
                 ::bsql_core::__bsql_fn! {
-                    pub fn fetch_one(
+                    pub fn fetch_one<'e>(
                         self,
-                        executor: impl Into<::bsql_core::QueryTarget<'_>>,
+                        executor: impl Into<::bsql_core::QueryTarget<'e>>,
                     ) -> ::bsql_core::BsqlResult<#result_name> {
                         #fetch_one_dispatcher
                     }
                 }
 
                 ::bsql_core::__bsql_fn! {
-                    pub fn fetch_optional(
+                    pub fn fetch_optional<'e>(
                         self,
-                        executor: impl Into<::bsql_core::QueryTarget<'_>>,
+                        executor: impl Into<::bsql_core::QueryTarget<'e>>,
                     ) -> ::bsql_core::BsqlResult<Option<#result_name>> {
                         #fetch_optional_dispatcher
                     }
@@ -1135,9 +1135,9 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
             #owned_fetch_one_optional
 
             ::bsql_core::__bsql_fn! {
-                pub fn fetch_all(
+                pub fn fetch_all<'e>(
                     self,
-                    executor: impl Into<::bsql_core::QueryTarget<'_>>,
+                    executor: impl Into<::bsql_core::QueryTarget<'e>>,
                 ) -> ::bsql_core::BsqlResult<Vec<#result_name>> {
                     #fetch_dispatcher
                 }
@@ -1173,9 +1173,9 @@ fn gen_dynamic_executor_impls(parsed: &ParsedQuery, validation: &ValidationResul
 
     let execute_method = quote! {
         ::bsql_core::__bsql_fn! {
-            pub fn execute(
+            pub fn execute<'e>(
                 self,
-                executor: impl Into<::bsql_core::QueryTarget<'_>>,
+                executor: impl Into<::bsql_core::QueryTarget<'e>>,
             ) -> ::bsql_core::BsqlResult<u64> {
                 #execute_dispatcher
             }

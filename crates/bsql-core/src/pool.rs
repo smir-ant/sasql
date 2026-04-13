@@ -285,6 +285,25 @@ impl PoolBuilder {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PgPool methods
+//
+// These methods are `pub async fn` even though they contain no `.await`
+// internally. This is intentional: the `query!()` macro generates code
+// that calls these methods via `__bsql_call!(pool.method())`, which
+// expands to `pool.method().await` when the `async` feature is enabled.
+// Without the `async` keyword, `.await` on a plain `Result` would be
+// a compile error.
+//
+// An `async fn` with no yield points compiles to a single-state state
+// machine that the optimizer inlines completely — zero runtime overhead.
+//
+// The only place where async genuinely differs from sync is in
+// `executor.rs` (QueryTarget::query / QueryTarget::execute), which
+// calls `acquire_async().await` + `query_async_with_parse().await`
+// in async mode vs their sync counterparts in sync mode.
+// ---------------------------------------------------------------------------
+
 impl PgPool {
     /// Connect to PostgreSQL using a connection URL.
     ///

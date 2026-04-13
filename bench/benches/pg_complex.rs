@@ -16,7 +16,7 @@ fn bench_pg_join_aggregate(c: &mut Criterion) {
     // sqlx is still async — it needs a runtime for its pool
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    let bsql_pool = bsql::Pool::connect(&url).unwrap();
+    let bsql_pool = rt.block_on(bsql::Pool::connect(&url)).unwrap();
     let sqlx_pool = rt.block_on(async { sqlx::PgPool::connect(&url).await.unwrap() });
 
     use diesel::prelude::*;
@@ -33,17 +33,20 @@ fn bench_pg_join_aggregate(c: &mut Criterion) {
 
     // Warm up
     {
-        let _rows = bsql::query!(
-            "SELECT u.name, COUNT(o.id) AS order_count, SUM(o.amount) AS total_amount
-             FROM bench_users u
-             JOIN bench_orders o ON u.id = o.user_id
-             WHERE u.active = true
-             GROUP BY u.name
-             ORDER BY SUM(o.amount) DESC
-             LIMIT 100"
-        )
-        .fetch_all(&bsql_pool)
-        .unwrap();
+        let _rows = rt
+            .block_on(
+                bsql::query!(
+                    "SELECT u.name, COUNT(o.id) AS order_count, SUM(o.amount) AS total_amount
+                     FROM bench_users u
+                     JOIN bench_orders o ON u.id = o.user_id
+                     WHERE u.active = true
+                     GROUP BY u.name
+                     ORDER BY SUM(o.amount) DESC
+                     LIMIT 100"
+                )
+                .fetch_all(&bsql_pool),
+            )
+            .unwrap();
     }
 
     let mut group = c.benchmark_group("pg_join_aggregate");
@@ -51,16 +54,18 @@ fn bench_pg_join_aggregate(c: &mut Criterion) {
     // -- bsql (for_each — zero allocation, sync) --
     group.bench_function("bsql", |b| {
         b.iter(|| {
-            bsql::query!(
-                "SELECT u.name, COUNT(o.id) AS order_count, SUM(o.amount) AS total_amount
-                 FROM bench_users u
-                 JOIN bench_orders o ON u.id = o.user_id
-                 WHERE u.active = true
-                 GROUP BY u.name
-                 ORDER BY SUM(o.amount) DESC
-                 LIMIT 100"
+            rt.block_on(
+                bsql::query!(
+                    "SELECT u.name, COUNT(o.id) AS order_count, SUM(o.amount) AS total_amount
+                     FROM bench_users u
+                     JOIN bench_orders o ON u.id = o.user_id
+                     WHERE u.active = true
+                     GROUP BY u.name
+                     ORDER BY SUM(o.amount) DESC
+                     LIMIT 100"
+                )
+                .for_each(&bsql_pool, |_row| Ok(())),
             )
-            .for_each(&bsql_pool, |_row| Ok(()))
             .unwrap();
         });
     });
@@ -130,7 +135,7 @@ fn bench_pg_subquery(c: &mut Criterion) {
     // sqlx is still async — it needs a runtime for its pool
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    let bsql_pool = bsql::Pool::connect(&url).unwrap();
+    let bsql_pool = rt.block_on(bsql::Pool::connect(&url)).unwrap();
     let sqlx_pool = rt.block_on(async { sqlx::PgPool::connect(&url).await.unwrap() });
 
     use diesel::prelude::*;
@@ -146,11 +151,13 @@ fn bench_pg_subquery(c: &mut Criterion) {
     // -- bsql (for_each — zero allocation, sync) --
     group.bench_function("bsql", |b| {
         b.iter(|| {
-            bsql::query!(
-                "SELECT id, name, email FROM bench_users
-                 WHERE id IN (SELECT user_id FROM bench_orders WHERE amount > 500 LIMIT 100)"
+            rt.block_on(
+                bsql::query!(
+                    "SELECT id, name, email FROM bench_users
+                     WHERE id IN (SELECT user_id FROM bench_orders WHERE amount > 500 LIMIT 100)"
+                )
+                .for_each(&bsql_pool, |_row| Ok(())),
             )
-            .for_each(&bsql_pool, |_row| Ok(()))
             .unwrap();
         });
     });

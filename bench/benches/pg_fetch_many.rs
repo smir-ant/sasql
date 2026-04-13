@@ -18,8 +18,8 @@ fn bench_pg_fetch_many(c: &mut Criterion) {
     // sqlx is still async — it needs a runtime for its pool
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    // -- bsql pool (sync) --
-    let bsql_pool = bsql::Pool::connect(&url).unwrap();
+    // -- bsql pool --
+    let bsql_pool = rt.block_on(bsql::Pool::connect(&url)).unwrap();
 
     // -- bsql direct connection (no pool, same as C/Go) --
     let sql_direct = "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $1";
@@ -51,11 +51,14 @@ fn bench_pg_fetch_many(c: &mut Criterion) {
     // Warm up: run a small query on each backend
     {
         let n = 10i64;
-        let _rows = bsql::query!(
-            "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $n: i64"
-        )
-        .fetch_all(&bsql_pool)
-        .unwrap();
+        let _rows = rt
+            .block_on(
+                bsql::query!(
+                    "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $n: i64"
+                )
+                .fetch_all(&bsql_pool),
+            )
+            .unwrap();
     }
     {
         let n_param: i64 = 10;
@@ -83,10 +86,12 @@ fn bench_pg_fetch_many(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("bsql", n), &n, |b, &n| {
             b.iter(|| {
                 let n = n;
-                bsql::query!(
-                    "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $n: i64"
+                rt.block_on(
+                    bsql::query!(
+                        "SELECT id, name, email, active, score FROM bench_users ORDER BY id LIMIT $n: i64"
+                    )
+                    .for_each(&bsql_pool, |_row| Ok(())),
                 )
-                .for_each(&bsql_pool, |_row| Ok(()))
                 .unwrap();
             });
         });

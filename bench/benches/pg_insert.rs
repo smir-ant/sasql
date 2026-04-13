@@ -18,7 +18,7 @@ fn bench_pg_insert_single(c: &mut Criterion) {
     // sqlx is still async — it needs a runtime for its pool
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    let bsql_pool = bsql::Pool::connect(&url).unwrap();
+    let bsql_pool = rt.block_on(bsql::Pool::connect(&url)).unwrap();
     let sqlx_pool = rt.block_on(async { sqlx::PgPool::connect(&url).await.unwrap() });
 
     use diesel::prelude::*;
@@ -27,9 +27,11 @@ fn bench_pg_insert_single(c: &mut Criterion) {
     // Clean up INSERT accumulation and force WAL checkpoint.
     // Without this, previous bench runs leave rows that slow down autovacuum
     // (even if disabled) and bloat table pages, degrading INSERT throughput.
-    bsql_pool
-        .raw_execute("DELETE FROM bench_users WHERE name = 'bench_insert'; CHECKPOINT")
-        .ok();
+    rt.block_on(
+        bsql_pool
+            .raw_execute("DELETE FROM bench_users WHERE name = 'bench_insert'; CHECKPOINT"),
+    )
+    .ok();
 
     let mut group = c.benchmark_group("pg_insert_single");
 
@@ -38,11 +40,14 @@ fn bench_pg_insert_single(c: &mut Criterion) {
         b.iter(|| {
             let name = "bench_insert";
             let email = "bench@example.com";
-            let _row = bsql::query!(
-                "INSERT INTO bench_users (name, email, active, score) VALUES ($name: &str, $email: &str, true, 0.0) RETURNING id"
-            )
-            .fetch_one(&bsql_pool)
-            .unwrap();
+            let _row = rt
+                .block_on(
+                    bsql::query!(
+                        "INSERT INTO bench_users (name, email, active, score) VALUES ($name: &str, $email: &str, true, 0.0) RETURNING id"
+                    )
+                    .fetch_one(&bsql_pool),
+                )
+                .unwrap();
         });
     });
 
@@ -111,7 +116,7 @@ fn bench_pg_insert_batch(c: &mut Criterion) {
     // sqlx is still async — it needs a runtime for its pool
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    let bsql_pool = bsql::Pool::connect(&url).unwrap();
+    let bsql_pool = rt.block_on(bsql::Pool::connect(&url)).unwrap();
     let sqlx_pool = rt.block_on(async { sqlx::PgPool::connect(&url).await.unwrap() });
 
     use diesel::prelude::*;
@@ -122,17 +127,19 @@ fn bench_pg_insert_batch(c: &mut Criterion) {
     // -- bsql: 100 INSERTs in a transaction (sync) --
     group.bench_function("bsql", |b| {
         b.iter(|| {
-            let mut tx = bsql_pool.begin().unwrap();
+            let mut tx = rt.block_on(bsql_pool.begin()).unwrap();
             for i in 0..100i32 {
                 let name = format!("batch_{i}");
                 let email = format!("batch_{i}@example.com");
-                bsql::query!(
-                    "INSERT INTO bench_users (name, email, active, score) VALUES ($name: String, $email: String, true, 0.0)"
+                rt.block_on(
+                    bsql::query!(
+                        "INSERT INTO bench_users (name, email, active, score) VALUES ($name: String, $email: String, true, 0.0)"
+                    )
+                    .execute(&mut tx),
                 )
-                .execute(&mut tx)
                 .unwrap();
             }
-            tx.commit().unwrap();
+            rt.block_on(tx.commit()).unwrap();
         });
     });
 

@@ -18,8 +18,8 @@ fn bench_pg_fetch_one(c: &mut Criterion) {
     // sqlx is still async — it needs a runtime for its pool
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    // -- bsql pool (sync) --
-    let bsql_pool = bsql::Pool::connect(&url).unwrap();
+    // -- bsql pool --
+    let bsql_pool = rt.block_on(bsql::Pool::connect(&url)).unwrap();
 
     // -- sqlx pool (async) --
     let sqlx_pool = rt.block_on(async { sqlx::PgPool::connect(&url).await.unwrap() });
@@ -31,8 +31,11 @@ fn bench_pg_fetch_one(c: &mut Criterion) {
     // Warm up: run the query once on each backend
     {
         let id = 42i32;
-        let _row = bsql::query!("SELECT id, name, email FROM bench_users WHERE id = $id: i32")
-            .fetch_one(&bsql_pool)
+        let _row = rt
+            .block_on(
+                bsql::query!("SELECT id, name, email FROM bench_users WHERE id = $id: i32")
+                    .fetch_one(&bsql_pool),
+            )
             .unwrap();
     }
     rt.block_on(async {
@@ -69,8 +72,11 @@ fn bench_pg_fetch_one(c: &mut Criterion) {
     group.bench_function("bsql", |b| {
         b.iter(|| {
             let id = 42i32;
-            let _user = bsql::query!("SELECT id, name, email FROM bench_users WHERE id = $id: i32")
-                .fetch_one(&bsql_pool)
+            let _user = rt
+                .block_on(
+                    bsql::query!("SELECT id, name, email FROM bench_users WHERE id = $id: i32")
+                        .fetch_one(&bsql_pool),
+                )
                 .unwrap();
         });
     });
