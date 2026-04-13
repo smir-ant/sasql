@@ -142,167 +142,6 @@ impl std::fmt::Debug for Listener {
 }
 
 impl Listener {
-    /// Connect to PostgreSQL and start the background notification reader.
-    ///
-    /// Opens a dedicated connection (not from any pool).
-    pub async fn connect(url: &str) -> BsqlResult<Self> {
-        let config = bsql_driver_postgres::Config::from_url(url)
-            .map_err(|e| ConnectError::create(format!("listener connect failed: {e}")))?;
-
-        // Disable statement_timeout on the listener connection -- it only runs
-        // LISTEN/UNLISTEN/NOTIFY, and the notification wait is unbounded by design.
-        let mut listener_config = config;
-        listener_config.statement_timeout_secs = 0;
-
-        let conn = bsql_driver_postgres::Connection::connect(&listener_config)
-            .map_err(|e| ConnectError::create(format!("listener connect failed: {e}")))?;
-
-        let (notif_tx, rx) = mpsc::sync_channel(NOTIFICATION_BUFFER_SIZE);
-        let (cmd_tx, cmd_rx) = mpsc::channel();
-        let channels: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-
-        let config_for_notify = listener_config.clone();
-
-        let thread_channels = Arc::clone(&channels);
-        let thread_config = listener_config;
-        let handle = thread::spawn(move || {
-            drive_listener(conn, thread_config, cmd_rx, notif_tx, thread_channels);
-        });
-
-        Ok(Listener {
-            cmd_tx,
-            rx,
-            _thread_handle: Some(handle),
-            channels,
-            config: config_for_notify,
-            notify_conn: Mutex::new(None),
-        })
-    }
-
-    /// Subscribe to a named notification channel.
-    ///
-    /// The channel name is properly quoted as a PostgreSQL identifier to
-    /// prevent SQL injection.
-    pub async fn listen(&self, channel: &str) -> BsqlResult<()> {
-        if channel.is_empty() {
-            return Err(ConnectError::create(
-                "LISTEN channel name must not be empty",
-            ));
-        }
-        let quoted = quote_ident(channel)?;
-        let sql = format!("LISTEN {quoted}");
-        self.send_command_listen(channel.to_owned(), sql)
-    }
-
-    /// Unsubscribe from a named notification channel.
-    pub async fn unlisten(&self, channel: &str) -> BsqlResult<()> {
-        if channel.is_empty() {
-            return Err(ConnectError::create(
-                "UNLISTEN channel name must not be empty",
-            ));
-        }
-        let quoted = quote_ident(channel)?;
-        let sql = format!("UNLISTEN {quoted}");
-        self.send_command_unlisten(channel.to_owned(), sql)
-    }
-
-    /// Unsubscribe from all channels.
-    pub async fn unlisten_all(&self) -> BsqlResult<()> {
-        // Clear the tracked set
-        self.channels
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-
-        let (resp_tx, resp_rx) = mpsc::sync_channel(1);
-        self.cmd_tx
-            .send(Command::UnlistenAll(resp_tx))
-            .map_err(|_| ConnectError::create("listener background thread exited"))?;
-        resp_rx
-            .recv()
-            .map_err(|_| ConnectError::create("listener background thread exited"))?
-            .map_err(BsqlError::from)
-    }
-
-    /// Receive the next notification.
-    ///
-    /// Blocks until a notification arrives, or returns an error if the
-    /// connection has been closed.
-    pub async fn recv(&mut self) -> BsqlResult<Notification> {
-        self.rx
-            .recv()
-            .map_err(|_| ConnectError::create("listener connection closed"))
-    }
-
-    /// Non-blocking receive. Returns `Ok(None)` if no notification is
-    /// available right now (as opposed to `recv()` which blocks).
-    ///
-    /// Returns `Err` only if the listener connection has been closed.
-    pub async fn try_recv(&mut self) -> BsqlResult<Option<Notification>> {
-        match self.rx.try_recv() {
-            Ok(notif) => Ok(Some(notif)),
-            Err(mpsc::TryRecvError::Empty) => Ok(None),
-            Err(mpsc::TryRecvError::Disconnected) => {
-                Err(ConnectError::create("listener connection closed"))
-            }
-        }
-    }
-
-    /// Send a NOTIFY on a channel with a payload.
-    ///
-    /// The payload must not exceed 7999 bytes (PostgreSQL's limit).
-    pub async fn notify(&self, channel: &str, payload: &str) -> BsqlResult<()> {
-        if channel.is_empty() {
-            return Err(ConnectError::create(
-                "NOTIFY channel name must not be empty",
-            ));
-        }
-        if payload.contains('\0') {
-            return Err(ConnectError::create(
-                "NOTIFY payload must not contain null bytes",
-            ));
-        }
-        if payload.len() > PG_MAX_PAYLOAD_SIZE {
-            return Err(ConnectError::create(format!(
-                "NOTIFY payload exceeds PostgreSQL's {PG_MAX_PAYLOAD_SIZE}-byte limit \
-                 (got {} bytes)",
-                payload.len()
-            )));
-        }
-        let quoted_channel = quote_ident(channel)?;
-        let escaped_payload = payload.replace('\'', "''");
-        let sql = format!("NOTIFY {quoted_channel}, '{escaped_payload}'");
-
-        // Send NOTIFY on a SEPARATE cached connection to avoid
-        // self-notification race on the listener connection. When NOTIFY
-        // is sent on the same connection that LISTENs, the notification
-        // arrives during simple_query's response read, creating duplicates.
-        //
-        // The connection is lazily opened on first notify() and reused for
-        // subsequent calls. On failure, reconnects once before returning error.
-        let mut conn_guard = self.notify_conn.lock().unwrap_or_else(|e| e.into_inner());
-        let conn = match conn_guard.as_mut() {
-            Some(c) => c,
-            None => {
-                let c = bsql_driver_postgres::Connection::connect(&self.config)
-                    .map_err(|e| ConnectError::create(format!("notify connection failed: {e}")))?;
-                conn_guard.insert(c)
-            }
-        };
-        match conn.simple_query(&sql) {
-            Ok(()) => Ok(()),
-            Err(_) => {
-                // Connection broken — reconnect and retry once
-                *conn_guard = None;
-                let c = bsql_driver_postgres::Connection::connect(&self.config)
-                    .map_err(|e| ConnectError::create(format!("notify reconnect failed: {e}")))?;
-                let conn = conn_guard.insert(c);
-                conn.simple_query(&sql)
-                    .map_err(BsqlError::from_driver_query)
-            }
-        }
-    }
-
     /// The set of currently subscribed channels.
     pub fn subscribed_channels(&self) -> Vec<String> {
         self.channels
@@ -353,6 +192,176 @@ impl Listener {
         result
     }
 }
+
+macro_rules! listener_io_methods {
+    ($($async_kw:tt)?) => {
+        /// Connect to PostgreSQL and start the background notification reader.
+        ///
+        /// Opens a dedicated connection (not from any pool).
+        pub $($async_kw)? fn connect(url: &str) -> BsqlResult<Self> {
+            let config = bsql_driver_postgres::Config::from_url(url)
+                .map_err(|e| ConnectError::create(format!("listener connect failed: {e}")))?;
+
+            // Disable statement_timeout on the listener connection -- it only runs
+            // LISTEN/UNLISTEN/NOTIFY, and the notification wait is unbounded by design.
+            let mut listener_config = config;
+            listener_config.statement_timeout_secs = 0;
+
+            let conn = bsql_driver_postgres::Connection::connect(&listener_config)
+                .map_err(|e| ConnectError::create(format!("listener connect failed: {e}")))?;
+
+            let (notif_tx, rx) = mpsc::sync_channel(NOTIFICATION_BUFFER_SIZE);
+            let (cmd_tx, cmd_rx) = mpsc::channel();
+            let channels: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
+            let config_for_notify = listener_config.clone();
+
+            let thread_channels = Arc::clone(&channels);
+            let thread_config = listener_config;
+            let handle = thread::spawn(move || {
+                drive_listener(conn, thread_config, cmd_rx, notif_tx, thread_channels);
+            });
+
+            Ok(Listener {
+                cmd_tx,
+                rx,
+                _thread_handle: Some(handle),
+                channels,
+                config: config_for_notify,
+                notify_conn: Mutex::new(None),
+            })
+        }
+
+        /// Subscribe to a named notification channel.
+        ///
+        /// The channel name is properly quoted as a PostgreSQL identifier to
+        /// prevent SQL injection.
+        pub $($async_kw)? fn listen(&self, channel: &str) -> BsqlResult<()> {
+            if channel.is_empty() {
+                return Err(ConnectError::create(
+                    "LISTEN channel name must not be empty",
+                ));
+            }
+            let quoted = quote_ident(channel)?;
+            let sql = format!("LISTEN {quoted}");
+            self.send_command_listen(channel.to_owned(), sql)
+        }
+
+        /// Unsubscribe from a named notification channel.
+        pub $($async_kw)? fn unlisten(&self, channel: &str) -> BsqlResult<()> {
+            if channel.is_empty() {
+                return Err(ConnectError::create(
+                    "UNLISTEN channel name must not be empty",
+                ));
+            }
+            let quoted = quote_ident(channel)?;
+            let sql = format!("UNLISTEN {quoted}");
+            self.send_command_unlisten(channel.to_owned(), sql)
+        }
+
+        /// Unsubscribe from all channels.
+        pub $($async_kw)? fn unlisten_all(&self) -> BsqlResult<()> {
+            // Clear the tracked set
+            self.channels
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+
+            let (resp_tx, resp_rx) = mpsc::sync_channel(1);
+            self.cmd_tx
+                .send(Command::UnlistenAll(resp_tx))
+                .map_err(|_| ConnectError::create("listener background thread exited"))?;
+            resp_rx
+                .recv()
+                .map_err(|_| ConnectError::create("listener background thread exited"))?
+                .map_err(BsqlError::from)
+        }
+
+        /// Receive the next notification.
+        ///
+        /// Blocks until a notification arrives, or returns an error if the
+        /// connection has been closed.
+        pub $($async_kw)? fn recv(&mut self) -> BsqlResult<Notification> {
+            self.rx
+                .recv()
+                .map_err(|_| ConnectError::create("listener connection closed"))
+        }
+
+        /// Non-blocking receive. Returns `Ok(None)` if no notification is
+        /// available right now (as opposed to `recv()` which blocks).
+        ///
+        /// Returns `Err` only if the listener connection has been closed.
+        pub $($async_kw)? fn try_recv(&mut self) -> BsqlResult<Option<Notification>> {
+            match self.rx.try_recv() {
+                Ok(notif) => Ok(Some(notif)),
+                Err(mpsc::TryRecvError::Empty) => Ok(None),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Err(ConnectError::create("listener connection closed"))
+                }
+            }
+        }
+
+        /// Send a NOTIFY on a channel with a payload.
+        ///
+        /// The payload must not exceed 7999 bytes (PostgreSQL's limit).
+        pub $($async_kw)? fn notify(&self, channel: &str, payload: &str) -> BsqlResult<()> {
+            if channel.is_empty() {
+                return Err(ConnectError::create(
+                    "NOTIFY channel name must not be empty",
+                ));
+            }
+            if payload.contains('\0') {
+                return Err(ConnectError::create(
+                    "NOTIFY payload must not contain null bytes",
+                ));
+            }
+            if payload.len() > PG_MAX_PAYLOAD_SIZE {
+                return Err(ConnectError::create(format!(
+                    "NOTIFY payload exceeds PostgreSQL's {PG_MAX_PAYLOAD_SIZE}-byte limit \
+                     (got {} bytes)",
+                    payload.len()
+                )));
+            }
+            let quoted_channel = quote_ident(channel)?;
+            let escaped_payload = payload.replace('\'', "''");
+            let sql = format!("NOTIFY {quoted_channel}, '{escaped_payload}'");
+
+            // Send NOTIFY on a SEPARATE cached connection to avoid
+            // self-notification race on the listener connection. When NOTIFY
+            // is sent on the same connection that LISTENs, the notification
+            // arrives during simple_query's response read, creating duplicates.
+            //
+            // The connection is lazily opened on first notify() and reused for
+            // subsequent calls. On failure, reconnects once before returning error.
+            let mut conn_guard = self.notify_conn.lock().unwrap_or_else(|e| e.into_inner());
+            let conn = match conn_guard.as_mut() {
+                Some(c) => c,
+                None => {
+                    let c = bsql_driver_postgres::Connection::connect(&self.config)
+                        .map_err(|e| ConnectError::create(format!("notify connection failed: {e}")))?;
+                    conn_guard.insert(c)
+                }
+            };
+            match conn.simple_query(&sql) {
+                Ok(()) => Ok(()),
+                Err(_) => {
+                    // Connection broken — reconnect and retry once
+                    *conn_guard = None;
+                    let c = bsql_driver_postgres::Connection::connect(&self.config)
+                        .map_err(|e| ConnectError::create(format!("notify reconnect failed: {e}")))?;
+                    let conn = conn_guard.insert(c);
+                    conn.simple_query(&sql)
+                        .map_err(BsqlError::from_driver_query)
+                }
+            }
+        }
+    };
+}
+
+#[cfg(feature = "async")]
+impl Listener { listener_io_methods!(async); }
+#[cfg(not(feature = "async"))]
+impl Listener { listener_io_methods!(); }
 
 /// Quote a PostgreSQL identifier: wrap in double quotes, double any internal quotes.
 fn quote_ident(name: &str) -> BsqlResult<String> {

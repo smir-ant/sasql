@@ -10,7 +10,7 @@ description = "Safe SQL for Rust — if it compiles, the SQL is correct"
 
 [features]
 default = ["async"]
-async = ["bsql-core/async", "dep:tokio"]
+async = ["bsql-core/async", "bsql-macros/async", "dep:tokio"]
 time = ["bsql-core/time", "bsql-macros/time"]
 chrono = ["bsql-core/chrono", "bsql-macros/chrono"]
 uuid = ["bsql-core/uuid", "bsql-macros/uuid"]

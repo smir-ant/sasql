@@ -50,66 +50,75 @@ impl Drop for TestContext {
 /// Called by generated `#[bsql::test]` code. Not intended for direct use.
 ///
 /// `fixtures_sql` contains compile-time embedded SQL strings from fixture files.
-pub async fn setup_test_schema(fixtures_sql: &[&str]) -> Result<TestContext, BsqlError> {
-    let db_url = std::env::var("BSQL_DATABASE_URL")
-        .or_else(|_| std::env::var("DATABASE_URL"))
-        .map_err(|_| {
-            ConnectError::create("BSQL_DATABASE_URL or DATABASE_URL must be set for #[bsql::test]")
-        })?;
+macro_rules! setup_test_schema_impl {
+    ($($async_kw:tt)?) => {
+        pub $($async_kw)? fn setup_test_schema(fixtures_sql: &[&str]) -> Result<TestContext, BsqlError> {
+            let db_url = std::env::var("BSQL_DATABASE_URL")
+                .or_else(|_| std::env::var("DATABASE_URL"))
+                .map_err(|_| {
+                    ConnectError::create("BSQL_DATABASE_URL or DATABASE_URL must be set for #[bsql::test]")
+                })?;
 
-    let schema_name = format!(
-        "__bsql_test_{}_{}",
-        std::process::id(),
-        TEST_COUNTER.fetch_add(1, Ordering::Relaxed),
-    );
+            let schema_name = format!(
+                "__bsql_test_{}_{}",
+                std::process::id(),
+                TEST_COUNTER.fetch_add(1, Ordering::Relaxed),
+            );
 
-    // Setup connection: create schema, apply fixtures
-    let config = Config::from_url(&db_url)
-        .map_err(|e| ConnectError::create(format!("invalid database URL: {e}")))?;
-    let mut conn = Connection::connect(&config)
-        .map_err(|e| ConnectError::create(format!("connection failed: {e}")))?;
+            // Setup connection: create schema, apply fixtures
+            let config = Config::from_url(&db_url)
+                .map_err(|e| ConnectError::create(format!("invalid database URL: {e}")))?;
+            let mut conn = Connection::connect(&config)
+                .map_err(|e| ConnectError::create(format!("connection failed: {e}")))?;
 
-    // Create isolated schema
-    conn.simple_query(&format!("CREATE SCHEMA \"{}\"", schema_name))
-        .map_err(|e| ConnectError::create(format!("failed to create test schema: {e}")))?;
+            // Create isolated schema
+            conn.simple_query(&format!("CREATE SCHEMA \"{}\"", schema_name))
+                .map_err(|e| ConnectError::create(format!("failed to create test schema: {e}")))?;
 
-    // Set search_path to test schema (with public for extensions)
-    conn.simple_query(&format!("SET search_path TO \"{}\", public", schema_name))
-        .map_err(|e| ConnectError::create(format!("failed to set search_path: {e}")))?;
+            // Set search_path to test schema (with public for extensions)
+            conn.simple_query(&format!("SET search_path TO \"{}\", public", schema_name))
+                .map_err(|e| ConnectError::create(format!("failed to set search_path: {e}")))?;
 
-    // Apply fixtures in order
-    for fixture_sql in fixtures_sql {
-        if !fixture_sql.trim().is_empty() {
-            conn.simple_query(fixture_sql)
-                .map_err(|e| ConnectError::create(format!("fixture failed: {e}")))?;
+            // Apply fixtures in order
+            for fixture_sql in fixtures_sql {
+                if !fixture_sql.trim().is_empty() {
+                    conn.simple_query(fixture_sql)
+                        .map_err(|e| ConnectError::create(format!("fixture failed: {e}")))?;
+                }
+            }
+
+            drop(conn); // Release setup connection
+
+            // Build pool. Connections are lazy, so we create the pool first,
+            // then immediately acquire one connection and set search_path on it.
+            setup_test_schema_impl!(@call $($async_kw)?, Pool::connect(&db_url), pool);
+            setup_test_schema_impl!(@call $($async_kw)?, pool.raw_execute(&format!("SET search_path TO \"{}\", public", schema_name)), _);
+
+            // Set warmup SQL so any *new* connections from this pool also get
+            // the correct search_path (the pool has max_size=10 by default,
+            // but for tests we typically only use 1 connection).
+            let warmup_sql = format!("SET search_path TO \"{}\", public", schema_name);
+            // set_warmup_sqls copies strings internally (into Box<str>), so &str
+            // only needs to live for the duration of this call. No leak needed.
+            pool.set_warmup_sqls([warmup_sql]);
+
+            Ok(TestContext {
+                pool,
+                schema_name,
+                db_url,
+            })
         }
-    }
-
-    drop(conn); // Release setup connection
-
-    // Build pool. Connections are lazy, so we create the pool first,
-    // then immediately acquire one connection and set search_path on it.
-    let pool = Pool::connect(&db_url).await?;
-
-    // Acquire a connection and set search_path so all subsequent queries
-    // in this test run against the isolated schema.
-    pool.raw_execute(&format!("SET search_path TO \"{}\", public", schema_name))
-        .await?;
-
-    // Set warmup SQL so any *new* connections from this pool also get
-    // the correct search_path (the pool has max_size=10 by default,
-    // but for tests we typically only use 1 connection).
-    let warmup_sql = format!("SET search_path TO \"{}\", public", schema_name);
-    // set_warmup_sqls copies strings internally (into Box<str>), so &str
-    // only needs to live for the duration of this call. No leak needed.
-    pool.set_warmup_sqls([warmup_sql]);
-
-    Ok(TestContext {
-        pool,
-        schema_name,
-        db_url,
-    })
+    };
+    (@call async, $expr:expr, _) => { $expr.await?; };
+    (@call async, $expr:expr, $bind:ident) => { let $bind = $expr.await?; };
+    (@call , $expr:expr, _) => { $expr?; };
+    (@call , $expr:expr, $bind:ident) => { let $bind = $expr?; };
 }
+
+#[cfg(feature = "async")]
+setup_test_schema_impl!(async);
+#[cfg(not(feature = "async"))]
+setup_test_schema_impl!();
 
 // ===========================================================================
 // SQLite test support
@@ -358,6 +367,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "async")]
     #[tokio::test]
     async fn missing_db_url_returns_clear_error() {
         let _guard = EnvGuard::lock();
@@ -368,6 +378,7 @@ mod tests {
         assert!(result.is_err(), "missing env vars should produce an error");
     }
 
+    #[cfg(feature = "async")]
     #[tokio::test]
     async fn missing_bsql_database_url_falls_back_to_database_url() {
         let _guard = EnvGuard::lock();
@@ -381,6 +392,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "async")]
     #[tokio::test]
     async fn invalid_db_url_returns_clear_error() {
         let _guard = EnvGuard::lock();
@@ -391,6 +403,7 @@ mod tests {
         assert!(result.is_err(), "connecting to bogus URL should fail");
     }
 
+    #[cfg(feature = "async")]
     #[tokio::test]
     async fn invalid_db_url_not_postgres_scheme() {
         let _guard = EnvGuard::lock();
@@ -626,6 +639,7 @@ mod tests {
     // BSQL_DATABASE_URL takes priority over DATABASE_URL
     // ---------------------------------------------------------------
 
+    #[cfg(feature = "async")]
     #[tokio::test]
     async fn bsql_database_url_takes_priority_over_database_url() {
         let orig_bsql = std::env::var("BSQL_DATABASE_URL").ok();

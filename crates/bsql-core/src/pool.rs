@@ -236,64 +236,75 @@ impl PoolBuilder {
         self
     }
 
-    pub async fn build(self) -> BsqlResult<PgPool> {
-        let url = self.url.ok_or_else(|| {
-            BsqlError::from(bsql_driver_postgres::DriverError::Pool(
-                "pool builder requires a URL".into(),
-            ))
-        })?;
-        let mut builder = bsql_driver_postgres::Pool::builder()
-            .url(&url)
-            .max_size(self.max_size);
+}
 
-        if let Some(lt) = self.max_lifetime {
-            builder = builder.max_lifetime(lt);
-        }
-        if let Some(at) = self.acquire_timeout {
-            builder = builder.acquire_timeout(at);
-        }
-        if let Some(mi) = self.min_idle {
-            builder = builder.min_idle(mi);
-        }
-        if let Some(st) = self.stale_timeout {
-            builder = builder.stale_timeout(st);
-        }
-        if let Some(msc) = self.max_stmt_cache_size {
-            builder = builder.max_stmt_cache_size(msc);
-        }
+// ---------------------------------------------------------------------------
+// PoolBuilder::build — I/O method, needs async/sync toggle
+// ---------------------------------------------------------------------------
 
-        let inner = builder.build().map_err(BsqlError::from)?;
+macro_rules! builder_io_methods {
+    ($($async_kw:tt)?) => {
+        pub $($async_kw)? fn build(self) -> BsqlResult<PgPool> {
+            let url = self.url.ok_or_else(|| {
+                BsqlError::from(bsql_driver_postgres::DriverError::Pool(
+                    "pool builder requires a URL".into(),
+                ))
+            })?;
+            let mut builder = bsql_driver_postgres::Pool::builder()
+                .url(&url)
+                .max_size(self.max_size);
 
-        // Build replica pool if configured
-        let read_pool = if let Some(replica_url) = &self.replica_url {
-            let replica_size = self.replica_max_size.unwrap_or(self.max_size);
-            let mut rbuilder = bsql_driver_postgres::Pool::builder()
-                .url(replica_url)
-                .max_size(replica_size);
             if let Some(lt) = self.max_lifetime {
-                rbuilder = rbuilder.max_lifetime(lt);
+                builder = builder.max_lifetime(lt);
             }
             if let Some(at) = self.acquire_timeout {
-                rbuilder = rbuilder.acquire_timeout(at);
+                builder = builder.acquire_timeout(at);
             }
-            Some(rbuilder.build().map_err(BsqlError::from)?)
-        } else {
-            None
-        };
+            if let Some(mi) = self.min_idle {
+                builder = builder.min_idle(mi);
+            }
+            if let Some(st) = self.stale_timeout {
+                builder = builder.stale_timeout(st);
+            }
+            if let Some(msc) = self.max_stmt_cache_size {
+                builder = builder.max_stmt_cache_size(msc);
+            }
 
-        Ok(PgPool { inner, read_pool })
-    }
+            let inner = builder.build().map_err(BsqlError::from)?;
+
+            // Build replica pool if configured
+            let read_pool = if let Some(replica_url) = &self.replica_url {
+                let replica_size = self.replica_max_size.unwrap_or(self.max_size);
+                let mut rbuilder = bsql_driver_postgres::Pool::builder()
+                    .url(replica_url)
+                    .max_size(replica_size);
+                if let Some(lt) = self.max_lifetime {
+                    rbuilder = rbuilder.max_lifetime(lt);
+                }
+                if let Some(at) = self.acquire_timeout {
+                    rbuilder = rbuilder.acquire_timeout(at);
+                }
+                Some(rbuilder.build().map_err(BsqlError::from)?)
+            } else {
+                None
+            };
+
+            Ok(PgPool { inner, read_pool })
+        }
+    };
 }
+
+#[cfg(feature = "async")]
+impl PoolBuilder { builder_io_methods!(async); }
+#[cfg(not(feature = "async"))]
+impl PoolBuilder { builder_io_methods!(); }
 
 // ---------------------------------------------------------------------------
 // PgPool methods
 //
-// These methods are `pub async fn` even though they contain no `.await`
-// internally. This is intentional: the `query!()` macro generates code
-// that calls these methods via `__bsql_call!(pool.method())`, which
-// expands to `pool.method().await` when the `async` feature is enabled.
-// Without the `async` keyword, `.await` on a plain `Result` would be
-// a compile error.
+// Always-sync methods live in a plain `impl PgPool` block. I/O methods
+// that need `async` in async mode and plain `fn` in sync mode are defined
+// via the `pool_io_methods!` local macro and cfg-gated impl blocks.
 //
 // An `async fn` with no yield points compiles to a single-state state
 // machine that the optimizer inlines completely — zero runtime overhead.
@@ -305,20 +316,6 @@ impl PoolBuilder {
 // ---------------------------------------------------------------------------
 
 impl PgPool {
-    /// Connect to PostgreSQL using a connection URL.
-    ///
-    /// Creates the pool (parses URL, allocates pool structures). Actual TCP/UDS
-    /// connections are established lazily on first `acquire()`.
-    ///
-    /// Format: `postgres://user:password@host:port/dbname`
-    pub async fn connect(url: &str) -> BsqlResult<Self> {
-        let inner = bsql_driver_postgres::Pool::connect(url).map_err(BsqlError::from)?;
-        Ok(PgPool {
-            inner,
-            read_pool: None,
-        })
-    }
-
     /// Create a pool builder for fine-grained configuration.
     pub fn builder() -> PoolBuilder {
         PoolBuilder {
@@ -334,66 +331,6 @@ impl PgPool {
         }
     }
 
-    /// Acquire a connection from the pool.
-    ///
-    /// **Fail-fast**: returns `BsqlError::Pool` immediately if no connections
-    /// are available (unless `acquire_timeout` is configured).
-    pub async fn acquire(&self) -> BsqlResult<PoolConnection> {
-        let guard = self.inner.acquire().map_err(BsqlError::from)?;
-        Ok(PoolConnection { inner: guard })
-    }
-
-    /// Begin a new transaction.
-    ///
-    /// Acquires a connection and sends BEGIN immediately.
-    pub async fn begin(&self) -> BsqlResult<Transaction> {
-        let tx = self.inner.begin().map_err(BsqlError::from)?;
-        Ok(Transaction::from_driver(tx))
-    }
-
-    /// Execute a query and return a stream of rows.
-    ///
-    /// Acquires a connection from the pool and returns a [`QueryStream`]
-    /// that holds the connection alive until the stream is consumed or dropped.
-    ///
-    /// Uses true PG-level streaming via `Execute(max_rows=64)`. Only 64 rows
-    /// are in memory at a time. The stream fetches additional chunks on demand
-    /// via the `PortalSuspended` / re-`Execute` protocol.
-    #[doc(hidden)]
-    pub async fn query_stream(
-        &self,
-        sql: &str,
-        sql_hash: u64,
-        params: &[&(dyn Encode + Sync)],
-    ) -> BsqlResult<QueryStream> {
-        let mut guard = self.inner.acquire().map_err(BsqlError::from)?;
-        let mut arena = acquire_arena();
-
-        // chunk_size=64 rows per Execute call
-        const CHUNK_SIZE: i32 = 64;
-
-        let (columns, _) = guard
-            .query_streaming_start(sql, sql_hash, params, CHUNK_SIZE)
-            .map_err(BsqlError::from)?;
-
-        let num_cols = columns.len();
-        let mut all_col_offsets: Vec<(usize, i32)> =
-            Vec::with_capacity(num_cols * CHUNK_SIZE as usize);
-
-        let more = guard
-            .streaming_next_chunk(&mut arena, &mut all_col_offsets)
-            .map_err(BsqlError::from)?;
-
-        let first_result = bsql_driver_postgres::QueryResult::from_parts(
-            all_col_offsets,
-            num_cols,
-            columns.clone(),
-            0,
-        );
-
-        Ok(QueryStream::new(guard, arena, first_result, columns, !more))
-    }
-
     /// Set the SQL statements to pre-PREPARE on new connections.
     ///
     /// Each SQL string is PREPAREd on new connections before they are returned
@@ -403,153 +340,6 @@ impl PgPool {
     /// the connection from being usable.
     pub fn set_warmup_sqls<S: Into<Box<str>>>(&self, sqls: impl IntoIterator<Item = S>) {
         self.inner.set_warmup_sqls(sqls);
-    }
-
-    /// Execute arbitrary SQL and return text rows.
-    ///
-    /// Uses PostgreSQL's simple query protocol — all values returned as strings.
-    /// This bypasses bsql's compile-time SQL validation entirely.
-    ///
-    /// Use for DDL, ad-hoc queries, migrations, or the rare dynamic SQL that
-    /// cannot be expressed via `query!`. For type-safe queries, use `query!`.
-    pub async fn raw_query(&self, sql: &str) -> BsqlResult<Vec<RawRow>> {
-        let mut guard = self.inner.acquire().map_err(BsqlError::from)?;
-        let rows = guard
-            .simple_query_rows(sql)
-            .map_err(BsqlError::from_driver_query)?;
-        Ok(rows.into_iter().map(RawRow).collect())
-    }
-
-    /// Execute arbitrary SQL without returning rows.
-    ///
-    /// Uses PostgreSQL's simple query protocol. Useful for DDL (CREATE TABLE,
-    /// ALTER, DROP), SET commands, or any statement where you don't need results.
-    pub async fn raw_execute(&self, sql: &str) -> BsqlResult<()> {
-        let mut guard = self.inner.acquire().map_err(BsqlError::from)?;
-        guard
-            .simple_query(sql)
-            .map_err(BsqlError::from_driver_query)?;
-        Ok(())
-    }
-
-    /// Execute parameterized SQL and return text rows.
-    ///
-    /// Uses PostgreSQL's extended query protocol (Parse+Bind+Execute) with
-    /// positional `$1, $2, ...` parameter placeholders. Results are converted
-    /// from binary format to text strings.
-    ///
-    /// This is the parameterized equivalent of [`raw_query`](Self::raw_query).
-    /// Use when you need parameter binding but don't want compile-time
-    /// validation via `query!`.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let rows = pool.raw_query_params(
-    ///     "SELECT $1::int4 + $2::int4 AS sum",
-    ///     &[&1i32, &2i32],
-    /// ).await?;
-    /// assert_eq!(rows[0].get(0), Some("3"));
-    /// ```
-    pub async fn raw_query_params(
-        &self,
-        sql: &str,
-        params: &[&(dyn Encode + Sync)],
-    ) -> BsqlResult<Vec<RawRow>> {
-        let sql_hash = crate::rapid_hash_str(sql);
-        let mut guard = self.inner.acquire().map_err(BsqlError::from)?;
-        let result = guard
-            .query(sql, sql_hash, params)
-            .map_err(BsqlError::from_driver_query)?;
-        let arena = bsql_driver_postgres::Arena::empty();
-        let columns = result.columns();
-        let num_rows = result.len();
-        let mut rows = Vec::with_capacity(num_rows);
-        for i in 0..num_rows {
-            let row = result.row(i, &arena);
-            let num_cols = row.column_count();
-            let mut values = Vec::with_capacity(num_cols);
-            for (c, col) in columns.iter().enumerate().take(num_cols) {
-                if row.is_null(c) {
-                    values.push(None);
-                } else {
-                    let text = binary_col_to_text(&row, c, col.type_oid);
-                    values.push(Some(text));
-                }
-            }
-            rows.push(RawRow(values));
-        }
-        Ok(rows)
-    }
-
-    /// Bulk copy data INTO a table from an iterator of text rows.
-    ///
-    /// Each row is a tab-separated string (TSV format, matching PostgreSQL's
-    /// default COPY text format). Returns the number of rows copied.
-    ///
-    /// This is 10-100x faster than individual INSERTs for bulk data loading.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let rows = vec!["alice\talice@example.com", "bob\tbob@example.com"];
-    /// let count = pool.copy_in("users", &["name", "email"], rows.iter().map(|s| s.as_str())).await?;
-    /// ```
-    pub async fn copy_in<'a, I>(&self, table: &str, columns: &[&str], rows: I) -> BsqlResult<u64>
-    where
-        I: IntoIterator<Item = &'a str>,
-    {
-        let mut guard = self.inner.acquire().map_err(BsqlError::from)?;
-        guard
-            .copy_in(table, columns, rows)
-            .map_err(BsqlError::from_driver_query)
-    }
-
-    /// Bulk copy data INTO a table using PostgreSQL binary COPY protocol.
-    ///
-    /// 5-10x faster than pipelined INSERT for large data sets. Each row
-    /// is a slice of `&dyn Encode` values — same trait used by `query!`.
-    /// Values are binary-encoded directly, no text conversion.
-    ///
-    /// ```rust,ignore
-    /// let rows: Vec<Vec<&dyn Encode>> = data.iter().map(|d| {
-    ///     vec![&d.id as &dyn Encode, &d.name as &dyn Encode]
-    /// }).collect();
-    /// let refs: Vec<&[&dyn Encode]> = rows.iter().map(|r| r.as_slice()).collect();
-    /// pool.copy_in_binary("events", &["id", "name"], &refs).await?;
-    /// ```
-    pub async fn copy_in_binary(
-        &self,
-        table: &str,
-        columns: &[&str],
-        rows: &[&[&(dyn bsql_driver_postgres::codec::Encode + Sync)]],
-    ) -> BsqlResult<u64> {
-        let mut guard = self.inner.acquire().map_err(BsqlError::from)?;
-        guard
-            .copy_in_binary(table, columns, rows)
-            .map_err(BsqlError::from_driver_query)
-    }
-
-    /// Bulk copy data OUT of a table or query result to a writer.
-    ///
-    /// Data is written in PostgreSQL's text format (tab-separated columns,
-    /// newline-terminated rows). Returns the number of rows copied.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let mut buf = Vec::new();
-    /// let count = pool.copy_out("SELECT name, email FROM users", &mut buf).await?;
-    /// ```
-    pub async fn copy_out<W: std::io::Write>(
-        &self,
-        query: &str,
-        writer: &mut W,
-    ) -> BsqlResult<u64> {
-        let mut guard = self.inner.acquire().map_err(BsqlError::from)?;
-        guard
-            .copy_out(query, writer)
-            .map_err(BsqlError::from_driver_query)
     }
 
     /// Pool status metrics: idle, active, open, and max_size.
@@ -595,93 +385,323 @@ impl PgPool {
     pub fn is_uds(&self) -> bool {
         self.inner.is_uds()
     }
-
-    /// Process each row directly from the wire buffer via a closure.
-    ///
-    /// Acquires a connection, calls `Connection::for_each`, and releases.
-    /// Zero arena allocation — the closure reads columns directly from
-    /// the DataRow message bytes.
-    ///
-    /// When `readonly` is true and a replica pool is configured, routes
-    /// to the replica pool; otherwise uses the primary.
-    #[doc(hidden)]
-    pub async fn for_each_raw<F>(
-        &self,
-        sql: &str,
-        sql_hash: u64,
-        params: &[&(dyn Encode + Sync)],
-        readonly: bool,
-        mut f: F,
-    ) -> BsqlResult<()>
-    where
-        F: FnMut(bsql_driver_postgres::PgDataRow<'_>) -> BsqlResult<()>,
-    {
-        let pool = if readonly {
-            self.read_pool.as_ref().unwrap_or(&self.inner)
-        } else {
-            &self.inner
-        };
-        let mut guard = pool.acquire().map_err(BsqlError::from)?;
-        // Bridge BsqlError from the user closure into DriverError for the
-        // driver-level for_each. Any closure error is stashed in `user_err`
-        // and re-surfaced after the driver returns.
-        let mut user_err: Option<BsqlError> = None;
-        let driver_result = guard.for_each(sql, sql_hash, params, |row| match f(row) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                user_err = Some(e);
-                Err(bsql_driver_postgres::DriverError::Protocol(
-                    "for_each closure error".into(),
-                ))
-            }
-        });
-        // If the user closure produced an error, return it directly.
-        if let Some(e) = user_err {
-            return Err(e);
-        }
-        driver_result.map_err(BsqlError::from_driver_query)
-    }
-
-    /// Process each DataRow as raw bytes via inline sequential decode.
-    ///
-    /// Like `for_each_raw` but passes the raw `&[u8]` DataRow payload directly
-    /// to the closure — no `PgDataRow` construction, no SmallVec pre-scan.
-    /// The generated macro code decodes columns inline by advancing a position
-    /// cursor through the bytes.
-    #[doc(hidden)]
-    pub async fn __for_each_raw_bytes<F>(
-        &self,
-        sql: &str,
-        sql_hash: u64,
-        params: &[&(dyn Encode + Sync)],
-        readonly: bool,
-        mut f: F,
-    ) -> BsqlResult<()>
-    where
-        F: FnMut(&[u8]) -> BsqlResult<()>,
-    {
-        let pool = if readonly {
-            self.read_pool.as_ref().unwrap_or(&self.inner)
-        } else {
-            &self.inner
-        };
-        let mut guard = pool.acquire().map_err(BsqlError::from)?;
-        let mut user_err: Option<BsqlError> = None;
-        let driver_result = guard.for_each_raw(sql, sql_hash, params, |data| match f(data) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                user_err = Some(e);
-                Err(bsql_driver_postgres::DriverError::Protocol(
-                    "for_each closure error".into(),
-                ))
-            }
-        });
-        if let Some(e) = user_err {
-            return Err(e);
-        }
-        driver_result.map_err(BsqlError::from_driver_query)
-    }
 }
+
+macro_rules! pool_io_methods {
+    ($($async_kw:tt)?) => {
+        /// Connect to PostgreSQL using a connection URL.
+        ///
+        /// Creates the pool (parses URL, allocates pool structures). Actual TCP/UDS
+        /// connections are established lazily on first `acquire()`.
+        ///
+        /// Format: `postgres://user:password@host:port/dbname`
+        pub $($async_kw)? fn connect(url: &str) -> BsqlResult<Self> {
+            let inner = bsql_driver_postgres::Pool::connect(url).map_err(BsqlError::from)?;
+            Ok(PgPool {
+                inner,
+                read_pool: None,
+            })
+        }
+
+        /// Acquire a connection from the pool.
+        ///
+        /// **Fail-fast**: returns `BsqlError::Pool` immediately if no connections
+        /// are available (unless `acquire_timeout` is configured).
+        pub $($async_kw)? fn acquire(&self) -> BsqlResult<PoolConnection> {
+            let guard = self.inner.acquire().map_err(BsqlError::from)?;
+            Ok(PoolConnection { inner: guard })
+        }
+
+        /// Begin a new transaction.
+        ///
+        /// Acquires a connection and sends BEGIN immediately.
+        pub $($async_kw)? fn begin(&self) -> BsqlResult<Transaction> {
+            let tx = self.inner.begin().map_err(BsqlError::from)?;
+            Ok(Transaction::from_driver(tx))
+        }
+
+        /// Execute a query and return a stream of rows.
+        ///
+        /// Acquires a connection from the pool and returns a [`QueryStream`]
+        /// that holds the connection alive until the stream is consumed or dropped.
+        ///
+        /// Uses true PG-level streaming via `Execute(max_rows=64)`. Only 64 rows
+        /// are in memory at a time. The stream fetches additional chunks on demand
+        /// via the `PortalSuspended` / re-`Execute` protocol.
+        #[doc(hidden)]
+        pub $($async_kw)? fn query_stream(
+            &self,
+            sql: &str,
+            sql_hash: u64,
+            params: &[&(dyn Encode + Sync)],
+        ) -> BsqlResult<QueryStream> {
+            let mut guard = self.inner.acquire().map_err(BsqlError::from)?;
+            let mut arena = acquire_arena();
+
+            // chunk_size=64 rows per Execute call
+            const CHUNK_SIZE: i32 = 64;
+
+            let (columns, _) = guard
+                .query_streaming_start(sql, sql_hash, params, CHUNK_SIZE)
+                .map_err(BsqlError::from)?;
+
+            let num_cols = columns.len();
+            let mut all_col_offsets: Vec<(usize, i32)> =
+                Vec::with_capacity(num_cols * CHUNK_SIZE as usize);
+
+            let more = guard
+                .streaming_next_chunk(&mut arena, &mut all_col_offsets)
+                .map_err(BsqlError::from)?;
+
+            let first_result = bsql_driver_postgres::QueryResult::from_parts(
+                all_col_offsets,
+                num_cols,
+                columns.clone(),
+                0,
+            );
+
+            Ok(QueryStream::new(guard, arena, first_result, columns, !more))
+        }
+
+        /// Execute arbitrary SQL and return text rows.
+        ///
+        /// Uses PostgreSQL's simple query protocol — all values returned as strings.
+        /// This bypasses bsql's compile-time SQL validation entirely.
+        ///
+        /// Use for DDL, ad-hoc queries, migrations, or the rare dynamic SQL that
+        /// cannot be expressed via `query!`. For type-safe queries, use `query!`.
+        pub $($async_kw)? fn raw_query(&self, sql: &str) -> BsqlResult<Vec<RawRow>> {
+            let mut guard = self.inner.acquire().map_err(BsqlError::from)?;
+            let rows = guard
+                .simple_query_rows(sql)
+                .map_err(BsqlError::from_driver_query)?;
+            Ok(rows.into_iter().map(RawRow).collect())
+        }
+
+        /// Execute arbitrary SQL without returning rows.
+        ///
+        /// Uses PostgreSQL's simple query protocol. Useful for DDL (CREATE TABLE,
+        /// ALTER, DROP), SET commands, or any statement where you don't need results.
+        pub $($async_kw)? fn raw_execute(&self, sql: &str) -> BsqlResult<()> {
+            let mut guard = self.inner.acquire().map_err(BsqlError::from)?;
+            guard
+                .simple_query(sql)
+                .map_err(BsqlError::from_driver_query)?;
+            Ok(())
+        }
+
+        /// Execute parameterized SQL and return text rows.
+        ///
+        /// Uses PostgreSQL's extended query protocol (Parse+Bind+Execute) with
+        /// positional `$1, $2, ...` parameter placeholders. Results are converted
+        /// from binary format to text strings.
+        ///
+        /// This is the parameterized equivalent of [`raw_query`](Self::raw_query).
+        /// Use when you need parameter binding but don't want compile-time
+        /// validation via `query!`.
+        ///
+        /// # Example
+        ///
+        /// ```rust,ignore
+        /// let rows = pool.raw_query_params(
+        ///     "SELECT $1::int4 + $2::int4 AS sum",
+        ///     &[&1i32, &2i32],
+        /// ).await?;
+        /// assert_eq!(rows[0].get(0), Some("3"));
+        /// ```
+        pub $($async_kw)? fn raw_query_params(
+            &self,
+            sql: &str,
+            params: &[&(dyn Encode + Sync)],
+        ) -> BsqlResult<Vec<RawRow>> {
+            let sql_hash = crate::rapid_hash_str(sql);
+            let mut guard = self.inner.acquire().map_err(BsqlError::from)?;
+            let result = guard
+                .query(sql, sql_hash, params)
+                .map_err(BsqlError::from_driver_query)?;
+            let arena = bsql_driver_postgres::Arena::empty();
+            let columns = result.columns();
+            let num_rows = result.len();
+            let mut rows = Vec::with_capacity(num_rows);
+            for i in 0..num_rows {
+                let row = result.row(i, &arena);
+                let num_cols = row.column_count();
+                let mut values = Vec::with_capacity(num_cols);
+                for (c, col) in columns.iter().enumerate().take(num_cols) {
+                    if row.is_null(c) {
+                        values.push(None);
+                    } else {
+                        let text = binary_col_to_text(&row, c, col.type_oid);
+                        values.push(Some(text));
+                    }
+                }
+                rows.push(RawRow(values));
+            }
+            Ok(rows)
+        }
+
+        /// Bulk copy data INTO a table from an iterator of text rows.
+        ///
+        /// Each row is a tab-separated string (TSV format, matching PostgreSQL's
+        /// default COPY text format). Returns the number of rows copied.
+        ///
+        /// This is 10-100x faster than individual INSERTs for bulk data loading.
+        ///
+        /// # Example
+        ///
+        /// ```rust,ignore
+        /// let rows = vec!["alice\talice@example.com", "bob\tbob@example.com"];
+        /// let count = pool.copy_in("users", &["name", "email"], rows.iter().map(|s| s.as_str())).await?;
+        /// ```
+        pub $($async_kw)? fn copy_in<'a, I>(&self, table: &str, columns: &[&str], rows: I) -> BsqlResult<u64>
+        where
+            I: IntoIterator<Item = &'a str>,
+        {
+            let mut guard = self.inner.acquire().map_err(BsqlError::from)?;
+            guard
+                .copy_in(table, columns, rows)
+                .map_err(BsqlError::from_driver_query)
+        }
+
+        /// Bulk copy data INTO a table using PostgreSQL binary COPY protocol.
+        ///
+        /// 5-10x faster than pipelined INSERT for large data sets. Each row
+        /// is a slice of `&dyn Encode` values — same trait used by `query!`.
+        /// Values are binary-encoded directly, no text conversion.
+        ///
+        /// ```rust,ignore
+        /// let rows: Vec<Vec<&dyn Encode>> = data.iter().map(|d| {
+        ///     vec![&d.id as &dyn Encode, &d.name as &dyn Encode]
+        /// }).collect();
+        /// let refs: Vec<&[&dyn Encode]> = rows.iter().map(|r| r.as_slice()).collect();
+        /// pool.copy_in_binary("events", &["id", "name"], &refs).await?;
+        /// ```
+        pub $($async_kw)? fn copy_in_binary(
+            &self,
+            table: &str,
+            columns: &[&str],
+            rows: &[&[&(dyn bsql_driver_postgres::codec::Encode + Sync)]],
+        ) -> BsqlResult<u64> {
+            let mut guard = self.inner.acquire().map_err(BsqlError::from)?;
+            guard
+                .copy_in_binary(table, columns, rows)
+                .map_err(BsqlError::from_driver_query)
+        }
+
+        /// Bulk copy data OUT of a table or query result to a writer.
+        ///
+        /// Data is written in PostgreSQL's text format (tab-separated columns,
+        /// newline-terminated rows). Returns the number of rows copied.
+        ///
+        /// # Example
+        ///
+        /// ```rust,ignore
+        /// let mut buf = Vec::new();
+        /// let count = pool.copy_out("SELECT name, email FROM users", &mut buf).await?;
+        /// ```
+        pub $($async_kw)? fn copy_out<W: std::io::Write>(
+            &self,
+            query: &str,
+            writer: &mut W,
+        ) -> BsqlResult<u64> {
+            let mut guard = self.inner.acquire().map_err(BsqlError::from)?;
+            guard
+                .copy_out(query, writer)
+                .map_err(BsqlError::from_driver_query)
+        }
+
+        /// Process each row directly from the wire buffer via a closure.
+        ///
+        /// Acquires a connection, calls `Connection::for_each`, and releases.
+        /// Zero arena allocation — the closure reads columns directly from
+        /// the DataRow message bytes.
+        ///
+        /// When `readonly` is true and a replica pool is configured, routes
+        /// to the replica pool; otherwise uses the primary.
+        #[doc(hidden)]
+        pub $($async_kw)? fn for_each_raw<F>(
+            &self,
+            sql: &str,
+            sql_hash: u64,
+            params: &[&(dyn Encode + Sync)],
+            readonly: bool,
+            mut f: F,
+        ) -> BsqlResult<()>
+        where
+            F: FnMut(bsql_driver_postgres::PgDataRow<'_>) -> BsqlResult<()>,
+        {
+            let pool = if readonly {
+                self.read_pool.as_ref().unwrap_or(&self.inner)
+            } else {
+                &self.inner
+            };
+            let mut guard = pool.acquire().map_err(BsqlError::from)?;
+            // Bridge BsqlError from the user closure into DriverError for the
+            // driver-level for_each. Any closure error is stashed in `user_err`
+            // and re-surfaced after the driver returns.
+            let mut user_err: Option<BsqlError> = None;
+            let driver_result = guard.for_each(sql, sql_hash, params, |row| match f(row) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    user_err = Some(e);
+                    Err(bsql_driver_postgres::DriverError::Protocol(
+                        "for_each closure error".into(),
+                    ))
+                }
+            });
+            // If the user closure produced an error, return it directly.
+            if let Some(e) = user_err {
+                return Err(e);
+            }
+            driver_result.map_err(BsqlError::from_driver_query)
+        }
+
+        /// Process each DataRow as raw bytes via inline sequential decode.
+        ///
+        /// Like `for_each_raw` but passes the raw `&[u8]` DataRow payload directly
+        /// to the closure — no `PgDataRow` construction, no SmallVec pre-scan.
+        /// The generated macro code decodes columns inline by advancing a position
+        /// cursor through the bytes.
+        #[doc(hidden)]
+        pub $($async_kw)? fn __for_each_raw_bytes<F>(
+            &self,
+            sql: &str,
+            sql_hash: u64,
+            params: &[&(dyn Encode + Sync)],
+            readonly: bool,
+            mut f: F,
+        ) -> BsqlResult<()>
+        where
+            F: FnMut(&[u8]) -> BsqlResult<()>,
+        {
+            let pool = if readonly {
+                self.read_pool.as_ref().unwrap_or(&self.inner)
+            } else {
+                &self.inner
+            };
+            let mut guard = pool.acquire().map_err(BsqlError::from)?;
+            let mut user_err: Option<BsqlError> = None;
+            let driver_result = guard.for_each_raw(sql, sql_hash, params, |data| match f(data) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    user_err = Some(e);
+                    Err(bsql_driver_postgres::DriverError::Protocol(
+                        "for_each closure error".into(),
+                    ))
+                }
+            });
+            if let Some(e) = user_err {
+                return Err(e);
+            }
+            driver_result.map_err(BsqlError::from_driver_query)
+        }
+    };
+}
+
+#[cfg(feature = "async")]
+impl PgPool { pool_io_methods!(async); }
+#[cfg(not(feature = "async"))]
+impl PgPool { pool_io_methods!(); }
 
 impl Clone for PgPool {
     fn clone(&self) -> Self {
@@ -804,6 +824,7 @@ mod tests {
         assert_eq!(b.replica_max_size, Some(20));
     }
 
+    #[cfg(feature = "async")]
     #[tokio::test]
     async fn pool_connect_has_no_replica() {
         let pool = Pool::connect("postgres://user:pass@localhost/db")
@@ -814,6 +835,7 @@ mod tests {
 
     // --- Auto-UDS sync connection tests ---
 
+    #[cfg(feature = "async")]
     #[tokio::test]
     async fn pool_is_uds_false_for_tcp() {
         let pool = Pool::connect("postgres://user:pass@localhost/db")
@@ -822,7 +844,7 @@ mod tests {
         assert!(!pool.is_uds());
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "async"))]
     #[tokio::test]
     async fn pool_is_uds_true_for_unix_socket() {
         let pool = Pool::connect("postgres://user@localhost/db?host=/tmp")
@@ -831,6 +853,7 @@ mod tests {
         assert!(pool.is_uds());
     }
 
+    #[cfg(feature = "async")]
     #[tokio::test]
     async fn pool_is_uds_false_for_ip() {
         let pool = Pool::connect("postgres://user:pass@127.0.0.1/db")
@@ -878,6 +901,7 @@ mod tests {
 
     // --- Pool Debug ---
 
+    #[cfg(feature = "async")]
     #[tokio::test]
     async fn pool_debug() {
         let pool = Pool::connect("postgres://user:pass@localhost/db")
@@ -889,6 +913,7 @@ mod tests {
 
     // --- Pool Clone ---
 
+    #[cfg(feature = "async")]
     #[tokio::test]
     async fn pool_clone_is_cheap() {
         let pool = Pool::connect("postgres://user:pass@localhost/db")
@@ -924,6 +949,7 @@ mod tests {
 
     // --- Builder without URL ---
 
+    #[cfg(feature = "async")]
     #[tokio::test]
     async fn builder_build_without_url_errors() {
         let result = Pool::builder().build().await;
@@ -1088,6 +1114,7 @@ mod tests {
 
     // --- Pool close / is_closed ---
 
+    #[cfg(feature = "async")]
     #[tokio::test]
     async fn pool_close_and_is_closed() {
         let pool = Pool::connect("postgres://user:pass@localhost/db")
@@ -1100,6 +1127,7 @@ mod tests {
 
     // --- Pool status on fresh pool ---
 
+    #[cfg(feature = "async")]
     #[tokio::test]
     async fn pool_status_on_fresh_pool() {
         let pool = Pool::connect("postgres://user:pass@localhost/db")
@@ -1189,6 +1217,7 @@ mod tests {
 
     // --- Pool has_replica false by default ---
 
+    #[cfg(feature = "async")]
     #[tokio::test]
     async fn pool_has_replica_false_default() {
         let pool = Pool::connect("postgres://user:pass@localhost/db")

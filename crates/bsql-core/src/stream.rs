@@ -112,6 +112,116 @@ impl QueryStream {
         None
     }
 
+    /// Whether more rows might be available (either in the current chunk or
+    /// from the server).
+    pub fn has_more(&self) -> bool {
+        if let Some(ref result) = self.current_result {
+            if self.position < result.len() {
+                return true;
+            }
+        }
+        !self.finished
+    }
+
+    /// Number of remaining rows in the current chunk.
+    pub fn remaining(&self) -> usize {
+        match self.current_result {
+            Some(ref result) => result.len().saturating_sub(self.position),
+            None => 0,
+        }
+    }
+
+    /// Column descriptors for the result set.
+    pub fn columns(&self) -> &[ColumnDesc] {
+        &self.columns
+    }
+}
+
+/// Shared implementation of `fetch_next_chunk` — body is identical in
+/// both async and sync modes.
+macro_rules! stream_fetch_chunk {
+    ($($async_kw:tt)?) => {
+        /// Fetch the next chunk from the server.
+        ///
+        /// Returns `true` if a new chunk was fetched (call `next_row()` to iterate
+        /// it). Returns `false` if all rows have been consumed.
+        ///
+        /// The arena is reset before fetching the new chunk, invalidating any
+        /// previous `Row` references. The generated code always decodes rows into
+        /// owned fields before calling this.
+        pub $($async_kw)? fn fetch_next_chunk(&mut self) -> Result<bool, crate::error::BsqlError> {
+            if self.finished {
+                return Ok(false);
+            }
+
+            let guard = self.guard.as_mut().ok_or_else(|| {
+                crate::error::BsqlError::from(bsql_driver_postgres::DriverError::Pool(
+                    "stream guard already taken".into(),
+                ))
+            })?;
+
+            let arena = self.arena.as_mut().ok_or_else(|| {
+                crate::error::BsqlError::from(bsql_driver_postgres::DriverError::Pool(
+                    "stream arena already taken".into(),
+                ))
+            })?;
+
+            // Reset arena for the new chunk
+            arena.reset();
+
+            // Send Execute+Sync if needed (2nd+ chunks)
+            if self.needs_execute {
+                guard
+                    .streaming_send_execute(STREAM_CHUNK_SIZE)
+                    .map_err(crate::error::BsqlError::from_driver_query)?;
+            }
+
+            let num_cols = self.columns.len();
+
+            // Reclaim the Vec from the previous chunk result to reuse its allocation.
+            let mut col_offsets = match self.current_result.as_mut() {
+                Some(result) => {
+                    let mut v = result.take_col_offsets();
+                    v.clear();
+                    v
+                }
+                None => Vec::with_capacity(num_cols * STREAM_CHUNK_SIZE as usize),
+            };
+
+            let more = guard
+                .streaming_next_chunk(arena, &mut col_offsets)
+                .map_err(crate::error::BsqlError::from_driver_query)?;
+
+            if !more {
+                self.finished = true;
+            }
+            self.needs_execute = more; // if more rows, next call needs Execute+Sync
+
+            if col_offsets.is_empty() && !more {
+                self.current_result = None;
+                self.position = 0;
+                return Ok(false);
+            }
+
+            // Pass Arc::clone of columns. The Arc is shared across all chunks —
+            // this is a single refcount increment per chunk, not per row.
+            self.current_result = Some(QueryResult::from_parts(
+                col_offsets,
+                num_cols,
+                Arc::clone(&self.columns),
+                0,
+            ));
+            self.position = 0;
+
+            Ok(true)
+        }
+    };
+}
+
+#[cfg(feature = "async")]
+impl QueryStream {
+    stream_fetch_chunk!(async);
+
     /// Ensure the current chunk has rows available for `next_row()`.
     ///
     /// If the current chunk is exhausted but more rows exist on the server,
@@ -122,7 +232,7 @@ impl QueryStream {
     /// the primary iteration pattern:
     ///
     /// ```rust,ignore
-    /// while stream.advance()? {
+    /// while stream.advance().await? {
     ///     let row = stream.next_row().unwrap();
     ///     let id: i32 = row.get_i32(0).unwrap();
     ///     // decode before next advance() — row borrows from arena
@@ -153,104 +263,52 @@ impl QueryStream {
 
         Ok(false)
     }
+}
 
-    /// Whether more rows might be available (either in the current chunk or
-    /// from the server).
-    pub fn has_more(&self) -> bool {
+#[cfg(not(feature = "async"))]
+impl QueryStream {
+    stream_fetch_chunk!();
+
+    /// Ensure the current chunk has rows available for `next_row()`.
+    ///
+    /// If the current chunk is exhausted but more rows exist on the server,
+    /// fetches the next chunk. Returns `true` if rows are available (call
+    /// `next_row()` next), `false` if all rows have been consumed.
+    ///
+    /// This is the complement to `next_row()`. Together they form
+    /// the primary iteration pattern:
+    ///
+    /// ```rust,ignore
+    /// while stream.advance()? {
+    ///     let row = stream.next_row().unwrap();
+    ///     let id: i32 = row.get_i32(0).unwrap();
+    ///     // decode before next advance() — row borrows from arena
+    /// }
+    /// ```
+    pub fn advance(&mut self) -> Result<bool, crate::error::BsqlError> {
+        // Fast path: current chunk still has rows
         if let Some(ref result) = self.current_result {
             if self.position < result.len() {
-                return true;
+                return Ok(true);
             }
         }
-        !self.finished
-    }
 
-    /// Fetch the next chunk from the server.
-    ///
-    /// Returns `true` if a new chunk was fetched (call `next_row()` to iterate
-    /// it). Returns `false` if all rows have been consumed.
-    ///
-    /// The arena is reset before fetching the new chunk, invalidating any
-    /// previous `Row` references. The generated code always decodes rows into
-    /// owned fields before calling this.
-    pub async fn fetch_next_chunk(&mut self) -> Result<bool, crate::error::BsqlError> {
+        // Current chunk exhausted
         if self.finished {
             return Ok(false);
         }
 
-        let guard = self.guard.as_mut().ok_or_else(|| {
-            crate::error::BsqlError::from(bsql_driver_postgres::DriverError::Pool(
-                "stream guard already taken".into(),
-            ))
-        })?;
+        // Fetch the next chunk
+        self.fetch_next_chunk()?;
 
-        let arena = self.arena.as_mut().ok_or_else(|| {
-            crate::error::BsqlError::from(bsql_driver_postgres::DriverError::Pool(
-                "stream arena already taken".into(),
-            ))
-        })?;
-
-        // Reset arena for the new chunk
-        arena.reset();
-
-        // Send Execute+Sync if needed (2nd+ chunks)
-        if self.needs_execute {
-            guard
-                .streaming_send_execute(STREAM_CHUNK_SIZE)
-                .map_err(crate::error::BsqlError::from_driver_query)?;
-        }
-
-        let num_cols = self.columns.len();
-
-        // Reclaim the Vec from the previous chunk result to reuse its allocation.
-        let mut col_offsets = match self.current_result.as_mut() {
-            Some(result) => {
-                let mut v = result.take_col_offsets();
-                v.clear();
-                v
+        // Check if the new chunk has rows
+        if let Some(ref result) = self.current_result {
+            if self.position < result.len() {
+                return Ok(true);
             }
-            None => Vec::with_capacity(num_cols * STREAM_CHUNK_SIZE as usize),
-        };
-
-        let more = guard
-            .streaming_next_chunk(arena, &mut col_offsets)
-            .map_err(crate::error::BsqlError::from_driver_query)?;
-
-        if !more {
-            self.finished = true;
-        }
-        self.needs_execute = more; // if more rows, next call needs Execute+Sync
-
-        if col_offsets.is_empty() && !more {
-            self.current_result = None;
-            self.position = 0;
-            return Ok(false);
         }
 
-        // Pass Arc::clone of columns. The Arc is shared across all chunks —
-        // this is a single refcount increment per chunk, not per row.
-        self.current_result = Some(QueryResult::from_parts(
-            col_offsets,
-            num_cols,
-            Arc::clone(&self.columns),
-            0,
-        ));
-        self.position = 0;
-
-        Ok(true)
-    }
-
-    /// Number of remaining rows in the current chunk.
-    pub fn remaining(&self) -> usize {
-        match self.current_result {
-            Some(ref result) => result.len().saturating_sub(self.position),
-            None => 0,
-        }
-    }
-
-    /// Column descriptors for the result set.
-    pub fn columns(&self) -> &[ColumnDesc] {
-        &self.columns
+        Ok(false)
     }
 }
 
@@ -412,6 +470,7 @@ mod tests {
 
     // --- fetch_next_chunk requires guard ---
 
+    #[cfg(feature = "async")]
     #[tokio::test]
     async fn fetch_next_chunk_without_guard_errors() {
         let mut stream = make_stream(0, 1, false);
@@ -419,6 +478,7 @@ mod tests {
         assert!(result.is_err(), "should error without guard");
     }
 
+    #[cfg(feature = "async")]
     #[tokio::test]
     async fn fetch_next_chunk_when_finished_returns_false() {
         let mut stream = make_stream(0, 1, true);
@@ -428,6 +488,7 @@ mod tests {
 
     // --- advance ---
 
+    #[cfg(feature = "async")]
     #[tokio::test]
     async fn advance_returns_true_when_rows_available() {
         let mut stream = make_stream(2, 1, true);
@@ -435,6 +496,7 @@ mod tests {
         assert!(has);
     }
 
+    #[cfg(feature = "async")]
     #[tokio::test]
     async fn advance_returns_false_when_finished_and_exhausted() {
         let mut stream = make_stream(1, 1, true);
@@ -456,6 +518,7 @@ mod tests {
 
     // --- fetch_next_chunk without arena errors ---
 
+    #[cfg(feature = "async")]
     #[tokio::test]
     async fn fetch_next_chunk_without_arena_errors() {
         let columns = sample_columns(1);
@@ -475,6 +538,7 @@ mod tests {
 
     // --- advance when not finished but fetch fails ---
 
+    #[cfg(feature = "async")]
     #[tokio::test]
     async fn advance_fetch_fails_propagates_error() {
         // Stream with 0 rows, not finished, no guard -> advance triggers fetch -> error
@@ -609,6 +673,7 @@ mod tests {
 
     // --- advance with rows already available ---
 
+    #[cfg(feature = "async")]
     #[tokio::test]
     async fn advance_does_not_consume_row() {
         let mut stream = make_stream(2, 1, true);
