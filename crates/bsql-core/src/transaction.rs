@@ -159,28 +159,32 @@ impl Transaction {
     }
 
     /// Execute a query within the transaction (used by QueryTarget dispatch).
-    pub(crate) fn query_inner(
+    /// Accepts optional pre-built Parse+Describe bytes for the cold path.
+    pub(crate) fn query_inner_with_parse(
         &mut self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
+        prebuilt_parse: Option<&[u8]>,
     ) -> BsqlResult<OwnedResult> {
         let tx = self.inner.as_mut().ok_or_else(Self::consumed_error)?;
         let result = tx
-            .query(sql, sql_hash, params)
+            .query_with_parse(sql, sql_hash, params, prebuilt_parse)
             .map_err(BsqlError::from_driver_query)?;
         Ok(OwnedResult::without_arena(result))
     }
 
     /// Execute without result rows within the transaction (used by QueryTarget dispatch).
-    pub(crate) fn execute_inner(
+    /// Accepts optional pre-built Parse+Describe bytes for the cold path.
+    pub(crate) fn execute_inner_with_parse(
         &mut self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
+        prebuilt_parse: Option<&[u8]>,
     ) -> BsqlResult<u64> {
         let tx = self.inner.as_mut().ok_or_else(Self::consumed_error)?;
-        tx.execute(sql, sql_hash, params)
+        tx.execute_with_parse(sql, sql_hash, params, prebuilt_parse)
             .map_err(BsqlError::from_driver_query)
     }
 

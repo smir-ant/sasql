@@ -600,8 +600,21 @@ impl Connection {
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> Result<QueryResult, DriverError> {
+        self.query_with_parse(sql, sql_hash, params, None)
+    }
+
+    /// Like `query` but accepts pre-built Parse+Describe bytes for the cold path.
+    /// When `prebuilt_parse` is Some, cache-miss skips runtime message construction.
+    #[inline]
+    pub fn query_with_parse(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+        prebuilt_parse: Option<&[u8]>,
+    ) -> Result<QueryResult, DriverError> {
         let columns = self
-            .send_pipeline(sql, sql_hash, params, true, true)?
+            .send_pipeline_with_parse(sql, sql_hash, params, true, true, prebuilt_parse)?
             .ok_or_else(|| {
                 DriverError::Protocol("send_pipeline(need_columns=true) returned None".into())
             })?;
@@ -1252,6 +1265,122 @@ impl Connection {
         params: &[&(dyn Encode + Sync)],
     ) -> Result<u64, DriverError> {
         self.execute_monolithic(sql, sql_hash, params)
+    }
+
+    /// Like `execute` but accepts pre-built Parse+Describe bytes for the cold path.
+    /// When `prebuilt_parse` is Some, cache-miss skips runtime message construction.
+    ///
+    /// Uses `send_pipeline_with_parse` rather than the monolithic path so the
+    /// prebuilt bytes reach the cold prepare path. On cache hit the prebuilt
+    /// bytes are ignored and the fast template path runs as usual.
+    #[inline]
+    pub fn execute_with_parse(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+        prebuilt_parse: Option<&[u8]>,
+    ) -> Result<u64, DriverError> {
+        // When no prebuilt bytes, use the fully-inlined monolithic path.
+        if prebuilt_parse.is_none() {
+            return self.execute_monolithic(sql, sql_hash, params);
+        }
+        let _ =
+            self.send_pipeline_with_parse(sql, sql_hash, params, false, true, prebuilt_parse)?;
+
+        let mut affected_rows: u64 = 0;
+
+        // Inline response parsing: BindComplete + CommandComplete + ReadyForQuery.
+        'outer: loop {
+            loop {
+                let avail = self.stream_buf_end - self.stream_buf_pos;
+                if avail < 5 {
+                    break;
+                }
+
+                let msg_type = self.stream_buf[self.stream_buf_pos];
+                let raw_len = i32::from_be_bytes([
+                    self.stream_buf[self.stream_buf_pos + 1],
+                    self.stream_buf[self.stream_buf_pos + 2],
+                    self.stream_buf[self.stream_buf_pos + 3],
+                    self.stream_buf[self.stream_buf_pos + 4],
+                ]);
+
+                if raw_len < 4 {
+                    return Err(DriverError::Protocol(format!(
+                        "invalid message length {raw_len} for type '{}'",
+                        msg_type as char
+                    )));
+                }
+
+                let payload_len = (raw_len - 4) as usize;
+                let total_msg_len = 5 + payload_len;
+
+                if avail < total_msg_len {
+                    if total_msg_len > self.stream_buf.len() {
+                        let msg = self.read_one_message()?;
+                        match msg {
+                            BackendMessage::BindComplete | BackendMessage::DataRow { .. } => {
+                                continue;
+                            }
+                            BackendMessage::CommandComplete { tag } => {
+                                affected_rows = proto::parse_command_tag(tag);
+                                continue;
+                            }
+                            BackendMessage::EmptyQuery => continue,
+                            BackendMessage::ReadyForQuery { status } => {
+                                self.tx_status = status;
+                                break 'outer;
+                            }
+                            BackendMessage::NoticeResponse { .. } => continue,
+                            BackendMessage::ErrorResponse { data } => {
+                                let fields = proto::parse_error_response(data);
+                                self.maybe_invalidate_stmt_cache(&fields, sql_hash);
+                                self.drain_to_ready()?;
+                                return Err(self.make_server_error(fields));
+                            }
+                            other => {
+                                return Err(DriverError::Protocol(format!(
+                                    "unexpected message during execute: {other:?}"
+                                )));
+                            }
+                        }
+                    }
+                    break;
+                }
+
+                let payload_start = self.stream_buf_pos + 5;
+                let payload_end = payload_start + payload_len;
+
+                if msg_type == b'2' || msg_type == b'D' || msg_type == b'I' {
+                    // BindComplete / DataRow / EmptyQuery — skip
+                } else if msg_type == b'C' {
+                    affected_rows = proto::parse_command_tag_bytes(
+                        &self.stream_buf[payload_start..payload_end],
+                    );
+                } else if msg_type == b'Z' {
+                    if payload_len >= 1 {
+                        self.tx_status = self.stream_buf[payload_start];
+                    }
+                    self.stream_buf_pos += total_msg_len;
+                    break 'outer;
+                } else {
+                    self.handle_non_datarow_execute(
+                        msg_type,
+                        payload_start,
+                        payload_end,
+                        sql_hash,
+                    )?;
+                }
+
+                self.stream_buf_pos += total_msg_len;
+            }
+
+            self.refill_stream_buf()?;
+        }
+
+        self.shrink_buffers();
+        Ok(affected_rows)
     }
 
     /// Execute the same prepared statement N times with different parameters
@@ -3071,6 +3200,47 @@ impl Connection {
         need_columns: bool,
         skip_bind_complete: bool,
     ) -> Result<Option<Arc<[ColumnDesc]>>, DriverError> {
+        self.send_pipeline_inner(
+            sql,
+            sql_hash,
+            params,
+            need_columns,
+            skip_bind_complete,
+            None,
+        )
+    }
+
+    /// Like send_pipeline but accepts pre-built Parse+Describe bytes.
+    /// When `prebuilt_parse` is Some, the cache-miss path uses these bytes
+    /// directly instead of calling write_parse + write_describe (~200ns saved).
+    fn send_pipeline_with_parse(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+        need_columns: bool,
+        skip_bind_complete: bool,
+        prebuilt_parse: Option<&[u8]>,
+    ) -> Result<Option<Arc<[ColumnDesc]>>, DriverError> {
+        self.send_pipeline_inner(
+            sql,
+            sql_hash,
+            params,
+            need_columns,
+            skip_bind_complete,
+            prebuilt_parse,
+        )
+    }
+
+    fn send_pipeline_inner(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+        need_columns: bool,
+        skip_bind_complete: bool,
+        prebuilt_parse: Option<&[u8]>,
+    ) -> Result<Option<Arc<[ColumnDesc]>>, DriverError> {
         debug_assert_eq!(crate::types::hash_sql(sql), sql_hash, "sql_hash mismatch");
 
         if params.len() > i16::MAX as usize {
@@ -3186,10 +3356,17 @@ impl Connection {
         } else {
             // Cache miss: Parse+Describe+Bind+Execute+Sync
             let name = make_stmt_name(sql_hash);
-            let param_oids: smallvec::SmallVec<[u32; 8]> =
-                params.iter().map(|p| p.type_oid()).collect();
-            proto::write_parse(&mut self.write_buf, &name, sql, &param_oids);
-            proto::write_describe(&mut self.write_buf, b'S', &name);
+            if let Some(prebuilt) = prebuilt_parse {
+                // Compile-time generated Parse+Describe bytes — zero runtime
+                // message construction. Just memcpy static data.
+                self.write_buf.extend_from_slice(prebuilt);
+            } else {
+                // Runtime construction (for dynamic SQL, user raw_query, etc.)
+                let param_oids: smallvec::SmallVec<[u32; 8]> =
+                    params.iter().map(|p| p.type_oid()).collect();
+                proto::write_parse(&mut self.write_buf, &name, sql, &param_oids);
+                proto::write_describe(&mut self.write_buf, b'S', &name);
+            }
             proto::write_bind_params(&mut self.write_buf, b"", &name, params);
 
             self.write_buf.extend_from_slice(proto::EXECUTE_SYNC);

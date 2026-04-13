@@ -399,8 +399,19 @@ impl AsyncConnection {
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> Result<QueryResult, DriverError> {
+        self.query_with_parse(sql, sql_hash, params, None).await
+    }
+
+    /// Like `query` but accepts pre-built Parse+Describe bytes for the cold path.
+    pub async fn query_with_parse(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+        prebuilt_parse: Option<&[u8]>,
+    ) -> Result<QueryResult, DriverError> {
         let columns = self
-            .send_pipeline(sql, sql_hash, params, true)
+            .send_pipeline_inner(sql, sql_hash, params, true, prebuilt_parse)
             .await?
             .ok_or_else(|| {
                 DriverError::Protocol("send_pipeline(need_columns=true) returned None".into())
@@ -533,7 +544,20 @@ impl AsyncConnection {
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
     ) -> Result<u64, DriverError> {
-        let _ = self.send_pipeline(sql, sql_hash, params, false).await?;
+        self.execute_with_parse(sql, sql_hash, params, None).await
+    }
+
+    /// Like `execute` but accepts pre-built Parse+Describe bytes for the cold path.
+    pub async fn execute_with_parse(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+        prebuilt_parse: Option<&[u8]>,
+    ) -> Result<u64, DriverError> {
+        let _ = self
+            .send_pipeline_inner(sql, sql_hash, params, false, prebuilt_parse)
+            .await?;
 
         let mut affected_rows: u64 = 0;
 
@@ -743,12 +767,16 @@ impl AsyncConnection {
 
     /// Common pipeline: builds and sends Parse+Describe+Bind+Execute+Sync (or
     /// Bind+Execute+Sync on cache hit). Returns column metadata.
-    async fn send_pipeline(
+    ///
+    /// When `prebuilt_parse` is Some, the cache-miss path uses these bytes
+    /// directly instead of calling write_parse + write_describe.
+    async fn send_pipeline_inner(
         &mut self,
         sql: &str,
         sql_hash: u64,
         params: &[&(dyn Encode + Sync)],
         need_columns: bool,
+        prebuilt_parse: Option<&[u8]>,
     ) -> Result<Option<Arc<[ColumnDesc]>>, DriverError> {
         debug_assert_eq!(crate::types::hash_sql(sql), sql_hash, "sql_hash mismatch");
 
@@ -852,10 +880,17 @@ impl AsyncConnection {
         } else {
             // Cache miss: Parse+Describe+Bind+Execute+Sync
             let name = make_stmt_name(sql_hash);
-            let param_oids: smallvec::SmallVec<[u32; 8]> =
-                params.iter().map(|p| p.type_oid()).collect();
-            proto::write_parse(&mut self.write_buf, &name, sql, &param_oids);
-            proto::write_describe(&mut self.write_buf, b'S', &name);
+            if let Some(prebuilt) = prebuilt_parse {
+                // Compile-time generated Parse+Describe bytes — zero runtime
+                // message construction. Just memcpy static data.
+                self.write_buf.extend_from_slice(prebuilt);
+            } else {
+                // Runtime construction (for dynamic SQL, user raw_query, etc.)
+                let param_oids: smallvec::SmallVec<[u32; 8]> =
+                    params.iter().map(|p| p.type_oid()).collect();
+                proto::write_parse(&mut self.write_buf, &name, sql, &param_oids);
+                proto::write_describe(&mut self.write_buf, b'S', &name);
+            }
             proto::write_bind_params(&mut self.write_buf, b"", &name, params);
 
             self.write_buf.extend_from_slice(proto::EXECUTE_SYNC);

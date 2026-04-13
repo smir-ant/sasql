@@ -135,6 +135,7 @@ impl<'a> QueryTarget<'a> {
         sql: crate::Sql<'_>,
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<OwnedResult> {
+        let parse_msg = sql.parse_msg();
         match self {
             QueryTarget::Pool(pool) => {
                 let driver_pool = if sql.readonly() {
@@ -144,7 +145,7 @@ impl<'a> QueryTarget<'a> {
                 };
                 let mut guard = driver_pool.acquire_async().await.map_err(BsqlError::from)?;
                 let result = guard
-                    .query_async(sql.text(), sql.hash(), params)
+                    .query_async_with_parse(sql.text(), sql.hash(), params, parse_msg)
                     .await
                     .map_err(BsqlError::from_driver_query)?;
                 Ok(OwnedResult::without_arena(result))
@@ -152,11 +153,13 @@ impl<'a> QueryTarget<'a> {
             QueryTarget::Conn(conn) => {
                 let result = conn
                     .inner
-                    .query(sql.text(), sql.hash(), params)
+                    .query_with_parse(sql.text(), sql.hash(), params, parse_msg)
                     .map_err(BsqlError::from_driver_query)?;
                 Ok(OwnedResult::without_arena(result))
             }
-            QueryTarget::Tx(tx) => tx.query_inner(sql.text(), sql.hash(), params),
+            QueryTarget::Tx(tx) => {
+                tx.query_inner_with_parse(sql.text(), sql.hash(), params, parse_msg)
+            }
         }
     }
 
@@ -168,6 +171,7 @@ impl<'a> QueryTarget<'a> {
         sql: crate::Sql<'_>,
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<u64> {
+        let parse_msg = sql.parse_msg();
         match self {
             QueryTarget::Pool(pool) => {
                 let driver_pool = if sql.readonly() {
@@ -177,15 +181,17 @@ impl<'a> QueryTarget<'a> {
                 };
                 let mut guard = driver_pool.acquire_async().await.map_err(BsqlError::from)?;
                 guard
-                    .execute_async(sql.text(), sql.hash(), params)
+                    .execute_async_with_parse(sql.text(), sql.hash(), params, parse_msg)
                     .await
                     .map_err(BsqlError::from_driver_query)
             }
             QueryTarget::Conn(conn) => conn
                 .inner
-                .execute(sql.text(), sql.hash(), params)
+                .execute_with_parse(sql.text(), sql.hash(), params, parse_msg)
                 .map_err(BsqlError::from_driver_query),
-            QueryTarget::Tx(tx) => tx.execute_inner(sql.text(), sql.hash(), params),
+            QueryTarget::Tx(tx) => {
+                tx.execute_inner_with_parse(sql.text(), sql.hash(), params, parse_msg)
+            }
         }
     }
 
@@ -210,6 +216,7 @@ impl<'a> QueryTarget<'a> {
         sql: crate::Sql<'_>,
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<OwnedResult> {
+        let parse_msg = sql.parse_msg();
         match self {
             QueryTarget::Pool(pool) => {
                 let driver_pool = if sql.readonly() {
@@ -219,18 +226,20 @@ impl<'a> QueryTarget<'a> {
                 };
                 let mut guard = driver_pool.acquire().map_err(BsqlError::from)?;
                 let result = guard
-                    .query(sql.text(), sql.hash(), params)
+                    .query_with_parse(sql.text(), sql.hash(), params, parse_msg)
                     .map_err(BsqlError::from_driver_query)?;
                 Ok(OwnedResult::without_arena(result))
             }
             QueryTarget::Conn(conn) => {
                 let result = conn
                     .inner
-                    .query(sql.text(), sql.hash(), params)
+                    .query_with_parse(sql.text(), sql.hash(), params, parse_msg)
                     .map_err(BsqlError::from_driver_query)?;
                 Ok(OwnedResult::without_arena(result))
             }
-            QueryTarget::Tx(tx) => tx.query_inner(sql.text(), sql.hash(), params),
+            QueryTarget::Tx(tx) => {
+                tx.query_inner_with_parse(sql.text(), sql.hash(), params, parse_msg)
+            }
         }
     }
 
@@ -242,6 +251,7 @@ impl<'a> QueryTarget<'a> {
         sql: crate::Sql<'_>,
         params: &[&(dyn Encode + Sync)],
     ) -> BsqlResult<u64> {
+        let parse_msg = sql.parse_msg();
         match self {
             QueryTarget::Pool(pool) => {
                 let driver_pool = if sql.readonly() {
@@ -251,14 +261,16 @@ impl<'a> QueryTarget<'a> {
                 };
                 let mut guard = driver_pool.acquire().map_err(BsqlError::from)?;
                 guard
-                    .execute(sql.text(), sql.hash(), params)
+                    .execute_with_parse(sql.text(), sql.hash(), params, parse_msg)
                     .map_err(BsqlError::from_driver_query)
             }
             QueryTarget::Conn(conn) => conn
                 .inner
-                .execute(sql.text(), sql.hash(), params)
+                .execute_with_parse(sql.text(), sql.hash(), params, parse_msg)
                 .map_err(BsqlError::from_driver_query),
-            QueryTarget::Tx(tx) => tx.execute_inner(sql.text(), sql.hash(), params),
+            QueryTarget::Tx(tx) => {
+                tx.execute_inner_with_parse(sql.text(), sql.hash(), params, parse_msg)
+            }
         }
     }
 }

@@ -894,6 +894,21 @@ impl PoolGuard {
         self.sync_conn_mut()?.query(sql, sql_hash, params)
     }
 
+    /// Like `query` but accepts pre-built Parse+Describe bytes for the cold path.
+    #[inline]
+    pub fn query_with_parse(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+        prebuilt_parse: Option<&[u8]>,
+    ) -> Result<QueryResult, DriverError> {
+        #[cfg(feature = "detect-n-plus-one")]
+        self.detector.track(sql_hash);
+        self.sync_conn_mut()?
+            .query_with_parse(sql, sql_hash, params, prebuilt_parse)
+    }
+
     /// Execute a query without result rows (INSERT/UPDATE/DELETE).
     #[inline]
     pub fn execute(
@@ -905,6 +920,21 @@ impl PoolGuard {
         #[cfg(feature = "detect-n-plus-one")]
         self.detector.track(sql_hash);
         self.sync_conn_mut()?.execute(sql, sql_hash, params)
+    }
+
+    /// Like `execute` but accepts pre-built Parse+Describe bytes for the cold path.
+    #[inline]
+    pub fn execute_with_parse(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+        prebuilt_parse: Option<&[u8]>,
+    ) -> Result<u64, DriverError> {
+        #[cfg(feature = "detect-n-plus-one")]
+        self.detector.track(sql_hash);
+        self.sync_conn_mut()?
+            .execute_with_parse(sql, sql_hash, params, prebuilt_parse)
     }
 
     /// Execute the same statement N times with different params in one pipeline.
@@ -1060,6 +1090,29 @@ impl PoolGuard {
         }
     }
 
+    /// Like `query_async` but accepts pre-built Parse+Describe bytes.
+    #[cfg(feature = "async")]
+    pub async fn query_async_with_parse(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+        prebuilt_parse: Option<&[u8]>,
+    ) -> Result<QueryResult, DriverError> {
+        #[cfg(feature = "detect-n-plus-one")]
+        self.detector.track(sql_hash);
+        match self.conn.as_mut() {
+            Some(PoolSlot::Sync(conn)) => {
+                conn.query_with_parse(sql, sql_hash, params, prebuilt_parse)
+            }
+            Some(PoolSlot::Async(conn)) => {
+                conn.query_with_parse(sql, sql_hash, params, prebuilt_parse)
+                    .await
+            }
+            None => Err(DriverError::Pool("connection already taken".into())),
+        }
+    }
+
     /// Execute without result rows (async).
     #[cfg(feature = "async")]
     pub async fn execute_async(
@@ -1073,6 +1126,29 @@ impl PoolGuard {
         match self.conn.as_mut() {
             Some(PoolSlot::Sync(conn)) => conn.execute(sql, sql_hash, params),
             Some(PoolSlot::Async(conn)) => conn.execute(sql, sql_hash, params).await,
+            None => Err(DriverError::Pool("connection already taken".into())),
+        }
+    }
+
+    /// Like `execute_async` but accepts pre-built Parse+Describe bytes.
+    #[cfg(feature = "async")]
+    pub async fn execute_async_with_parse(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+        prebuilt_parse: Option<&[u8]>,
+    ) -> Result<u64, DriverError> {
+        #[cfg(feature = "detect-n-plus-one")]
+        self.detector.track(sql_hash);
+        match self.conn.as_mut() {
+            Some(PoolSlot::Sync(conn)) => {
+                conn.execute_with_parse(sql, sql_hash, params, prebuilt_parse)
+            }
+            Some(PoolSlot::Async(conn)) => {
+                conn.execute_with_parse(sql, sql_hash, params, prebuilt_parse)
+                    .await
+            }
             None => Err(DriverError::Pool("connection already taken".into())),
         }
     }
@@ -1244,6 +1320,21 @@ impl Transaction {
         self.guard.query(sql, sql_hash, params)
     }
 
+    /// Like `query` but accepts pre-built Parse+Describe bytes for the cold path.
+    pub fn query_with_parse(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+        prebuilt_parse: Option<&[u8]>,
+    ) -> Result<QueryResult, DriverError> {
+        if self.deferred_count > 0 {
+            self.flush_deferred()?;
+        }
+        self.guard
+            .query_with_parse(sql, sql_hash, params, prebuilt_parse)
+    }
+
     /// Execute without result rows within the transaction.
     pub fn execute(
         &mut self,
@@ -1252,6 +1343,18 @@ impl Transaction {
         params: &[&(dyn Encode + Sync)],
     ) -> Result<u64, DriverError> {
         self.guard.execute(sql, sql_hash, params)
+    }
+
+    /// Like `execute` but accepts pre-built Parse+Describe bytes for the cold path.
+    pub fn execute_with_parse(
+        &mut self,
+        sql: &str,
+        sql_hash: u64,
+        params: &[&(dyn Encode + Sync)],
+        prebuilt_parse: Option<&[u8]>,
+    ) -> Result<u64, DriverError> {
+        self.guard
+            .execute_with_parse(sql, sql_hash, params, prebuilt_parse)
     }
 
     /// Execute the same statement N times with different params in one pipeline.
