@@ -35,6 +35,60 @@ let user = &users[0];
 
 [**You need to see this** 🫢](https://github.com/smir-ant/bsql/blob/main/bench/README.md) — bsql vs C vs Go vs diesel vs sqlx, PostgreSQL and SQLite, full methodology and how to reproduce.
 
+<details>
+<summary>Squeezing the last 5-15%: PGO and allocator tuning</summary>
+
+bsql is already fast out of the box — compile-time generated wire protocol, arena-based zero-copy decoding, bind templates with in-place parameter patching, thread-local buffer recycling. But two things can push it further:
+
+### Profile-Guided Optimization (PGO)
+
+PGO lets the compiler see which code paths YOUR specific workload actually hits, then optimizes layout, inlining, and branch prediction for those paths. Typical gain: **5-15% on hot paths**, zero runtime cost.
+
+```bash
+# 1. Build your app with profiling instrumentation (~5-10% slower)
+RUSTFLAGS="-Cprofile-generate=/tmp/pgo-data" cargo build --release
+
+# 2. Run your app with real traffic for a while (hours, overnight — whatever
+#    covers your full workload: peak, quiet, simple queries, complex ones)
+./target/release/your_app
+
+# 3. After enough data collected — stop the app, merge the profile
+llvm-profdata merge -output=/tmp/merged.profdata /tmp/pgo-data/
+
+# 4. Rebuild with the profile (this is the fast binary)
+RUSTFLAGS="-Cprofile-use=/tmp/merged.profdata" cargo build --release
+
+# 5. Deploy the optimized binary. Done.
+```
+
+The profiling phase captures branch frequencies across your REAL traffic — peak hours, quiet periods, simple and complex queries. The compiler uses this to make bsql's hot paths (wire protocol, decode, statement cache) as fast as your specific workload allows.
+
+**Re-run PGO after major bsql updates** (the profile is tied to code layout). Minor patches: the profile stays mostly valid.
+
+### Custom allocator
+
+bsql uses its own arena allocator for the performance-critical path (response buffers, column data, row decoding). The system allocator is only hit on the "cold path" — `Vec<Row>` results, `String` column values, pool internals.
+
+For most workloads, the default system allocator is fine. But if your application does heavy allocation beyond bsql (web framework, JSON serialization, etc.), switching the **global** allocator can help:
+
+```rust
+// In your main.rs (not in bsql — this is YOUR application's choice):
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+```
+
+```toml
+# In your Cargo.toml:
+[dependencies]
+mimalloc = "0.1"
+```
+
+Alternatives: `tikv-jemallocator` (best fragmentation resistance for long-running servers), `snmalloc-rs` (lock-free, latest MSR research). All three are safe, well-maintained, and give 3-8% improvement on allocation-heavy workloads.
+
+This is an application-level decision, not a bsql dependency — bsql works with any global allocator.
+
+</details>
+
 ---
 
 ## Quick Start
