@@ -202,20 +202,23 @@ impl Transaction {
 
     // --- Deferred pipeline API ---
 
-    /// Buffer an execute for deferred pipeline flush.
+    /// Defer a compile-time validated query for pipeline flush on commit.
     ///
-    /// The operation is not sent to the server immediately. Instead, the
-    /// Bind+Execute message bytes are buffered internally. The buffered
-    /// operations are sent as a single pipeline on [`commit()`](Self::commit)
-    /// or [`flush_deferred()`](Self::flush_deferred).
+    /// Uses PgQuerySpec to extract SQL, hash, and params from the query struct.
+    /// Generated code delegates here via a one-line wrapper.
+    #[doc(hidden)]
+    pub async fn defer_typed<Q: crate::executor::PgQuerySpec>(
+        &mut self,
+        query: &Q,
+    ) -> BsqlResult<()> {
+        let params = query.params();
+        self.defer_execute(Q::SQL, Q::SQL_HASH, &params).await
+    }
+
+    /// Buffer an execute for deferred pipeline flush (low-level).
     ///
-    /// If the statement has not been prepared yet, a single round-trip is
-    /// made to prepare it. After that, the Bind+Execute bytes are buffered
-    /// with no I/O.
-    ///
-    /// Any read operation (`query_inner`, `for_each_raw`, `simple_query`, etc.)
-    /// automatically flushes deferred operations first to ensure
-    /// read-your-writes consistency.
+    /// Prefer `defer_typed` for generated code. This method is used by
+    /// dynamic queries and other paths that don't implement PgQuerySpec.
     #[doc(hidden)]
     pub async fn defer_execute(
         &mut self,
